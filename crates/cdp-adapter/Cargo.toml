@@ -1,0 +1,29 @@
+[package]
+name = "cdp-adapter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["SoulBrowser Team"]
+description = "Chromium DevTools Protocol adapter for SoulBrowser L0"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+futures = "0.3"
+tokio = { version = "1.39", features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
+tokio-util = "0.7"
+dashmap = "5.5"
+base64 = "0.22"
+chromiumoxide = { version = "0.5", default-features = false, features = ["tokio-runtime"] }
+chromiumoxide_types = "0.5"
+rand = "0.8"
+anyhow = "1.0"
+
+[features]
+default = []
+# Placeholder feature; the actual Chromium client dependency will be wired in when implementation starts.
+chromiumoxide = []

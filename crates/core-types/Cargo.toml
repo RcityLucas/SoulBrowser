@@ -1,0 +1,18 @@
+[package]
+name = "soulbrowser-core-types"
+version = "0.1.0"
+edition = "2021"
+description = "Shared primitives for SoulBrowser L1 unified kernel"
+license = "MIT OR Apache-2.0"
+authors = ["SoulBrowser Team"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"], optional = true }
+thiserror = "1.0"
+uuid = { version = "1.6", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+serde_json = { version = "1.0", optional = true }
+
+[features]
+default = []
+serde-full = ["serde", "uuid/serde", "chrono", "serde_json"]

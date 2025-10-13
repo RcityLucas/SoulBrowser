@@ -1,0 +1,22 @@
+[package]
+name = "soulbrowser-policy-center"
+version = "0.1.0"
+edition = "2021"
+description = "Policy and feature flag center for SoulBrowser L1 unified kernel"
+license = "MIT OR Apache-2.0"
+authors = ["SoulBrowser Team"]
+
+[dependencies]
+arc-swap = "1"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "1.0"
+tokio = { version = "1.39", features = ["rt", "sync", "time"] }
+soulbrowser-core-types = { path = "../core-types" }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.39", features = ["macros", "rt"] }
+tempfile = "3.8"

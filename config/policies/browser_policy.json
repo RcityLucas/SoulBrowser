@@ -1,0 +1,50 @@
+[
+  {
+    "when": { "Http": { "method": "POST", "path_glob": "browser://session/navigate" } },
+    "bind": {
+      "resource": "browser:session:navigate",
+      "action": "Invoke",
+      "attrs_template": {
+        "operation": "navigate",
+        "channel": "automation"
+      },
+      "attrs_from_body": true
+    }
+  },
+  {
+    "when": { "Http": { "method": "POST", "path_glob": "browser://session/click" } },
+    "bind": {
+      "resource": "browser:session:click",
+      "action": "Invoke",
+      "attrs_template": {
+        "operation": "click",
+        "channel": "automation"
+      },
+      "attrs_from_body": true
+    }
+  },
+  {
+    "when": { "Http": { "method": "POST", "path_glob": "browser://session/type" } },
+    "bind": {
+      "resource": "browser:session:type",
+      "action": "Invoke",
+      "attrs_template": {
+        "operation": "type",
+        "channel": "automation"
+      },
+      "attrs_from_body": true
+    }
+  },
+  {
+    "when": { "Http": { "method": "POST", "path_glob": "browser://session/screenshot" } },
+    "bind": {
+      "resource": "browser:session:screenshot",
+      "action": "Read",
+      "attrs_template": {
+        "operation": "screenshot",
+        "channel": "automation"
+      },
+      "attrs_from_body": false
+    }
+  }
+]

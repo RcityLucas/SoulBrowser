@@ -1,0 +1,91 @@
+# This shows how to properly integrate soul-base crates into SoulBrowser's Cargo.toml
+# Copy these sections into your main Cargo.toml to use soul-base components directly
+
+[workspace]
+members = [
+    ".",
+    # Include soul-base crates that use Rust 2021
+    "../soul-base-main/soul-base-main/crates/soulbase-auth",
+    "../soul-base-main/soul-base-main/crates/soulbase-config", 
+    "../soul-base-main/soul-base-main/crates/soulbase-errors",
+    "../soul-base-main/soul-base-main/crates/soulbase-interceptors",
+    "../soul-base-main/soul-base-main/crates/soulbase-llm",
+    "../soul-base-main/soul-base-main/crates/soulbase-sandbox",
+    "../soul-base-main/soul-base-main/crates/soulbase-storage",
+    "../soul-base-main/soul-base-main/crates/soulbase-tools",
+    "../soul-base-main/soul-base-main/crates/soulbase-tx",
+    # Skip soulbase-types (uses edition 2024)
+]
+
+[dependencies]
+# === DIRECTLY REUSABLE SOUL-BASE CRATES (Rust 2021) ===
+
+# Error system with HTTP/gRPC mapping and retry semantics
+soulbase-errors = { path = "../soul-base-main/soul-base-main/crates/soulbase-errors" }
+
+# Schema-driven configuration with validation and hot reload
+soulbase-config = { path = "../soul-base-main/soul-base-main/crates/soulbase-config" }
+
+# Tool manifest, registry, and invocation protocol
+soulbase-tools = { path = "../soul-base-main/soul-base-main/crates/soulbase-tools" }
+
+# Secure sandboxed execution with resource limits
+soulbase-sandbox = { path = "../soul-base-main/soul-base-main/crates/soulbase-sandbox" }
+
+# LLM integration for AI-powered automation
+soulbase-llm = { path = "../soul-base-main/soul-base-main/crates/soulbase-llm" }
+
+# Authentication and authorization
+soulbase-auth = { path = "../soul-base-main/soul-base-main/crates/soulbase-auth" }
+
+# Interceptor chains for middleware
+soulbase-interceptors = { path = "../soul-base-main/soul-base-main/crates/soulbase-interceptors" }
+
+# Storage abstraction with multiple backends
+soulbase-storage = { path = "../soul-base-main/soul-base-main/crates/soulbase-storage" }
+
+# Transaction management with saga support
+soulbase-tx = { path = "../soul-base-main/soul-base-main/crates/soulbase-tx" }
+
+# === SOUL-BASE CRATES REQUIRING WORKSPACE EDITION CHECK ===
+# These use edition.workspace = true, defaulting to 2021
+
+# Two-level caching with Redis support (if compatible)
+# soulbase-cache = { path = "../soul-base-main/soul-base-main/crates/soulbase-cache" }
+
+# Object storage for screenshots (if compatible)
+# soulbase-blob = { path = "../soul-base-main/soul-base-main/crates/soulbase-blob" }
+
+# Cryptography utilities (if compatible)
+# soulbase-crypto = { path = "../soul-base-main/soul-base-main/crates/soulbase-crypto" }
+
+# HTTP client with retry/failover (if compatible)
+# soulbase-net = { path = "../soul-base-main/soul-base-main/crates/soulbase-net" }
+
+# Observability pipeline (if compatible)
+# soulbase-observe = { path = "../soul-base-main/soul-base-main/crates/soulbase-observe" }
+
+# === INCOMPATIBLE CRATE (Rust 2024) ===
+# soulbase-types requires Rust edition 2024 - must use adapted version
+# Use src/soul_integration/types.rs instead
+
+[features]
+# Feature flags to control soul-base integration
+soul-base-full = [
+    "soul-base-core",
+    "soul-base-tools", 
+    "soul-base-auth",
+    "soul-base-storage",
+]
+
+soul-base-core = []  # Core error, config, sandbox
+soul-base-tools = []  # Tool system
+soul-base-auth = []   # Authentication/authorization  
+soul-base-storage = [] # Storage and transactions
+
+# Optional features for crates that might have compatibility issues
+soul-base-cache = []
+soul-base-blob = []
+soul-base-crypto = []
+soul-base-net = []
+soul-base-observe = []

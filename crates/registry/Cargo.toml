@@ -1,0 +1,25 @@
+[package]
+name = "soulbrowser-registry"
+version = "0.1.0"
+edition = "2021"
+description = "Session/Tab/Frame registry for SoulBrowser L1 unified kernel"
+license = "MIT OR Apache-2.0"
+authors = ["SoulBrowser Team"]
+
+[dependencies]
+async-trait = "0.1"
+dashmap = "5"
+parking_lot = "0.12"
+tokio = { version = "1.39", features = ["rt", "sync", "macros", "time"] }
+tracing = "0.1"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"], optional = true }
+soulbrowser-core-types = { path = "../core-types" }
+soulbrowser-event-bus = { path = "../event-bus" }
+soulbrowser-policy-center = { path = "../policy-center" }
+soulbrowser-state-center = { path = "../state-center" }
+network-tap-light = { path = "../network-tap-light" }
+
+[features]
+default = []
+serde = ["dep:serde", "soulbrowser-core-types/serde-full"]

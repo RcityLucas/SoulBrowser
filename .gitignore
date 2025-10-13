@@ -1,0 +1,32 @@
+# Build artifacts
+/target/
+/debug/
+/release/
+
+# Generated run outputs
+/soulbrowser-output/
+
+# Local tooling and editor configs
+/.idea/
+/.vscode/
+/.claude/
+
+# Environment and secret files
+.env
+.env.*
+*.local
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Rust formatter backup files
+**/*.rs.bk
+
+# OS-specific files
+.DS_Store
+Thumbs.db

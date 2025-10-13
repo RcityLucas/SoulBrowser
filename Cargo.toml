@@ -1,0 +1,160 @@
+# Single crate project - no workspace needed
+
+[workspace]
+members = [
+    "crates/cdp-adapter",
+    "crates/permissions-broker",
+    "crates/network-tap-light",
+    "crates/stealth",
+    "crates/extensions-bridge",
+    "crates/event-bus",
+    "crates/core-types",
+    "crates/registry",
+    "crates/scheduler",
+    "crates/state-center",
+    "crates/policy-center"
+]
+resolver = "2"
+
+[package]
+name = "soulbrowser-cli"
+version = "1.0.0"
+edition = "2021"
+authors = ["SoulBrowser Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/soulbrowser"
+description = "Intelligent Web Automation with Soul - CLI application"
+readme = "README.md"
+keywords = ["browser", "automation", "ai", "web", "testing"]
+categories = ["web-programming", "development-tools", "automation"]
+rust-version = "1.70"
+
+[lib]
+name = "soulbrowser_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "soulbrowser"
+path = "src/main.rs"
+
+[[example]]
+name = "advanced_tools"
+path = "examples/advanced_tools.rs"
+required-features = ["legacy-examples"]
+
+[[example]]
+name = "basic_demo"
+path = "examples/basic_demo.rs"
+required-features = ["legacy-examples"]
+
+[[example]]
+name = "basic_navigation"
+path = "examples/basic_navigation.rs"
+required-features = ["legacy-examples"]
+
+[[example]]
+name = "form_automation"
+path = "examples/form_automation.rs"
+required-features = ["legacy-examples"]
+
+[[example]]
+name = "soul_integration_demo"
+path = "examples/soul_integration_demo.rs"
+required-features = ["legacy-examples"]
+
+[[example]]
+name = "soul_reuse_example"
+path = "examples/soul_reuse_example.rs"
+required-features = ["legacy-examples"]
+
+[[example]]
+name = "standalone_demo"
+path = "examples/standalone_demo.rs"
+required-features = ["legacy-examples"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.39", features = ["full"] }
+tokio-util = { version = "0.7" }
+async-trait = "0.1"
+async-recursion = "1.0"
+once_cell = "1.19"
+soulbrowser-core-types = { path = "crates/core-types", features = ["serde-full"] }
+soulbrowser-event-bus = { path = "crates/event-bus" }
+soulbrowser-registry = { path = "crates/registry" }
+soulbrowser-scheduler = { path = "crates/scheduler", features = ["serde"] }
+soulbrowser-state-center = { path = "crates/state-center" }
+soulbrowser-policy-center = { path = "crates/policy-center" }
+cdp-adapter = { path = "crates/cdp-adapter" }
+network-tap-light = { path = "crates/network-tap-light" }
+dashmap = "5"
+parking_lot = "0.12"
+
+# CLI and argument parsing
+clap = { version = "4.4", features = ["derive", "color", "suggestions"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+schemars = "0.8"
+csv = "1.3"
+humantime = "2.1"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Configuration and directories
+config = "0.14"
+dirs = "5.0"
+
+# Time & Date
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Direct soul-base components integration
+soulbase-types = { path = "../soul-base-main/soul-base-main/crates/soulbase-types" }
+soulbase-errors = { path = "../soul-base-main/soul-base-main/crates/soulbase-errors" }
+soulbase-config = { path = "../soul-base-main/soul-base-main/crates/soulbase-config" }
+soulbase-auth = { path = "../soul-base-main/soul-base-main/crates/soulbase-auth" }
+soulbase-interceptors = { path = "../soul-base-main/soul-base-main/crates/soulbase-interceptors" }
+soulbase-storage = { path = "../soul-base-main/soul-base-main/crates/soulbase-storage" }
+soulbase-tools = { path = "../soul-base-main/soul-base-main/crates/soulbase-tools" }
+# Future integration (currently unused, commented out to speed up builds)
+# soulbase-sandbox = { path = "../soul-base-main/soul-base-main/crates/soulbase-sandbox" }
+# soulbase-llm = { path = "../soul-base-main/soul-base-main/crates/soulbase-llm" }
+# soulbase-tx = { path = "../soul-base-main/soul-base-main/crates/soulbase-tx" }
+# soulbase-observe = { path = "../soul-base-main/soul-base-main/crates/soulbase-observe" }
+# soulbase-cache = { path = "../soul-base-main/soul-base-main/crates/soulbase-cache" }
+# soulbase-blob = { path = "../soul-base-main/soul-base-main/crates/soulbase-blob" }
+# soulbase-crypto = { path = "../soul-base-main/soul-base-main/crates/soulbase-crypto" }
+# soulbase-net = { path = "../soul-base-main/soul-base-main/crates/soulbase-net" }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.8"
+
+[build-dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+
+[features]
+default = []
+# Soul-base integration features (currently using adapted versions due to Rust 2024 incompatibility)
+soul-adapted = []  # Use adapted versions in src/soul_integration/
+full-stack = []
+legacy-examples = []
+legacy-tests = []
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
