@@ -143,7 +143,11 @@ async fn handle_cdp_event(
 ) -> Result<(), SoulBrowserError> {
     match event {
         RawEvent::PageLifecycle {
-            page, frame, phase, ..
+            page,
+            frame,
+            parent,
+            phase,
+            ..
         } => {
             let phase_lower = phase.to_ascii_lowercase();
             match phase_lower.as_str() {
@@ -205,15 +209,16 @@ async fn handle_cdp_event(
                 }
                 "frame_attached" => {
                     if let (Some(pid), Some(fid)) = (mapping.get(&page), frame) {
-                        let is_main = frames.is_empty();
-                        let frame_id = FrameId::new();
-                        frames.insert(fid, frame_id.clone());
-                        let pid_value = pid.clone();
-                        registry
-                            .frame_attached(&pid_value, None, is_main)
+                        let parent_frame = parent.and_then(|parent_fid| {
+                            frames.get(&parent_fid).map(|entry| entry.clone())
+                        });
+                        let is_main = parent_frame.is_none();
+                        let new_frame = registry
+                            .frame_attached(&pid, parent_frame.clone(), is_main)
                             .map_err(|err| {
                                 SoulBrowserError::internal(&format!("frame attach failed: {err}"))
                             })?;
+                        frames.insert(fid, new_frame);
                     }
                 }
                 "frame_detached" => {
@@ -256,6 +261,16 @@ async fn handle_cdp_event(
                         SoulBrowserError::internal(&format!("network summary apply failed: {err}"))
                     })?;
                 if let Some(tap_page) = cdp_to_tap.get(&page) {
+                    if let Err(err) = network_tap
+                        .update_snapshot(*tap_page, snapshot.clone())
+                        .await
+                    {
+                        warn!(
+                            target: "l0-bridge",
+                            ?err,
+                            "failed to update network tap snapshot"
+                        );
+                    }
                     let _ = network_tap.publish_summary(NetworkSummary {
                         page: *tap_page,
                         window_ms: snapshot.window_ms,

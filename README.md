@@ -52,6 +52,38 @@ cargo test
 
 # Run legacy examples (feature-gated)
 cargo run --features legacy-examples --example basic_demo
+
+# Run the real-browser demo (requires Chrome/Chromium)
+SOULBROWSER_USE_REAL_CHROME=1 \
+SOULBROWSER_DISABLE_SANDBOX=1 \
+cargo run -- demo \
+    --chrome-path /path/to/chrome \
+    --screenshot soulbrowser-output/demo.png
+```
+
+### Real Browser Demo
+
+The `demo` CLI command drives a headless (or optional headful) Chromium session through the L0 CDP adapter and the L2 structural perceiver. To reproduce:
+
+1. Install Chrome/Chromium locally and note the executable path.
+2. Export `SOULBROWSER_USE_REAL_CHROME=1` (and typically `SOULBROWSER_DISABLE_SANDBOX=1` when running inside containers) so the adapter switches from the noop transport to the real Chromium transport. Optionally set `SOULBROWSER_CHROME=/absolute/path/to/chrome` if the binary is not discoverable via PATH.
+3. Execute `cargo run -- demo --chrome-path /absolute/path/to/chrome --screenshot soulbrowser-output/demo.png`.
+4. The command will
+   - Wait for a live page/session from Chrome,
+   - Navigate to `https://www.wikipedia.org/`,
+   - Use the structural perceiver to resolve the search input/button via DOM/AX snapshots,
+   - Type "SoulBrowser", click the submit button, and log CDP events,
+   - Capture a PNG screenshot in `soulbrowser-output/`.
+
+Use `--headful` to launch a visible Chrome window or tweak selectors/text with the `--input-selector`, `--submit-selector`, and `--input-text` flags.
+
+If you already have a Chrome instance running with DevTools remote debugging enabled (for example: `/usr/bin/google-chrome --remote-debugging-port=9222 ...`), you can attach instead of launching:
+
+```bash
+SOULBROWSER_USE_REAL_CHROME=1 \
+cargo run -- demo \
+  --ws-url ws://127.0.0.1:9222/devtools/browser/<id> \
+  --screenshot soulbrowser-output/demo.png
 ```
 
 ## 📦 Project Structure

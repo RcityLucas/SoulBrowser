@@ -1561,6 +1561,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
+name = "perceiver-structural"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cdp-adapter",
+ "dashmap",
+ "network-tap-light",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "soulbrowser-core-types",
+ "soulbrowser-policy-center",
+ "soulbrowser-registry",
+ "soulbrowser-state-center",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2224,6 +2245,7 @@ dependencies = [
  "network-tap-light",
  "once_cell",
  "parking_lot",
+ "perceiver-structural",
  "schemars",
  "serde",
  "serde_json",

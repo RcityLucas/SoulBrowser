@@ -1,10 +1,21 @@
 use anyhow::{anyhow, bail, Context, Result};
+use cdp_adapter::{
+    config::CdpConfig, event_bus, events::RawEvent, ids::PageId as AdapterPageId, AdapterError,
+    Cdp, CdpAdapter,
+};
 use clap::{Args, Parser, Subcommand};
+use perceiver_structural::{
+    AdapterPort as StructuralAdapterPort, ResolveHint, ResolveOptions, StructuralPerceiver,
+    StructuralPerceiverImpl,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::time::{sleep, timeout, Instant};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -20,8 +31,9 @@ use crate::types::BrowserType;
 use humantime::format_rfc3339;
 use serde_json::json;
 use soulbase_types::tenant::TenantId;
-use soulbrowser_core_types::ActionId;
-use soulbrowser_core_types::{RoutingHint, TaskId, ToolCall};
+use soulbrowser_core_types::{
+    ActionId, ExecRoute, FrameId, PageId, RoutingHint, SessionId, TaskId, ToolCall,
+};
 use soulbrowser_policy_center::RuntimeOverrideSpec;
 use soulbrowser_registry::Registry;
 use soulbrowser_scheduler::model::{
@@ -129,6 +141,9 @@ enum Commands {
 
     /// Manage policy snapshots and overrides
     Policy(PolicyArgs),
+
+    /// Run a minimal real-browser demo against Chromium via the CDP adapter
+    Demo(DemoArgs),
 }
 
 #[derive(Args)]
@@ -198,6 +213,53 @@ struct RunArgs {
     /// Number of parallel instances
     #[arg(long, default_value = "1")]
     parallel: usize,
+}
+
+#[derive(Args)]
+struct DemoArgs {
+    /// URL to open in the demo session
+    #[arg(long, default_value = "https://www.wikipedia.org/")]
+    url: String,
+
+    /// Seconds to wait for the initial page/session wiring
+    #[arg(long, default_value_t = 30)]
+    startup_timeout: u64,
+
+    /// Seconds to continue streaming events after DOM ready
+    #[arg(long, default_value_t = 5)]
+    hold_after_ready: u64,
+
+    /// Optional path to write a PNG screenshot after navigation
+    #[arg(long)]
+    screenshot: Option<PathBuf>,
+
+    /// Override Chrome/Chromium executable path (defaults to SOULBROWSER_CHROME or system path)
+    #[arg(long)]
+    chrome_path: Option<PathBuf>,
+
+    /// Run Chrome with a visible window instead of headless mode
+    #[arg(long)]
+    headful: bool,
+
+    /// Attach to an existing Chrome DevTools websocket instead of launching a new instance
+    #[arg(long)]
+    ws_url: Option<String>,
+
+    /// CSS selector for the input field to populate during the demo
+    #[arg(long, default_value = "#searchInput")]
+    input_selector: String,
+
+    /// Text to type into the input field
+    #[arg(long, default_value = "SoulBrowser")]
+    input_text: String,
+
+    /// CSS selector for the submit button; if omitted no click is issued
+    #[arg(long, default_value = "button.pure-button")]
+    submit_selector: String,
+
+    /// Skip the submit click step even if a selector is provided
+    #[arg(long)]
+    skip_submit: bool,
 }
 
 #[derive(Args)]
@@ -629,6 +691,7 @@ async fn main() -> Result<()> {
         Commands::Info => cmd_info(&config).await,
         Commands::Scheduler(args) => cmd_scheduler(args, &config).await,
         Commands::Policy(args) => cmd_policy(args, &config).await,
+        Commands::Demo(args) => cmd_demo_real(args).await,
     };
 
     match result {
@@ -1747,6 +1810,391 @@ async fn cmd_policy(args: PolicyArgs, config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn cmd_demo_real(args: DemoArgs) -> Result<()> {
+    let attach_existing = args.ws_url.is_some();
+    if !attach_existing {
+        ensure_real_chrome_enabled()?;
+    }
+
+    let temp_profile = if attach_existing {
+        None
+    } else {
+        let dir = PathBuf::from(format!(".soulbrowser-profile-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("creating profile directory {}", dir.display()))?;
+        Some(dir)
+    };
+
+    let (bus, mut rx) = event_bus(256);
+    let mut adapter_cfg = CdpConfig::default();
+    if let Some(url) = &args.ws_url {
+        adapter_cfg.websocket_url = Some(url.clone());
+    }
+    if let Some(path) = &args.chrome_path {
+        adapter_cfg.executable = path.clone();
+    }
+    if args.headful {
+        adapter_cfg.headless = false;
+    }
+    if let Some(profile_dir) = &temp_profile {
+        adapter_cfg.user_data_dir = profile_dir.clone();
+    }
+
+    let adapter = Arc::new(CdpAdapter::new(adapter_cfg, bus));
+    if let Some(ws) = &args.ws_url {
+        info!(%ws, "Attaching to existing DevTools endpoint");
+    }
+    let result = async {
+        Arc::clone(&adapter)
+            .start()
+            .await
+            .map_err(|err| adapter_error("starting CDP adapter", err))?;
+
+        let mut event_log = Vec::new();
+        let page_id = wait_for_page_ready(
+            Arc::clone(&adapter),
+            &mut rx,
+            Duration::from_secs(args.startup_timeout),
+            &mut event_log,
+        )
+        .await?;
+        info!(?page_id, url = %args.url, "Demo page ready; navigating");
+
+        adapter
+            .navigate(
+                page_id,
+                &args.url,
+                Duration::from_secs(args.startup_timeout),
+            )
+            .await
+            .map_err(|err| adapter_error("navigating to URL", err))?;
+
+        adapter
+            .wait_basic(
+                page_id,
+                "domready".to_string(),
+                Duration::from_secs(args.startup_timeout),
+            )
+            .await
+            .map_err(|err| adapter_error("waiting for DOM readiness", err))?;
+        info!("DOM ready reached; continuing to observe events");
+
+        let frame_stable_gate = json!({ "FrameStable": { "min_stable_ms": 200 } }).to_string();
+        if let Err(err) = adapter
+            .wait_basic(page_id, frame_stable_gate, Duration::from_secs(5))
+            .await
+        {
+            warn!(?err, "frame stability wait failed");
+        }
+
+        sleep(Duration::from_millis(300)).await;
+
+        let exec_route = build_exec_route(&adapter, page_id)?;
+        let perception_port = Arc::new(StructuralAdapterPort::new(Arc::clone(&adapter)));
+        let perceiver = StructuralPerceiverImpl::new(Arc::clone(&perception_port));
+        let resolve_opts = ResolveOptions::default();
+
+        let input_hint = ResolveHint::Css(args.input_selector.clone());
+        if let Ok(anchor) = perceiver
+            .resolve_anchor(exec_route.clone(), input_hint, resolve_opts.clone())
+            .await
+        {
+            info!(
+                selector = %args.input_selector,
+                reason = %anchor.reason,
+                "Input anchor resolved"
+            );
+            if let Ok(vis) = perceiver
+                .is_visible(exec_route.clone(), &anchor.primary)
+                .await
+            {
+                info!(
+                    selector = %args.input_selector,
+                    visible = vis.ok,
+                    reason = %vis.reason,
+                    "Input visibility check"
+                );
+            }
+        } else {
+            warn!(
+                selector = %args.input_selector,
+                "Falling back to raw selector for typing"
+            );
+        }
+
+        adapter
+            .type_text(
+                page_id,
+                &args.input_selector,
+                &args.input_text,
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|err| adapter_error("typing into input", err))?;
+        info!(text = %args.input_text, "Input field populated");
+
+        if !args.skip_submit {
+            let submit_hint = ResolveHint::Css(args.submit_selector.clone());
+            if let Ok(anchor) = perceiver
+                .resolve_anchor(exec_route.clone(), submit_hint, resolve_opts.clone())
+                .await
+            {
+                info!(
+                    selector = %args.submit_selector,
+                    reason = %anchor.reason,
+                    "Submit anchor resolved"
+                );
+                if let Ok(clickable) = perceiver
+                    .is_clickable(exec_route.clone(), &anchor.primary)
+                    .await
+                {
+                    info!(
+                        selector = %args.submit_selector,
+                        clickable = clickable.ok,
+                        reason = %clickable.reason,
+                        "Submit clickable check"
+                    );
+                }
+            } else {
+                warn!(
+                    selector = %args.submit_selector,
+                    "Falling back to raw selector for submit"
+                );
+            }
+
+            if let Err(err) = adapter
+                .click(page_id, &args.submit_selector, Duration::from_secs(5))
+                .await
+            {
+                warn!(?err, "clicking submit button failed");
+            } else {
+                info!("Submit button clicked");
+                let gate = json!({
+                    "NetworkQuiet": { "window_ms": 1_000, "max_inflight": 0 }
+                })
+                .to_string();
+                if let Err(err) = adapter
+                    .wait_basic(page_id, gate, Duration::from_secs(args.startup_timeout))
+                    .await
+                {
+                    warn!("Network quiet wait after submit failed: {:?}", err.kind);
+                }
+            }
+        }
+
+        collect_events(
+            &mut rx,
+            Duration::from_secs(args.hold_after_ready),
+            &mut event_log,
+        )
+        .await?;
+
+        if let Some(ctx) = adapter.registry().get(&page_id) {
+            if let Some(url) = ctx.recent_url {
+                println!("Final URL: {}", url);
+                event_log.push(format!("final_url {url}"));
+            }
+        }
+
+        if let Some(path) = &args.screenshot {
+            let bytes = adapter
+                .screenshot(page_id, Duration::from_secs(args.startup_timeout))
+                .await
+                .map_err(|err| adapter_error("capturing screenshot", err))?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await.with_context(|| {
+                    format!("creating screenshot directory {}", parent.display())
+                })?;
+            }
+            fs::write(path, &bytes)
+                .await
+                .with_context(|| format!("writing screenshot to {}", path.display()))?;
+            info!(path = %path.display(), "Screenshot saved");
+        }
+
+        adapter.shutdown().await;
+
+        println!("Demo captured {} events:", event_log.len());
+        for line in event_log {
+            println!("  - {line}");
+        }
+
+        Ok(())
+    }
+    .await;
+
+    if let Some(profile_dir) = temp_profile {
+        if let Err(err) = fs::remove_dir_all(&profile_dir).await {
+            warn!(
+                path = %profile_dir.display(),
+                ?err,
+                "failed to remove temporary chrome profile directory"
+            );
+        }
+    }
+
+    result
+}
+
+fn ensure_real_chrome_enabled() -> Result<()> {
+    let flag = env::var("SOULBROWSER_USE_REAL_CHROME")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let enabled = matches!(flag.as_str(), "1" | "true" | "yes" | "on");
+    if enabled {
+        Ok(())
+    } else {
+        bail!("Set SOULBROWSER_USE_REAL_CHROME=1 to run the demo against a real Chrome/Chromium binary");
+    }
+}
+
+fn build_exec_route(adapter: &Arc<CdpAdapter>, page_id: AdapterPageId) -> Result<ExecRoute> {
+    let context = adapter
+        .registry()
+        .iter()
+        .into_iter()
+        .find(|(pid, _)| pid == &page_id)
+        .map(|(_, ctx)| ctx)
+        .ok_or_else(|| anyhow!("no registry context available for page {:?}", page_id))?;
+
+    let session = SessionId(context.session_id.0.to_string());
+    let page = PageId(page_id.0.to_string());
+    let frame_key = context.target_id.clone().unwrap_or_else(|| page.0.clone());
+    let frame = FrameId(frame_key);
+
+    Ok(ExecRoute::new(session, page, frame))
+}
+
+fn adapter_error(context: &str, err: AdapterError) -> anyhow::Error {
+    let hint = err.hint.clone().unwrap_or_default();
+    let data = err
+        .data
+        .as_ref()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    anyhow!(
+        "{}: kind={:?}, retriable={}, hint={}, data={}",
+        context,
+        err.kind,
+        err.retriable,
+        hint,
+        data
+    )
+}
+
+async fn wait_for_page_ready(
+    adapter: Arc<CdpAdapter>,
+    rx: &mut cdp_adapter::EventStream,
+    wait_limit: Duration,
+    log: &mut Vec<String>,
+) -> Result<AdapterPageId> {
+    let deadline = Instant::now() + wait_limit;
+    loop {
+        if let Some((page_id, _ctx)) = adapter
+            .registry()
+            .iter()
+            .into_iter()
+            .find(|(_, ctx)| ctx.cdp_session.is_some())
+        {
+            return Ok(page_id);
+        }
+
+        if Instant::now() >= deadline {
+            let preview = log.iter().take(16).cloned().collect::<Vec<_>>();
+            let preview = preview.join(" | ");
+            bail!(
+                "Timed out waiting for Chrome target/session. Recent events: {}",
+                preview
+            );
+        }
+
+        match timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Ok(event)) => {
+                log.push(describe_raw_event(&event));
+            }
+            Ok(Err(RecvError::Lagged(skipped))) => {
+                warn!(skipped, "Demo event stream lagged; skipping older events");
+            }
+            Ok(Err(RecvError::Closed)) => {
+                bail!("CDP adapter event stream closed unexpectedly");
+            }
+            Err(_) => {
+                // No event within slice; continue polling registry
+            }
+        }
+    }
+}
+
+async fn collect_events(
+    rx: &mut cdp_adapter::EventStream,
+    duration: Duration,
+    log: &mut Vec<String>,
+) -> Result<()> {
+    if duration.is_zero() {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        let slice = if remaining > Duration::from_millis(500) {
+            Duration::from_millis(500)
+        } else {
+            remaining
+        };
+
+        match timeout(slice, rx.recv()).await {
+            Ok(Ok(event)) => {
+                log.push(describe_raw_event(&event));
+            }
+            Ok(Err(RecvError::Lagged(skipped))) => {
+                warn!(skipped, "Demo event stream lagged; skipping older events");
+            }
+            Ok(Err(RecvError::Closed)) => {
+                warn!("Demo event stream closed");
+                break;
+            }
+            Err(_) => {
+                // no event in this slice; loop continues until deadline
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn describe_raw_event(event: &RawEvent) -> String {
+    match event {
+        RawEvent::PageLifecycle {
+            page, frame, phase, ..
+        } => {
+            let frame_str = frame.map(|f| format!(" frame={:?}", f)).unwrap_or_default();
+            format!("page {:?} phase={}{}", page, phase, frame_str)
+        }
+        RawEvent::NetworkSummary {
+            page,
+            req,
+            res2xx,
+            res4xx,
+            res5xx,
+            inflight,
+            quiet,
+            since_last_activity_ms,
+            ..
+        } => format!(
+            "network {:?} req={} 2xx={} 4xx={} 5xx={} inflight={} quiet={} idle={}ms",
+            page, req, res2xx, res4xx, res5xx, inflight, quiet, since_last_activity_ms
+        ),
+        RawEvent::Error { message, .. } => format!("adapter-error: {message}"),
+    }
 }
 
 // Helper functions

@@ -95,6 +95,7 @@ async fn l1_end_to_end_flow() -> Result<()> {
         .send(cdp_adapter::events::RawEvent::PageLifecycle {
             page: cdp_page,
             frame: None,
+            parent: None,
             phase: "opened".into(),
             ts: 0,
         })

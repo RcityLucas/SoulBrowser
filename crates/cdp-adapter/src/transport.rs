@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chromiumoxide::async_process::Child;
@@ -9,8 +11,9 @@ use chromiumoxide::browser::BrowserConfig;
 use chromiumoxide::cdp::browser_protocol::target::SessionId as CdpSessionId;
 use chromiumoxide::cdp::events::CdpEventMessage;
 use chromiumoxide::conn::Connection;
+use chromiumoxide::error::CdpError;
 use chromiumoxide_types::{CallId, CdpJsonEventMessage, Message, MethodId, Response};
-use futures::StreamExt;
+use futures::{future::BoxFuture, StreamExt};
 use serde_json::json;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
@@ -19,6 +22,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::CdpConfig;
 use crate::error::{AdapterError, AdapterErrorKind};
+use crate::metrics;
 use crate::util::extract_ws_url;
 
 #[derive(Clone, Debug)]
@@ -70,27 +74,54 @@ impl CdpTransport for NoopTransport {
     }
 }
 
+type RuntimeFactory = Arc<
+    dyn Fn(CdpConfig) -> BoxFuture<'static, Result<Arc<RuntimeState>, AdapterError>> + Send + Sync,
+>;
+
 pub struct ChromiumTransport {
     cfg: CdpConfig,
-    state: OnceCell<Arc<RuntimeState>>,
+    state: OnceCell<Mutex<Option<Arc<RuntimeState>>>>,
+    factory: RuntimeFactory,
 }
 
 impl ChromiumTransport {
     pub fn new(cfg: CdpConfig) -> Self {
+        let factory: RuntimeFactory = Arc::new(|cfg: CdpConfig| {
+            Box::pin(async move {
+                let state = RuntimeState::start(cfg).await?;
+                Ok(Arc::new(state))
+            })
+        });
+
         Self {
             cfg,
             state: OnceCell::new(),
+            factory,
         }
     }
 
     async fn runtime(&self) -> Result<Arc<RuntimeState>, AdapterError> {
-        if let Some(rt) = self.state.get() {
-            return Ok(rt.clone());
+        let cell = self.state.get_or_init(|| async { Mutex::new(None) }).await;
+        let mut guard = cell.lock().await;
+
+        if let Some(rt) = guard.as_ref() {
+            if rt.is_alive() {
+                return Ok(rt.clone());
+            }
         }
 
-        let state = Arc::new(RuntimeState::start(self.cfg.clone()).await?);
-        let _ = self.state.set(state.clone());
-        Ok(state)
+        let runtime = (self.factory)(self.cfg.clone()).await?;
+        *guard = Some(runtime.clone());
+        Ok(runtime)
+    }
+
+    #[cfg(test)]
+    fn with_factory(cfg: CdpConfig, factory: RuntimeFactory) -> Self {
+        Self {
+            cfg,
+            state: OnceCell::new(),
+            factory,
+        }
     }
 }
 
@@ -99,12 +130,27 @@ impl CdpTransport for ChromiumTransport {
     async fn start(&self) -> Result<(), AdapterError> {
         let runtime = self.runtime().await?;
 
+        let deadline = Duration::from_millis(self.cfg.default_deadline_ms);
+
         runtime
             .send_internal(
                 CommandTarget::Browser,
                 "Target.setDiscoverTargets",
                 json!({ "discover": true }),
-                Duration::from_millis(self.cfg.default_deadline_ms),
+                deadline,
+            )
+            .await?;
+
+        runtime
+            .send_internal(
+                CommandTarget::Browser,
+                "Target.setAutoAttach",
+                json!({
+                    "autoAttach": true,
+                    "waitForDebuggerOnStart": false,
+                    "flatten": true,
+                }),
+                deadline,
             )
             .await?;
 
@@ -128,7 +174,8 @@ impl CdpTransport for ChromiumTransport {
         params: Value,
     ) -> Result<Value, AdapterError> {
         let runtime = self.runtime().await?;
-        runtime
+        let start = Instant::now();
+        match runtime
             .send_internal(
                 target,
                 method,
@@ -136,6 +183,16 @@ impl CdpTransport for ChromiumTransport {
                 Duration::from_millis(self.cfg.default_deadline_ms),
             )
             .await
+        {
+            Ok(value) => {
+                metrics::record_command_success(start.elapsed());
+                Ok(value)
+            }
+            Err(err) => {
+                metrics::record_command_failure();
+                Err(err)
+            }
+        }
     }
 }
 
@@ -151,12 +208,17 @@ struct RuntimeState {
     events_rx: Mutex<mpsc::Receiver<TransportEvent>>,
     loop_task: JoinHandle<()>,
     child: Mutex<Option<Child>>,
+    alive: Arc<AtomicBool>,
 }
 
 impl RuntimeState {
     async fn start(cfg: CdpConfig) -> Result<Self, AdapterError> {
-        let browser_cfg = Self::browser_config(&cfg)?;
-        let (child, ws_url) = Self::launch_browser(browser_cfg).await?;
+        let (child, ws_url) = if let Some(url) = cfg.websocket_url.clone() {
+            (None, url)
+        } else {
+            let browser_cfg = Self::browser_config(&cfg)?;
+            Self::launch_browser(browser_cfg).await?
+        };
 
         let conn = Connection::<CdpEventMessage>::connect(&ws_url)
             .await
@@ -165,8 +227,13 @@ impl RuntimeState {
         let (command_tx, command_rx) = mpsc::channel(128);
         let (events_tx, events_rx) = mpsc::channel(512);
 
+        let alive = Arc::new(AtomicBool::new(true));
+        let loop_alive = alive.clone();
+
         let loop_task = tokio::spawn(async move {
-            if let Err(err) = Self::run_loop(conn, command_rx, events_tx).await {
+            let result = Self::run_loop(conn, command_rx, events_tx).await;
+            loop_alive.store(false, Ordering::Relaxed);
+            if let Err(err) = result {
                 error!(target: "cdp-transport", ?err, "transport loop terminated with error");
             }
         });
@@ -178,7 +245,35 @@ impl RuntimeState {
             events_rx: Mutex::new(events_rx),
             loop_task,
             child: Mutex::new(child),
+            alive,
         })
+    }
+
+    #[cfg(test)]
+    fn test_stub() -> (Arc<Self>, Arc<AtomicBool>) {
+        let (command_tx, _command_rx) = mpsc::channel(8);
+        let (_events_tx, events_rx) = mpsc::channel(8);
+        let alive = Arc::new(AtomicBool::new(true));
+        let loop_alive = alive.clone();
+        let loop_task = tokio::spawn(async move {
+            futures::future::pending::<()>().await;
+            loop_alive.store(false, Ordering::Relaxed);
+        });
+
+        (
+            Arc::new(Self {
+                command_tx,
+                events_rx: Mutex::new(events_rx),
+                loop_task,
+                child: Mutex::new(None),
+                alive: alive.clone(),
+            }),
+            alive,
+        )
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 
     async fn send_internal(
@@ -218,6 +313,51 @@ impl RuntimeState {
     }
 
     fn browser_config(cfg: &CdpConfig) -> Result<BrowserConfig, AdapterError> {
+        if cfg.websocket_url.is_some() {
+            return Err(AdapterError::new(AdapterErrorKind::Internal)
+                .with_hint("browser_config requested while websocket_url present"));
+        }
+
+        if !cfg.executable.as_os_str().is_empty() && !cfg.executable.exists() {
+            return Err(AdapterError::new(AdapterErrorKind::CdpIo)
+                .with_hint(format!(
+                    "chrome executable not found at {}",
+                    cfg.executable.display()
+                ))
+                .with_data(json!({
+                    "expected": cfg.executable,
+                    "hint": "Set SOULBROWSER_CHROME to the full path of chrome/chromium."
+                })));
+        }
+
+        if cfg.websocket_url.is_some() {
+            return Ok(BrowserConfig::builder().build().map_err(|err| {
+                AdapterError::new(AdapterErrorKind::Internal)
+                    .with_hint(format!("browser config error: {err}"))
+            })?);
+        }
+
+        let profile_dir = if cfg.user_data_dir.is_absolute() {
+            cfg.user_data_dir.clone()
+        } else {
+            let cwd = std::env::current_dir().map_err(|err| {
+                AdapterError::new(AdapterErrorKind::Internal)
+                    .with_hint(format!("failed to resolve cwd for user-data-dir: {err}"))
+            })?;
+            cwd.join(&cfg.user_data_dir)
+        };
+
+        if let Some(parent) = profile_dir.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                AdapterError::new(AdapterErrorKind::Internal)
+                    .with_hint(format!("failed to create user-data-dir parent: {err}"))
+            })?;
+        }
+        fs::create_dir_all(&profile_dir).map_err(|err| {
+            AdapterError::new(AdapterErrorKind::Internal)
+                .with_hint(format!("failed to ensure user-data-dir: {err}"))
+        })?;
+
         let mut builder = BrowserConfig::builder()
             .request_timeout(Duration::from_millis(cfg.default_deadline_ms))
             .launch_timeout(Duration::from_secs(20));
@@ -226,8 +366,44 @@ impl RuntimeState {
             builder = builder.with_head();
         }
 
-        builder = builder.chrome_executable(cfg.executable.clone());
-        builder = builder.user_data_dir(cfg.user_data_dir.clone());
+        if std::env::var("SOULBROWSER_DISABLE_SANDBOX")
+            .map(|v| v != "0" && v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            builder = builder.no_sandbox();
+        }
+
+        let mut args = vec![
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-breakpad",
+            "--disable-client-side-phishing-detection",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-dev-shm-usage",
+            "--disable-extensions",
+            "--disable-hang-monitor",
+            "--disable-popup-blocking",
+            "--disable-prompt-on-repost",
+            "--disable-sync",
+            "--metrics-recording-only",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--password-store=basic",
+            "--remote-allow-origins=*",
+            "--use-mock-keychain",
+        ];
+        if cfg.headless {
+            args.push("--headless=new");
+            args.push("--hide-scrollbars");
+            args.push("--mute-audio");
+        }
+        builder = builder.args(args);
+
+        if !cfg.executable.as_os_str().is_empty() {
+            builder = builder.chrome_executable(cfg.executable.clone());
+        }
+        builder = builder.user_data_dir(profile_dir);
 
         builder.build().map_err(|err| {
             AdapterError::new(AdapterErrorKind::Internal)
@@ -274,8 +450,7 @@ impl RuntimeState {
                             }
                         }
                         Some(Err(err)) => {
-                            let adapter_err = AdapterError::new(AdapterErrorKind::CdpIo)
-                                .with_hint(err.to_string());
+                            let adapter_err = Self::map_cdp_error(err);
                             for (_, sender) in inflight.drain() {
                                 let _ = sender.send(Err(adapter_err.clone()));
                             }
@@ -357,16 +532,50 @@ impl RuntimeState {
         if let Some(result) = resp.result {
             Ok(result)
         } else if let Some(error) = resp.error {
+            let retriable = error.code >= 500;
             Err(AdapterError::new(AdapterErrorKind::CdpIo)
-                .with_hint(format!("cdp error {}: {}", error.code, error.message)))
+                .with_hint(format!("cdp error {}: {}", error.code, error.message))
+                .retriable(retriable))
         } else {
             Err(AdapterError::new(AdapterErrorKind::Internal).with_hint("empty cdp response"))
+        }
+    }
+
+    fn map_cdp_error(err: CdpError) -> AdapterError {
+        let hint = err.to_string();
+        match err {
+            CdpError::Timeout => AdapterError::new(AdapterErrorKind::NavTimeout)
+                .with_hint(hint)
+                .retriable(true),
+            CdpError::FrameNotFound(_) => {
+                AdapterError::new(AdapterErrorKind::Internal).with_hint(hint)
+            }
+            CdpError::JavascriptException(_) => {
+                AdapterError::new(AdapterErrorKind::Internal).with_hint(hint)
+            }
+            CdpError::Serde(_) => AdapterError::new(AdapterErrorKind::Internal).with_hint(hint),
+            CdpError::Ws(_)
+            | CdpError::Io(_)
+            | CdpError::Chrome(_)
+            | CdpError::ChromeMessage(_)
+            | CdpError::ChannelSendError(_)
+            | CdpError::NoResponse
+            | CdpError::LaunchExit(_, _)
+            | CdpError::LaunchTimeout(_)
+            | CdpError::LaunchIo(_, _)
+            | CdpError::DecodeError(_)
+            | CdpError::ScrollingFailed(_)
+            | CdpError::NotFound
+            | CdpError::Url(_) => AdapterError::new(AdapterErrorKind::CdpIo)
+                .with_hint(hint)
+                .retriable(true),
         }
     }
 }
 
 impl Drop for RuntimeState {
     fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
         self.loop_task.abort();
 
         if let Ok(mut guard) = self.child.try_lock() {
@@ -382,5 +591,60 @@ impl Drop for RuntimeState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    #[tokio::test]
+    async fn recreates_runtime_when_dead() {
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let alive_flags = Arc::new(TokioMutex::new(Vec::<Arc<AtomicBool>>::new()));
+
+        let factory: RuntimeFactory = {
+            let spawn_count = spawn_count.clone();
+            let alive_flags = alive_flags.clone();
+            Arc::new(move |cfg: CdpConfig| {
+                let spawn_count = spawn_count.clone();
+                let alive_flags = alive_flags.clone();
+                Box::pin(async move {
+                    let _ = cfg;
+                    spawn_count.fetch_add(1, AtomicOrdering::SeqCst);
+                    let (runtime, alive) = RuntimeState::test_stub();
+                    alive_flags.lock().await.push(alive);
+                    Ok(runtime)
+                })
+            })
+        };
+
+        let transport = ChromiumTransport::with_factory(CdpConfig::default(), factory);
+
+        let rt1 = transport.runtime().await.expect("runtime #1");
+        assert_eq!(spawn_count.load(AtomicOrdering::SeqCst), 1);
+
+        {
+            let guard = alive_flags.lock().await;
+            guard[0].store(false, AtomicOrdering::SeqCst);
+        }
+
+        let rt1_clone = rt1.clone();
+        drop(rt1);
+
+        let rt2 = transport.runtime().await.expect("runtime #2");
+        assert_eq!(spawn_count.load(AtomicOrdering::SeqCst), 2);
+        assert!(!Arc::ptr_eq(&rt1_clone, &rt2));
+
+        {
+            let guard = alive_flags.lock().await;
+            assert!(guard.len() >= 2);
+        }
+
+        drop(rt1_clone);
+        drop(rt2);
     }
 }

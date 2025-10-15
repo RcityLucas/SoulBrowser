@@ -5,14 +5,15 @@
 ## 1. 依赖与准备
 - [x] 引入 `chromiumoxide`、`rand` 等依赖（已完成 `cargo fetch`）。
 - [ ] 确认优先使用的浏览器（Chromium/Chrome）与运行参数，准备调试配置。例如：可执行路径、user-data-dir、headless/显示输出、代理设置。
+  - ⚠️ 当前默认优先读取环境变量 `SOULBROWSER_CHROME`；若未设置则依赖系统 PATH 或 chromiumoxide 的自动检测。建议显式安装 Chrome/Chromium 并通过 `SOULBROWSER_CHROME` 指定可执行路径，避免因找不到浏览器而出错。
 - [ ] 准备本地或 CI 环境：需要可运行的 Chrome 和 WebSocket 访问权限；考虑沙箱与权限限制。
 
 ## 2. Transport 实现（`crates/cdp-adapter/src/transport.rs`）
-- [ ] 新建 `ChromiumTransport` 结构体：
+- [x] 新建 `ChromiumTransport` 结构体：
   - 启动/连接浏览器；
   - 保存 `Browser`, `Handler`（chromiumoxide 链路）、channel senders/receivers；
   - 使用 `Handler::new`、`Connection::connect` 处理 websocket 连接，支持外部既有实例。
-- [ ] 实现 `CdpTransport` trait：
+- [x] 实现 `CdpTransport` trait：
   - `start()`：启动事件循环，订阅 `Handler` 的事件和响应；
   - `next_event()`：返回统一 `TransportEvent`（`method` + `params` JSON）；
   - `send_command()`：生成 command id、发送并 async 等待响应，超时/错误转换为 `AdapterError`；可利用 `CommandMessage`、`to_command_response`；
@@ -21,18 +22,18 @@
   - 监听 `Connection` 错误事件，重建浏览器/连接。
 
 ## 3. Adapter 层（`crates/cdp-adapter/src/adapter.rs`）
-- [ ] 扩展 `CdpAdapter::start()`：
+- [x] 扩展 `CdpAdapter::start()`：
   - 使用 `ChromiumTransport` 替换 `NoopTransport`；
   - 启动事件循环，将 `TransportEvent` 解析为 `RawEvent`（映射 `Page.lifecycle`, `Network.*`, `Runtime.exception` 等）；
   - 更新 `Registry`：注册新 session/page/frame；
   - 使用 `network_tap_light` retrofit（或将网络摘要发送到 bridge）。
-- [ ] `handle_event()`：
+- [x] `handle_event()`：
   - 解析 `method` 字符串映射到具体 `RawEvent`；
   - 维护 `PageId ↔ Target` 映射（`registry`）；
   - 将 RawEvent 推送到 `bus`。
-- [ ] 补充常用命令：navigate/click/type/wait/screenshot → 生成具体 `chromiumoxide_cdp` 命令参数。
-- [ ] `wait_basic`：映射 `WaitGate` 到 `chromiumoxide` 的等待 API（如 `Page::wait_for_navigation`、`Runtime::evaluate` 等）。
-- [ ] 错误映射：`chromiumoxide::error::CdpError` -> `AdapterError`（含 retriable 标识）。
+- [x] 补充常用命令：navigate/click/type/wait/screenshot → 生成具体 `chromiumoxide_cdp` 命令参数。
+- [x] `wait_basic`：映射 `WaitGate` 到 `chromiumoxide` 的等待 API（如 `Page::wait_for_navigation`、`Runtime::evaluate` 等）。
+- [x] 错误映射：`chromiumoxide::error::CdpError` -> `AdapterError`（含 retriable 标识）。
 
 ## 4. 网络探针整合
 - [ ] 在 `handle_event()` 中聚合 `Network.requestWillBeSent`/`Network.response*` 等事件；
@@ -49,7 +50,7 @@
 
 ## 6. 监控与指标
 - [ ] 扩展 scheduler metrics，加入请求耗时、失败原因；
-- [ ] 为 CDP adapter 增加基础 metrics（命令 P95、事件总数、重连次数），输出到 `tracing` 或 metrics crate；
+- [ ] 为 CDP adapter 增加基础 metrics（命令 P95、事件总数、重连次数），输出到 `tracing` 或 metrics crate；（当前已接入命令计数/成功率/耗时累计，待补 P95 与重连统计）
 - [ ] 接入可选的 Soulbase-observe/Prometheus exporter，输出 `scheduler`/`registry`/`adapter` 关键指标。
 
 ## 7. 测试计划
@@ -85,7 +86,7 @@
 - [ ] 本地验证：启动 headless Chrome，执行简单脚本，确认事件总线与 Registry 更新。
 
 ### Milestone B：网络探针与桥接
-- [ ] 聚合 `Network.*` 事件为 `RawEvent::NetworkSummary`，写入 `NetworkTapLight`。
+- [x] 聚合 `Network.*` 事件为 `RawEvent::NetworkSummary`，写入 `NetworkTapLight`。
 - [ ] `L0Bridge` 使用真实 TargetId/TapId 映射，多页面并发下正确创建/关闭。
 - [ ] 触发 `RegistryAction::PageHealthUpdated` 并写入 State Center；调整 `tests/l1_e2e.rs` 使用事件通知而非 `sleep`。
 

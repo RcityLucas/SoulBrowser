@@ -11,10 +11,12 @@ pub async fn extract_ws_url(child: &mut Child) -> Result<String> {
         .take()
         .ok_or_else(|| anyhow!("chromium process missing stderr handle"))?;
     let mut lines = BufReader::new(stderr).lines();
+    let mut captured = Vec::new();
 
     let reader = async {
         while let Some(line) = lines.next().await {
             let line = line?;
+            captured.push(line.clone());
             if let Some((_, ws)) = line.rsplit_once("listening on ") {
                 let ws = ws.trim();
                 if ws.starts_with("ws") && ws.contains("devtools/browser") {
@@ -23,7 +25,13 @@ pub async fn extract_ws_url(child: &mut Child) -> Result<String> {
             }
         }
         Err(anyhow!(
-            "chromium exited before exposing devtools websocket url"
+            "chromium exited before exposing devtools websocket url. stderr preview: {}",
+            captured
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ")
         ))
     };
 
