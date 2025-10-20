@@ -8,6 +8,8 @@ pub struct PolicySnapshot {
     pub scheduler: SchedulerPolicy,
     pub registry: RegistryPolicy,
     pub features: FeatureFlags,
+    #[serde(default)]
+    pub perceiver: PerceiverPolicies,
     pub provenance: HashMap<String, PolicyProvenance>,
 }
 
@@ -53,6 +55,70 @@ pub struct FeatureFlags {
     pub registry_ingest_bus: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct PerceiverPolicies {
+    pub structural: StructuralPerceiverPolicy,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StructuralPerceiverPolicy {
+    pub resolve: StructuralResolvePolicy,
+    pub weights: StructuralScoreWeights,
+    pub judge: StructuralJudgePolicy,
+    pub diff: StructuralDiffPolicy,
+    pub cache: StructuralCachePolicy,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StructuralResolvePolicy {
+    pub max_candidates: usize,
+    pub fuzziness: Option<f32>,
+    pub debounce_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StructuralScoreWeights {
+    pub visibility: f32,
+    pub accessibility: f32,
+    pub text: f32,
+    pub geometry: f32,
+    pub backend: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StructuralJudgePolicy {
+    pub minimum_opacity: Option<f32>,
+    pub minimum_visible_area: Option<f64>,
+    pub pointer_events_block: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StructuralDiffPolicy {
+    pub debounce_ms: Option<u64>,
+    pub max_changes: Option<usize>,
+    pub focus: Option<StructuralDiffFocus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StructuralDiffFocus {
+    pub backend_node_id: Option<u64>,
+    pub geometry: Option<StructuralDiffGeometry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StructuralDiffGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StructuralCachePolicy {
+    pub anchor_ttl_ms: u64,
+    pub snapshot_ttl_ms: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicyProvenance {
     pub path: String,
@@ -74,6 +140,7 @@ pub struct PolicyView {
     pub scheduler: SchedulerPolicy,
     pub registry: RegistryPolicy,
     pub features: FeatureFlags,
+    pub perceiver: PerceiverPolicies,
 }
 
 impl From<PolicySnapshot> for PolicyView {
@@ -83,6 +150,7 @@ impl From<PolicySnapshot> for PolicyView {
             scheduler: snapshot.scheduler,
             registry: snapshot.registry,
             features: snapshot.features,
+            perceiver: snapshot.perceiver,
         }
     }
 }

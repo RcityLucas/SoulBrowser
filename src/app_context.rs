@@ -307,6 +307,10 @@ impl AppContext {
         self.scheduler_service.clone()
     }
 
+    pub fn scheduler_runtime(&self) -> Arc<SchedulerRuntime> {
+        Arc::clone(&self._scheduler_runtime)
+    }
+
     pub fn policy_center(&self) -> Arc<dyn PolicyCenter + Send + Sync> {
         self.policy_center.clone()
     }

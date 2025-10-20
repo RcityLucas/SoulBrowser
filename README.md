@@ -86,21 +86,66 @@ cargo run -- demo \
   --screenshot soulbrowser-output/demo.png
 ```
 
+### Multi-Modal Perception Analysis
+
+The `perceive` CLI command provides comprehensive page analysis using all three L2 perceivers:
+
+```bash
+# Full multi-modal analysis with cross-modal insights
+SOULBROWSER_USE_REAL_CHROME=1 \
+cargo run -- perceive \
+  --url https://www.wikipedia.org \
+  --all \
+  --insights \
+  --screenshot wiki.png \
+  --output results.json
+
+# Visual-only analysis
+SOULBROWSER_USE_REAL_CHROME=1 \
+cargo run -- perceive \
+  --url https://example.com \
+  --visual \
+  --screenshot example.png
+
+# Semantic-only analysis
+SOULBROWSER_USE_REAL_CHROME=1 \
+cargo run -- perceive \
+  --url https://news.ycombinator.com \
+  --semantic \
+  --output hn-analysis.json
+```
+
+The command provides rich output including:
+- 📊 **Structural Analysis**: DOM node count, interactive elements, forms, navigation
+- 👁️ **Visual Analysis**: Dominant colors, contrast ratios, viewport utilization, complexity scores
+- 🧠 **Semantic Analysis**: Language detection, content classification, keywords, readability
+- 💡 **Cross-Modal Insights**: Performance, accessibility, UX observations from combining multiple modalities
+
 ## 📦 Project Structure
 
 ```
 SoulBrowser/
 ├── crates/
-│   ├── cdp-adapter/         # L0 transport & event wiring scaffold
-│   ├── permissions-broker/  # L0 policy runtime with TTL-aware decisions
-│   ├── network-tap-light/   # L0 network summary & snapshot helper
-│   ├── stealth/             # L0 fingerprint & captcha runtime scaffold
-│   └── extensions-bridge/   # L0 MV3 bridge scaffold
-├── docs/                    # Architecture plans & progress notes
-├── examples/                # Legacy demos (enable with `legacy-examples` feature)
-├── src/                     # CLI entrypoint and soul-base orchestration
-├── tests/                   # Integration harness (legacy bits gated)
-└── target/                  # Cargo build artifacts
+│   ├── cdp-adapter/            # L0 transport & event wiring scaffold
+│   ├── permissions-broker/     # L0 policy runtime with TTL-aware decisions
+│   ├── network-tap-light/      # L0 network summary & snapshot helper
+│   ├── stealth/                # L0 fingerprint & captcha runtime scaffold
+│   ├── extensions-bridge/      # L0 MV3 bridge scaffold
+│   ├── perceiver-structural/   # L2 DOM/AX tree analysis with caching
+│   ├── perceiver-visual/       # L2 screenshot capture and visual metrics
+│   ├── perceiver-semantic/     # L2 content classification and NLP
+│   ├── perceiver-hub/          # L2 multi-modal coordination layer
+│   ├── core-types/             # Shared data structures
+│   ├── event-bus/              # Event broadcasting system
+│   ├── registry/               # Session/page registry
+│   ├── scheduler/              # Task scheduling and dispatch
+│   ├── state-center/           # State management with telemetry
+│   └── policy-center/          # Policy and quota management
+├── docs/                       # Architecture plans & progress notes
+├── examples/                   # Legacy demos (enable with `legacy-examples` feature)
+├── src/                        # CLI entrypoint and orchestration
+├── tests/                      # Integration tests (includes L2 perception tests)
+└── target/                     # Cargo build artifacts
 ```
 
 ## 🔑 Key Features
@@ -140,11 +185,29 @@ Every action produces a rich observation containing:
 - **Execution Scheduler**: Concurrency and priority control
 - **State Center**: In-memory state with event logging
 
-### L2: Layered Perception
-- **Structural Perceiver**: DOM and Accessibility tree analysis
-- **Visual Perceiver**: Screenshot and OCR capabilities [Scaffold]
-- **Semantic Perceiver**: Content understanding [Later]
-- **Runtime Perceiver**: Console and performance monitoring
+### L2: Layered Perception ✨ Production-Ready Multi-Modal System
+- **Structural Perceiver**: DOM and Accessibility tree analysis with intelligent caching
+  - TTL-based anchor and snapshot caches (60s default, configurable)
+  - Automatic cache invalidation on CDP lifecycle events (navigate, load, DOM updates)
+  - Real-time metrics: hit/miss tracking, average latency, cache efficiency
+  - CLI visibility: `soulbrowser perceiver` shows cache stats and hit rates
+- **Visual Perceiver**: Screenshot capture and visual analysis ✅ Production-Ready
+  - CDP-based screenshot capture with configurable quality and format
+  - Visual metrics: color palette, contrast ratio, viewport utilization
+  - Visual diff computation (pixel-based and SSIM)
+  - Screenshot caching with TTL-based invalidation
+- **Semantic Perceiver**: Content understanding and classification ✅ Production-Ready
+  - Language detection with confidence scoring (60+ languages)
+  - Content type classification (Article, Portal, Form, Product, etc.)
+  - Page intent recognition (Informational, Transactional, Navigation)
+  - Text summarization and keyword extraction
+  - Readability scoring (Flesch-Kincaid)
+- **Multi-Modal Perception Hub**: Unified coordination layer ✅ Production-Ready
+  - Orchestrates all three perceivers for comprehensive page understanding
+  - Cross-modal insight generation (6 insight types)
+  - Confidence scoring across modalities
+  - Parallel execution with configurable timeouts
+  - CLI command: `soulbrowser perceive --url <URL> --all --insights`
 
 ### L3: Intelligent Action
 - **Action Primitives**: Low-level browser operations
@@ -215,6 +278,15 @@ cargo test -p network-tap-light
 cargo test -p stealth
 cargo test -p extensions-bridge
 
+# Run L2 perceiver tests
+cargo test -p perceiver-structural
+cargo test -p perceiver-visual
+cargo test -p perceiver-semantic
+cargo test -p perceiver-hub
+
+# Run L2 integration tests with real Chrome
+SOULBROWSER_USE_REAL_CHROME=1 cargo test --test l2_perception_integration
+
 # Run with logging
 RUST_LOG=debug cargo run
 
@@ -232,13 +304,15 @@ cargo clippy
 - ✅ Core architecture setup
 - ✅ Unified data contracts
 - 🔄 L0-L1 implementation
-- ⏳ L2-L3 core features
+- ✅ L2 Multi-Modal Perception (Structural, Visual, Semantic)
+- ⏳ L3 Intelligent Action enhancements
 
 ### Phase 2: Intelligence
-- ⏳ Visual perception
-- ⏳ Semantic understanding
-- ⏳ Advanced recovery
-- ⏳ Flow orchestration
+- ✅ Visual perception (screenshot, metrics, diff)
+- ✅ Semantic understanding (NLP, classification, summarization)
+- ✅ Multi-modal insight generation
+- ⏳ Advanced recovery strategies
+- ⏳ Flow orchestration and planning
 
 ### Phase 3: Scale
 - ⏳ Distributed execution

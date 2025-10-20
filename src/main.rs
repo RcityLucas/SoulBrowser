@@ -4,15 +4,21 @@ use cdp_adapter::{
     Cdp, CdpAdapter,
 };
 use clap::{Args, Parser, Subcommand};
+use chrono::Utc;
 use perceiver_structural::{
+    metrics::{self, MetricSnapshot},
     AdapterPort as StructuralAdapterPort, ResolveHint, ResolveOptions, StructuralPerceiver,
     StructuralPerceiverImpl,
 };
 use serde::{Deserialize, Serialize};
+use soulbrowser_state_center::{
+    InMemoryStateCenter, PerceiverEvent, PerceiverEventKind, ScoreComponentRecord, StateCenter,
+};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration as StdDuration, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{sleep, timeout, Instant};
@@ -34,12 +40,14 @@ use soulbase_types::tenant::TenantId;
 use soulbrowser_core_types::{
     ActionId, ExecRoute, FrameId, PageId, RoutingHint, SessionId, TaskId, ToolCall,
 };
-use soulbrowser_policy_center::RuntimeOverrideSpec;
+use soulbrowser_policy_center::{
+    default_snapshot, InMemoryPolicyCenter, PolicyCenter, RuntimeOverrideSpec,
+};
 use soulbrowser_registry::Registry;
 use soulbrowser_scheduler::model::{
     CallOptions, DispatchRequest, DispatchTimeline, Priority, RetryOpt,
 };
-use soulbrowser_scheduler::Dispatcher;
+use soulbrowser_scheduler::{metrics as scheduler_metrics, Dispatcher};
 use soulbrowser_state_center::{DispatchEvent, DispatchStatus, StateEvent};
 use std::time::Duration;
 use uuid::Uuid;
@@ -136,6 +144,9 @@ enum Commands {
     /// Show system information and health check
     Info,
 
+    /// Inspect recent perceiver events captured by the state center
+    Perceiver(PerceiverArgs),
+
     /// Inspect recent scheduler dispatch events
     Scheduler(SchedulerArgs),
 
@@ -144,6 +155,9 @@ enum Commands {
 
     /// Run a minimal real-browser demo against Chromium via the CDP adapter
     Demo(DemoArgs),
+
+    /// Perform multi-modal page perception (visual, semantic, structural)
+    Perceive(PerceiveArgs),
 }
 
 #[derive(Args)]
@@ -260,6 +274,57 @@ struct DemoArgs {
     /// Skip the submit click step even if a selector is provided
     #[arg(long)]
     skip_submit: bool,
+}
+
+#[derive(Args)]
+struct PerceiveArgs {
+    /// URL to analyze
+    #[arg(long)]
+    url: String,
+
+    /// Enable visual perception (screenshots, visual metrics)
+    #[arg(long)]
+    visual: bool,
+
+    /// Enable semantic perception (content classification, language detection)
+    #[arg(long)]
+    semantic: bool,
+
+    /// Enable structural perception (DOM/AX tree analysis)
+    #[arg(long)]
+    structural: bool,
+
+    /// Enable all perception modes (visual + semantic + structural)
+    #[arg(long)]
+    all: bool,
+
+    /// Capture screenshot to file
+    #[arg(long)]
+    screenshot: Option<PathBuf>,
+
+    /// Output perception results to JSON file
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Show cross-modal insights
+    #[arg(long)]
+    insights: bool,
+
+    /// Override Chrome/Chromium executable path
+    #[arg(long)]
+    chrome_path: Option<PathBuf>,
+
+    /// Run Chrome with a visible window instead of headless mode
+    #[arg(long)]
+    headful: bool,
+
+    /// Attach to an existing Chrome DevTools websocket
+    #[arg(long)]
+    ws_url: Option<String>,
+
+    /// Analysis timeout in seconds
+    #[arg(long, default_value = "30")]
+    timeout: u64,
 }
 
 #[derive(Args)]
@@ -544,6 +609,26 @@ enum SchedulerOutputFormat {
     Json,
 }
 
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum PerceiverKindFilter {
+    Resolve,
+    Judge,
+    Snapshot,
+    Diff,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum PerceiverCacheFilter {
+    Hit,
+    Miss,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum PerceiverOutputFormat {
+    Table,
+    Json,
+}
+
 #[derive(Args)]
 struct SchedulerArgs {
     /// Number of recent events to display (default: 20)
@@ -561,6 +646,41 @@ struct SchedulerArgs {
     /// Cancel a pending action by id
     #[arg(long)]
     cancel: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct PerceiverArgs {
+    /// Number of recent events to display (default: 20)
+    #[arg(short, long)]
+    limit: Option<usize>,
+
+    /// Only show events of the specified kind
+    #[arg(long, value_enum)]
+    kind: Option<PerceiverKindFilter>,
+
+    /// Only show judge events with the specified check (e.g., visible, clickable)
+    #[arg(long)]
+    check: Option<String>,
+
+    /// Filter by session id
+    #[arg(long)]
+    session: Option<String>,
+
+    /// Filter by page id
+    #[arg(long)]
+    page: Option<String>,
+
+    /// Filter by frame id
+    #[arg(long)]
+    frame: Option<String>,
+
+    /// Filter by cache status (resolve/snapshot events only)
+    #[arg(long, value_enum)]
+    cache: Option<PerceiverCacheFilter>,
+
+    /// Output format (`table` or `json`)
+    #[arg(long, value_enum, default_value_t = PerceiverOutputFormat::Table)]
+    format: PerceiverOutputFormat,
 }
 
 #[derive(Args)]
@@ -689,9 +809,11 @@ async fn main() -> Result<()> {
         Commands::Analyze(args) => cmd_analyze(args, &config).await,
         Commands::Config(args) => cmd_config(args, &config).await,
         Commands::Info => cmd_info(&config).await,
+        Commands::Perceiver(args) => cmd_perceiver(args, &config).await,
         Commands::Scheduler(args) => cmd_scheduler(args, &config).await,
         Commands::Policy(args) => cmd_policy(args, &config).await,
         Commands::Demo(args) => cmd_demo_real(args).await,
+        Commands::Perceive(args) => cmd_perceive(args).await,
     };
 
     match result {
@@ -1464,10 +1586,15 @@ async fn cmd_info(config: &Config) -> Result<()> {
         config.policy_paths.clone(),
     )
     .await?;
+    let overview = scheduler_overview(&context);
     let state_events = context.state_center_snapshot();
     let mut successes = 0usize;
     let mut failures = 0usize;
     let mut registry_count = 0usize;
+    let mut perceiver_resolve = 0usize;
+    let mut perceiver_judge = 0usize;
+    let mut perceiver_snapshot = 0usize;
+    let mut perceiver_diff = 0usize;
     for event in &state_events {
         match event {
             StateEvent::Dispatch(dispatch) => match dispatch.status {
@@ -1475,6 +1602,12 @@ async fn cmd_info(config: &Config) -> Result<()> {
                 DispatchStatus::Failure => failures += 1,
             },
             StateEvent::Registry(_) => registry_count += 1,
+            StateEvent::Perceiver(perceiver) => match &perceiver.kind {
+                PerceiverEventKind::Resolve { .. } => perceiver_resolve += 1,
+                PerceiverEventKind::Judge { .. } => perceiver_judge += 1,
+                PerceiverEventKind::Snapshot { .. } => perceiver_snapshot += 1,
+                PerceiverEventKind::Diff { .. } => perceiver_diff += 1,
+            },
         }
     }
 
@@ -1532,6 +1665,38 @@ async fn cmd_info(config: &Config) -> Result<()> {
     println!("- Successes: {}", successes);
     println!("- Failures: {}", failures);
     println!("- Registry events: {}", registry_count);
+    println!(
+        "- Scheduler snapshot captured_at: {}",
+        overview.captured_at.to_rfc3339()
+    );
+    println!(
+        "- Runtime queue → total={} lightning={} quick={} standard={} deep={}",
+        overview.runtime.queue_depth,
+        overview.queue_by_priority.lightning,
+        overview.queue_by_priority.quick,
+        overview.queue_by_priority.standard,
+        overview.queue_by_priority.deep
+    );
+    println!(
+        "- Runtime slots → inflight={}/{} (free={})",
+        overview.runtime.inflight,
+        overview.runtime.global_limit,
+        overview.runtime.slots_free
+    );
+    println!(
+        "- Metrics counters → enqueued={} started={} completed={} failed={} cancelled={}",
+        overview.metrics.enqueued,
+        overview.metrics.started,
+        overview.metrics.completed,
+        overview.metrics.failed,
+        overview.metrics.cancelled
+    );
+    if perceiver_resolve + perceiver_judge + perceiver_snapshot + perceiver_diff > 0 {
+        println!(
+            "- Perceiver events → resolve: {}, judge: {}, snapshot: {}, diff: {}",
+            perceiver_resolve, perceiver_judge, perceiver_snapshot, perceiver_diff
+        );
+    }
     if let Some(failure) = last_failure {
         println!(
             "- Last failure: {} at {} (error: {})",
@@ -1589,6 +1754,597 @@ async fn cmd_info(config: &Config) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_perceiver(args: PerceiverArgs, config: &Config) -> Result<()> {
+    let context = get_or_create_context(
+        "cli-perceiver".to_string(),
+        Some(config.output_dir.clone()),
+        config.policy_paths.clone(),
+    )
+    .await?;
+
+    let perceiver_events: Vec<PerceiverEvent> = context
+        .state_center_snapshot()
+        .into_iter()
+        .filter_map(|event| match event {
+            StateEvent::Perceiver(perceiver) => Some(perceiver),
+            _ => None,
+        })
+        .collect();
+
+    if perceiver_events.is_empty() {
+        println!("No perceiver events recorded yet.");
+        return Ok(());
+    }
+
+    let filtered = filter_perceiver_events(perceiver_events, &args);
+
+    if filtered.is_empty() {
+        println!("No perceiver events matched the provided filters.");
+        return Ok(());
+    }
+
+    let summary = summarize_perceiver_events(&filtered);
+
+    match args.format {
+        PerceiverOutputFormat::Table => {
+            print_perceiver_summary(&summary);
+            print_perceiver_table(&filtered);
+        }
+        PerceiverOutputFormat::Json => {
+            let events: Vec<_> = filtered.iter().map(perceiver_event_to_json).collect();
+            let payload = json!({
+                "summary": summary,
+                "events": events,
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct PerceiverSummary {
+    resolve: usize,
+    judge: usize,
+    snapshot: usize,
+    diff: usize,
+    metrics: MetricSnapshot,
+}
+
+fn filter_perceiver_events(
+    mut events: Vec<PerceiverEvent>,
+    args: &PerceiverArgs,
+) -> Vec<PerceiverEvent> {
+    let limit = args.limit.unwrap_or(20);
+    let check_filter = args.check.as_ref().map(|value| value.to_lowercase());
+    let session_filter = args.session.as_ref();
+    let page_filter = args.page.as_ref();
+    let frame_filter = args.frame.as_ref();
+
+    events = events
+        .into_iter()
+        .filter(|event| {
+            if let Some(kind_filter) = args.kind.as_ref() {
+                if !matches_perceiver_kind(kind_filter, &event.kind) {
+                    return false;
+                }
+            }
+
+            if let Some(expected_session) = session_filter {
+                if &event.route.session.0 != expected_session {
+                    return false;
+                }
+            }
+
+            if let Some(expected_page) = page_filter {
+                if &event.route.page.0 != expected_page {
+                    return false;
+                }
+            }
+
+            if let Some(expected_frame) = frame_filter {
+                if &event.route.frame.0 != expected_frame {
+                    return false;
+                }
+            }
+
+            if let Some(cache_filter) = args.cache.as_ref() {
+                if !matches_cache_filter(cache_filter, &event.kind) {
+                    return false;
+                }
+            }
+
+            if let Some(check_filter) = check_filter.as_ref() {
+                match &event.kind {
+                    PerceiverEventKind::Judge { check, .. } => {
+                        if check.to_lowercase() != *check_filter {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+
+            true
+        })
+        .collect();
+
+    events.sort_by_key(|event| event_timestamp_ms(event));
+    events.reverse();
+
+    if limit > 0 && events.len() > limit {
+        events.truncate(limit);
+    }
+
+    events
+}
+
+fn summarize_perceiver_events(events: &[PerceiverEvent]) -> PerceiverSummary {
+    let mut resolve = 0usize;
+    let mut judge = 0usize;
+    let mut snapshot = 0usize;
+    let mut diff = 0usize;
+    for event in events {
+        match event.kind {
+            PerceiverEventKind::Resolve { .. } => resolve += 1,
+            PerceiverEventKind::Judge { .. } => judge += 1,
+            PerceiverEventKind::Snapshot { .. } => snapshot += 1,
+            PerceiverEventKind::Diff { .. } => diff += 1,
+        }
+    }
+
+    PerceiverSummary {
+        resolve,
+        judge,
+        snapshot,
+        diff,
+        metrics: metrics::snapshot(),
+    }
+}
+
+fn print_perceiver_summary(summary: &PerceiverSummary) {
+    println!(
+        "Perceiver summary → resolve: {} | judge: {} | snapshot: {} | diff: {}",
+        summary.resolve, summary.judge, summary.snapshot, summary.diff
+    );
+    println!(
+        "Metric summary → resolve: {} (avg {:.2}ms) | judge: {} (avg {:.2}ms) | snapshot: {} (avg {:.2}ms) | diff: {} (avg {:.2}ms)",
+        summary.metrics.resolve.total,
+        summary.metrics.resolve.avg_ms,
+        summary.metrics.judge.total,
+        summary.metrics.judge.avg_ms,
+        summary.metrics.snapshot.total,
+        summary.metrics.snapshot.avg_ms,
+        summary.metrics.diff.total,
+        summary.metrics.diff.avg_ms
+    );
+    println!(
+        "Cache stats → resolve: {} hit / {} miss ({:.1}%) | snapshot: {} hit / {} miss ({:.1}%)",
+        summary.metrics.resolve_cache.hits,
+        summary.metrics.resolve_cache.misses,
+        summary.metrics.resolve_cache.hit_rate,
+        summary.metrics.snapshot_cache.hits,
+        summary.metrics.snapshot_cache.misses,
+        summary.metrics.snapshot_cache.hit_rate
+    );
+}
+
+fn print_perceiver_table(events: &[PerceiverEvent]) {
+    println!("Showing {} most recent perceiver event(s):", events.len());
+    for event in events {
+        let timestamp = format_rfc3339(event.recorded_at);
+        let route = &event.route;
+        match &event.kind {
+            PerceiverEventKind::Resolve {
+                strategy,
+                score,
+                candidate_count,
+                cache_hit,
+                breakdown,
+                reason,
+            } => {
+                let breakdown_summary = summarize_breakdown(breakdown);
+                println!(
+                    "[{}] resolve session={} page={} frame={} strategy={} score={:.2} candidates={} cache={} reason=\"{}\" breakdown=[{}]",
+                    timestamp,
+                    route.session.0,
+                    route.page.0,
+                    route.frame.0,
+                    strategy,
+                    score,
+                    candidate_count,
+                    if *cache_hit { "hit" } else { "miss" },
+                    reason,
+                    breakdown_summary,
+                );
+            }
+            PerceiverEventKind::Judge {
+                check,
+                ok,
+                reason,
+                facts,
+            } => {
+                println!(
+                    "[{}] judge::{} session={} page={} frame={} status={} reason=\"{}\" facts={}",
+                    timestamp,
+                    check,
+                    route.session.0,
+                    route.page.0,
+                    route.frame.0,
+                    if *ok { "ok" } else { "fail" },
+                    reason,
+                    compact_json(facts, 80),
+                );
+            }
+            PerceiverEventKind::Snapshot { cache_hit } => {
+                println!(
+                    "[{}] snapshot session={} page={} frame={} cache={}",
+                    timestamp,
+                    route.session.0,
+                    route.page.0,
+                    route.frame.0,
+                    if *cache_hit { "hit" } else { "miss" }
+                );
+            }
+            PerceiverEventKind::Diff {
+                change_count,
+                changes,
+            } => {
+                println!(
+                    "[{}] diff session={} page={} frame={} changes={} sample={}",
+                    timestamp,
+                    route.session.0,
+                    route.page.0,
+                    route.frame.0,
+                    change_count,
+                    changes
+                        .get(0)
+                        .map(|value| compact_json(value, 80))
+                        .unwrap_or_else(|| "-".into()),
+                );
+            }
+        }
+    }
+}
+
+fn perceiver_event_to_json(event: &PerceiverEvent) -> serde_json::Value {
+    let timestamp = format_rfc3339(event.recorded_at).to_string();
+    let route = &event.route;
+    match &event.kind {
+        PerceiverEventKind::Resolve {
+            strategy,
+            score,
+            candidate_count,
+            cache_hit,
+            breakdown,
+            reason,
+        } => json!({
+            "timestamp": timestamp,
+            "kind": "resolve",
+            "session": route.session.0,
+            "page": route.page.0,
+            "frame": route.frame.0,
+            "mutex_key": route.mutex_key,
+            "strategy": strategy,
+            "score": score,
+            "candidate_count": candidate_count,
+            "cache_hit": cache_hit,
+            "reason": reason,
+            "score_breakdown": breakdown,
+        }),
+        PerceiverEventKind::Judge {
+            check,
+            ok,
+            reason,
+            facts,
+        } => json!({
+            "timestamp": timestamp,
+            "kind": "judge",
+            "session": route.session.0,
+            "page": route.page.0,
+            "frame": route.frame.0,
+            "mutex_key": route.mutex_key,
+            "check": check,
+            "ok": ok,
+            "reason": reason,
+            "facts": facts,
+        }),
+        PerceiverEventKind::Snapshot { cache_hit } => json!({
+            "timestamp": timestamp,
+            "kind": "snapshot",
+            "session": route.session.0,
+            "page": route.page.0,
+            "frame": route.frame.0,
+            "mutex_key": route.mutex_key,
+            "cache_hit": cache_hit,
+        }),
+        PerceiverEventKind::Diff {
+            change_count,
+            changes,
+        } => json!({
+            "timestamp": timestamp,
+            "kind": "diff",
+            "session": route.session.0,
+            "page": route.page.0,
+            "frame": route.frame.0,
+            "mutex_key": route.mutex_key,
+            "change_count": change_count,
+            "changes": changes,
+        }),
+    }
+}
+
+fn summarize_breakdown(breakdown: &[ScoreComponentRecord]) -> String {
+    if breakdown.is_empty() {
+        return String::new();
+    }
+
+    let sum_abs: f32 = breakdown
+        .iter()
+        .map(|component| component.contribution.abs())
+        .sum();
+    let mut components: Vec<&ScoreComponentRecord> = breakdown.iter().collect();
+    components.sort_by(|a, b| {
+        b.contribution
+            .abs()
+            .partial_cmp(&a.contribution.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    components
+        .into_iter()
+        .map(|component| {
+            let magnitude = component.contribution.abs();
+            let sign = if component.contribution >= 0.0 {
+                '+'
+            } else {
+                '-'
+            };
+            let share = if sum_abs > f32::EPSILON {
+                (magnitude / sum_abs) * 100.0
+            } else {
+                0.0
+            };
+            format!(
+                "{}:{}{:.3} (w={:.3}, {:>3.0}%)",
+                component.label, sign, magnitude, component.weight, share
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn compact_json(value: &serde_json::Value, limit: usize) -> String {
+    let raw = match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    truncate(&raw, limit)
+}
+
+fn truncate(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        text.to_string()
+    } else {
+        format!("{}…", &text[..limit])
+    }
+}
+
+fn matches_perceiver_kind(filter: &PerceiverKindFilter, kind: &PerceiverEventKind) -> bool {
+    match (filter, kind) {
+        (PerceiverKindFilter::Resolve, PerceiverEventKind::Resolve { .. }) => true,
+        (PerceiverKindFilter::Judge, PerceiverEventKind::Judge { .. }) => true,
+        (PerceiverKindFilter::Snapshot, PerceiverEventKind::Snapshot { .. }) => true,
+        (PerceiverKindFilter::Diff, PerceiverEventKind::Diff { .. }) => true,
+        _ => false,
+    }
+}
+
+fn matches_cache_filter(filter: &PerceiverCacheFilter, kind: &PerceiverEventKind) -> bool {
+    match (filter, kind) {
+        (PerceiverCacheFilter::Hit, PerceiverEventKind::Resolve { cache_hit, .. }) => *cache_hit,
+        (PerceiverCacheFilter::Miss, PerceiverEventKind::Resolve { cache_hit, .. }) => !cache_hit,
+        (PerceiverCacheFilter::Hit, PerceiverEventKind::Snapshot { cache_hit }) => *cache_hit,
+        (PerceiverCacheFilter::Miss, PerceiverEventKind::Snapshot { cache_hit }) => !cache_hit,
+        _ => false,
+    }
+}
+
+fn event_timestamp_ms(event: &PerceiverEvent) -> u128 {
+    event
+        .recorded_at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| StdDuration::from_secs(0))
+        .as_millis()
+}
+
+#[cfg(test)]
+mod perceiver_cli_tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn base_args() -> PerceiverArgs {
+        PerceiverArgs {
+            limit: None,
+            kind: None,
+            check: None,
+            session: None,
+            page: None,
+            frame: None,
+            cache: None,
+            format: PerceiverOutputFormat::Table,
+        }
+    }
+
+    fn route(session: &str, page: &str, frame: &str) -> ExecRoute {
+        ExecRoute {
+            session: SessionId(session.to_string()),
+            page: PageId(page.to_string()),
+            frame: FrameId(frame.to_string()),
+            mutex_key: format!("frame:{}", frame),
+        }
+    }
+
+    fn stamped(mut event: PerceiverEvent, millis: u64) -> PerceiverEvent {
+        event.recorded_at = UNIX_EPOCH + Duration::from_millis(millis);
+        event
+    }
+
+    fn score_components(items: Vec<(&str, f32, f32)>) -> Vec<ScoreComponentRecord> {
+        items
+            .into_iter()
+            .map(|(label, weight, contribution)| ScoreComponentRecord {
+                label: label.into(),
+                weight,
+                contribution,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn filters_by_kind_and_orders_descending() {
+        let events = vec![
+            stamped(
+                PerceiverEvent::resolve(
+                    route("s1", "p1", "f1"),
+                    "css".into(),
+                    0.7,
+                    2,
+                    false,
+                    score_components(vec![("confidence", 1.0, 0.7)]),
+                    "score=0.7".into(),
+                ),
+                10,
+            ),
+            stamped(
+                PerceiverEvent::judge(
+                    route("s1", "p1", "f1"),
+                    "visible".into(),
+                    true,
+                    "geometry".into(),
+                    json!({ "geometry": {"width": 120} }),
+                ),
+                30,
+            ),
+            stamped(
+                PerceiverEvent::diff(route("s1", "p1", "f1"), 5, vec![json!({"kind": "text"})]),
+                20,
+            ),
+        ];
+
+        let mut args = base_args();
+        args.kind = Some(PerceiverKindFilter::Judge);
+        let filtered = filter_perceiver_events(events, &args);
+        assert_eq!(filtered.len(), 1);
+        match &filtered[0].kind {
+            PerceiverEventKind::Judge { check, .. } => assert_eq!(check, "visible"),
+            _ => panic!("expected judge event"),
+        }
+    }
+
+    #[test]
+    fn filters_by_cache_status() {
+        let events = vec![
+            stamped(
+                PerceiverEvent::resolve(
+                    route("s1", "p1", "f1"),
+                    "css".into(),
+                    0.8,
+                    3,
+                    true,
+                    score_components(vec![("confidence", 1.0, 0.8)]),
+                    "score=0.8".into(),
+                ),
+                40,
+            ),
+            stamped(PerceiverEvent::snapshot(route("s1", "p1", "f1"), false), 50),
+        ];
+
+        let mut args = base_args();
+        args.cache = Some(PerceiverCacheFilter::Miss);
+        let filtered = filter_perceiver_events(events, &args);
+        assert_eq!(filtered.len(), 1);
+        match &filtered[0].kind {
+            PerceiverEventKind::Snapshot { cache_hit } => assert!(!cache_hit),
+            _ => panic!("expected snapshot event"),
+        }
+    }
+
+    #[test]
+    fn applies_limit_and_session_filter() {
+        let events = vec![
+            stamped(
+                PerceiverEvent::resolve(
+                    route("a", "p1", "f1"),
+                    "css".into(),
+                    0.9,
+                    4,
+                    false,
+                    score_components(vec![("confidence", 1.0, 0.9)]),
+                    "score=0.9".into(),
+                ),
+                10,
+            ),
+            stamped(
+                PerceiverEvent::resolve(
+                    route("b", "p2", "f2"),
+                    "css".into(),
+                    0.6,
+                    1,
+                    true,
+                    score_components(vec![("confidence", 1.0, 0.6)]),
+                    "score=0.6".into(),
+                ),
+                30,
+            ),
+            stamped(
+                PerceiverEvent::resolve(
+                    route("a", "p3", "f3"),
+                    "text".into(),
+                    0.5,
+                    2,
+                    false,
+                    score_components(vec![("confidence", 1.0, 0.5)]),
+                    "score=0.5".into(),
+                ),
+                20,
+            ),
+        ];
+
+        let mut args = base_args();
+        args.session = Some("a".into());
+        args.limit = Some(1);
+        let filtered = filter_perceiver_events(events, &args);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].route.session.0, "a");
+        // Ensure the most recent event survives the limit.
+        assert_eq!(filtered[0].route.page.0, "p3");
+    }
+
+    #[test]
+    fn summarize_breakdown_formats_components() {
+        let records = vec![
+            ScoreComponentRecord {
+                label: "visibility".into(),
+                weight: 0.5,
+                contribution: 0.6,
+            },
+            ScoreComponentRecord {
+                label: "text".into(),
+                weight: 0.3,
+                contribution: 0.2,
+            },
+        ];
+        let summary = super::summarize_breakdown(&records);
+        assert!(summary.contains("visibility:+0.600"));
+        assert!(summary.contains("w=0.500"));
+        assert!(summary.contains("text:+0.200"));
+        assert!(summary.contains("%"));
+    }
+}
+
 async fn cmd_scheduler(args: SchedulerArgs, config: &Config) -> Result<()> {
     let context = get_or_create_context(
         "cli-scheduler".to_string(),
@@ -1612,10 +2368,7 @@ async fn cmd_scheduler(args: SchedulerArgs, config: &Config) -> Result<()> {
     }
 
     let events = context.state_center_snapshot();
-    if events.is_empty() {
-        println!("No dispatch events recorded yet.");
-        return Ok(());
-    }
+    let overview = scheduler_overview(&context);
 
     let limit = args.limit.unwrap_or(20);
     let status_filter = args.status;
@@ -1628,14 +2381,14 @@ async fn cmd_scheduler(args: SchedulerArgs, config: &Config) -> Result<()> {
                     (SchedulerStatusFilter::Failure, DispatchStatus::Failure) => true,
                     _ => false,
                 },
-                StateEvent::Registry(_) => false,
+                StateEvent::Registry(_) | StateEvent::Perceiver(_) => false,
             }
         } else {
             matches!(event, StateEvent::Dispatch(_))
         }
     });
 
-    let mut display_events: Vec<DispatchEvent> = if limit == 0 {
+    let display_events: Vec<DispatchEvent> = if limit == 0 {
         filtered_iter
             .filter_map(|event| match event {
                 StateEvent::Dispatch(dispatch) => Some(dispatch),
@@ -1652,24 +2405,39 @@ async fn cmd_scheduler(args: SchedulerArgs, config: &Config) -> Result<()> {
             .collect()
     };
 
-    if display_events.is_empty() {
-        match args.format {
-            SchedulerOutputFormat::Json => {
-                println!("[]");
-            }
-            SchedulerOutputFormat::Text => {
+    match args.format {
+        SchedulerOutputFormat::Text => {
+            println!(
+                "Scheduler counters → enqueued={} started={} completed={} failed={} cancelled={}",
+                overview.metrics.enqueued,
+                overview.metrics.started,
+                overview.metrics.completed,
+                overview.metrics.failed,
+                overview.metrics.cancelled
+            );
+            println!(
+                "Scheduler runtime → queue={} inflight={} slots_free={} (limit={}, per_task_limit={})",
+                overview.runtime.queue_depth,
+                overview.runtime.inflight,
+                overview.runtime.slots_free,
+                overview.runtime.global_limit,
+                overview.runtime.per_task_limit
+            );
+            println!(
+                "Queue breakdown → lightning={} quick={} standard={} deep={}",
+                overview.queue_by_priority.lightning,
+                overview.queue_by_priority.quick,
+                overview.queue_by_priority.standard,
+                overview.queue_by_priority.deep
+            );
+            if display_events.is_empty() {
                 if status_filter.is_some() {
                     println!("No events match the selected filters.");
                 } else {
                     println!("No dispatch events recorded yet.");
                 }
+                return Ok(());
             }
-        }
-        return Ok(());
-    }
-
-    match args.format {
-        SchedulerOutputFormat::Text => {
             println!(
                 "Recent scheduler dispatch events (latest first, showing up to {}):",
                 if limit == 0 {
@@ -1710,32 +2478,218 @@ async fn cmd_scheduler(args: SchedulerArgs, config: &Config) -> Result<()> {
             }
         }
         SchedulerOutputFormat::Json => {
-            let json_events: Vec<_> = display_events
-                .drain(..)
-                .map(|dispatch| {
-                    let recorded_at = format_rfc3339(dispatch.recorded_at).to_string();
-                    json!({
-                        "status": match dispatch.status {
-                            DispatchStatus::Success => "success",
-                            DispatchStatus::Failure => "failure",
-                        },
-                        "recorded_at": recorded_at,
-                        "tool": dispatch.tool,
-                        "route": dispatch.route.to_string(),
-                        "attempts": dispatch.attempts,
-                        "wait_ms": dispatch.wait_ms,
-                        "run_ms": dispatch.run_ms,
-                        "pending": dispatch.pending,
-                        "slots_available": dispatch.slots_available,
-                        "error": dispatch.error.map(|e| e.to_string()),
-                    })
-                })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&json_events)?);
+            let payload = scheduler_json_payload(&overview, &display_events);
+            println!("{}", serde_json::to_string_pretty(&payload)?);
         }
     }
 
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct SchedulerRuntimeSummary {
+    queue_depth: usize,
+    inflight: usize,
+    slots_free: usize,
+    global_limit: usize,
+    per_task_limit: usize,
+}
+
+#[derive(Clone, Debug)]
+struct QueueByPriority {
+    lightning: usize,
+    quick: usize,
+    standard: usize,
+    deep: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SchedulerOverview {
+    metrics: scheduler_metrics::SchedulerMetricsSnapshot,
+    runtime: SchedulerRuntimeSummary,
+    queue_by_priority: QueueByPriority,
+    captured_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn scheduler_overview(context: &Arc<AppContext>) -> SchedulerOverview {
+    let metrics = scheduler_metrics::snapshot();
+    let captured_at = Utc::now();
+    let runtime = context.scheduler_runtime();
+    let queue_depth = runtime.pending();
+    let slots_free = runtime.global_slots().available_permits();
+    let config = runtime.config();
+    let inflight = config.global_slots.saturating_sub(slots_free);
+    let per_priority = runtime.depth_by_priority();
+
+    SchedulerOverview {
+        metrics,
+        runtime: SchedulerRuntimeSummary {
+            queue_depth,
+            inflight,
+            slots_free,
+            global_limit: config.global_slots,
+            per_task_limit: config.per_task_limit,
+        },
+        queue_by_priority: QueueByPriority {
+            lightning: per_priority[Priority::Lightning.index()],
+            quick: per_priority[Priority::Quick.index()],
+            standard: per_priority[Priority::Standard.index()],
+            deep: per_priority[Priority::Deep.index()],
+        },
+        captured_at,
+    }
+}
+
+fn scheduler_json_payload(
+    overview: &SchedulerOverview,
+    events: &[DispatchEvent],
+) -> serde_json::Value {
+    let json_events: Vec<_> = events.iter().map(dispatch_event_to_value).collect();
+    json!({
+        "captured_at": overview.captured_at.to_rfc3339(),
+        "metrics": {
+            "enqueued": overview.metrics.enqueued,
+            "started": overview.metrics.started,
+            "completed": overview.metrics.completed,
+            "failed": overview.metrics.failed,
+            "cancelled": overview.metrics.cancelled,
+        },
+        "runtime": {
+            "queue_depth": overview.runtime.queue_depth,
+            "inflight": overview.runtime.inflight,
+            "slots_free": overview.runtime.slots_free,
+            "global_limit": overview.runtime.global_limit,
+            "per_task_limit": overview.runtime.per_task_limit,
+        },
+        "queue_by_priority": {
+            "lightning": overview.queue_by_priority.lightning,
+            "quick": overview.queue_by_priority.quick,
+            "standard": overview.queue_by_priority.standard,
+            "deep": overview.queue_by_priority.deep,
+        },
+        "events": json_events,
+    })
+}
+
+fn dispatch_event_to_value(dispatch: &DispatchEvent) -> serde_json::Value {
+    let recorded_at = format_rfc3339(dispatch.recorded_at).to_string();
+    json!({
+        "status": match dispatch.status {
+            DispatchStatus::Success => "success",
+            DispatchStatus::Failure => "failure",
+        },
+        "recorded_at": recorded_at,
+        "tool": dispatch.tool.clone(),
+        "route": dispatch.route.to_string(),
+        "attempts": dispatch.attempts,
+        "wait_ms": dispatch.wait_ms,
+        "run_ms": dispatch.run_ms,
+        "pending": dispatch.pending,
+        "slots_available": dispatch.slots_available,
+        "error": dispatch.error.as_ref().map(|e| e.to_string()),
+    })
+}
+
+impl SchedulerRuntimeSummary {
+    #[cfg(test)]
+    fn new_for_test(
+        queue_depth: usize,
+        inflight: usize,
+        slots_free: usize,
+        global_limit: usize,
+        per_task_limit: usize,
+    ) -> Self {
+        Self {
+            queue_depth,
+            inflight,
+            slots_free,
+            global_limit,
+            per_task_limit,
+        }
+    }
+}
+
+impl QueueByPriority {
+    #[cfg(test)]
+    fn new_for_test(lightning: usize, quick: usize, standard: usize, deep: usize) -> Self {
+        Self {
+            lightning,
+            quick,
+            standard,
+            deep,
+        }
+    }
+}
+
+impl SchedulerOverview {
+    #[cfg(test)]
+    fn new_for_test(
+        metrics: scheduler_metrics::SchedulerMetricsSnapshot,
+        runtime: SchedulerRuntimeSummary,
+        queue_by_priority: QueueByPriority,
+    ) -> Self {
+        Self {
+            metrics,
+            runtime,
+            queue_by_priority,
+            captured_at: chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .expect("valid test timestamp"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod scheduler_cli_tests {
+    use super::*;
+    use serde_json::json;
+    use soulbrowser_core_types::{ActionId, FrameId, PageId, SessionId};
+
+    fn mock_route() -> ExecRoute {
+        ExecRoute::new(SessionId::new(), PageId::new(), FrameId::new())
+    }
+
+    #[test]
+    fn scheduler_json_payload_contains_expected_fields() {
+        let metrics = scheduler_metrics::SchedulerMetricsSnapshot {
+            enqueued: 10,
+            started: 8,
+            completed: 7,
+            failed: 2,
+            cancelled: 1,
+        };
+        let runtime = SchedulerRuntimeSummary::new_for_test(5, 3, 2, 6, 2);
+        let queue = QueueByPriority::new_for_test(2, 1, 1, 1);
+        let overview = SchedulerOverview::new_for_test(metrics, runtime, queue);
+
+        let route = mock_route();
+        let mutex_key = route.mutex_key.clone();
+        let dispatch = DispatchEvent::success(
+            ActionId::new(),
+            Some("task-1".into()),
+            route.clone(),
+            "tool.click".into(),
+            mutex_key,
+            1,
+            12,
+            34,
+            0,
+            4,
+        );
+        let expected_timestamp = overview.captured_at.to_rfc3339();
+        let payload = scheduler_json_payload(&overview, &[dispatch]);
+        assert_eq!(payload["captured_at"], json!(expected_timestamp));
+
+        assert_eq!(payload["metrics"]["enqueued"], json!(10));
+        assert_eq!(payload["metrics"]["failed"], json!(2));
+        assert_eq!(payload["runtime"]["queue_depth"], json!(5));
+        assert_eq!(payload["runtime"]["global_limit"], json!(6));
+        assert_eq!(payload["queue_by_priority"]["lightning"], json!(2));
+        assert_eq!(payload["queue_by_priority"]["deep"], json!(1));
+        assert!(payload["events"].is_array());
+        assert_eq!(payload["events"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["events"][0]["tool"], "tool.click");
+        assert_eq!(payload["events"][0]["status"], "success");
+    }
 }
 
 async fn cmd_policy(args: PolicyArgs, config: &Config) -> Result<()> {
@@ -1750,10 +2704,12 @@ async fn cmd_policy(args: PolicyArgs, config: &Config) -> Result<()> {
         PolicyCommand::Show(show_args) => {
             let snapshot = context.policy_center().snapshot().await;
             let stats = context.state_center_stats();
+            let overview = scheduler_overview(&context);
             if show_args.json {
                 let payload = serde_json::json!({
                     "policy": &*snapshot,
                     "state_center_stats": stats,
+                    "scheduler": scheduler_json_payload(&overview, &[]),
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
@@ -1779,6 +2735,25 @@ async fn cmd_policy(args: PolicyArgs, config: &Config) -> Result<()> {
                     snapshot.features.state_center_persistence,
                     snapshot.features.metrics_export,
                     snapshot.features.registry_ingest_bus
+                );
+                println!(
+                    "Scheduler Runtime → queue={} (lightning={} quick={} standard={} deep={}) inflight={}/{} slots_free={}",
+                    overview.runtime.queue_depth,
+                    overview.queue_by_priority.lightning,
+                    overview.queue_by_priority.quick,
+                    overview.queue_by_priority.standard,
+                    overview.queue_by_priority.deep,
+                    overview.runtime.inflight,
+                    overview.runtime.global_limit,
+                    overview.runtime.slots_free
+                );
+                println!(
+                    "Scheduler Metrics → enqueued={} started={} completed={} failed={} cancelled={}",
+                    overview.metrics.enqueued,
+                    overview.metrics.started,
+                    overview.metrics.completed,
+                    overview.metrics.failed,
+                    overview.metrics.cancelled
                 );
                 println!(
                     "State Center Counters → total={}, success={}, failure={}, registry={}",
@@ -1843,7 +2818,7 @@ async fn cmd_demo_real(args: DemoArgs) -> Result<()> {
         adapter_cfg.user_data_dir = profile_dir.clone();
     }
 
-    let adapter = Arc::new(CdpAdapter::new(adapter_cfg, bus));
+    let adapter = Arc::new(CdpAdapter::new(adapter_cfg, bus.clone()));
     if let Some(ws) = &args.ws_url {
         info!(%ws, "Attaching to existing DevTools endpoint");
     }
@@ -1894,9 +2869,38 @@ async fn cmd_demo_real(args: DemoArgs) -> Result<()> {
 
         let exec_route = build_exec_route(&adapter, page_id)?;
         let perception_port = Arc::new(StructuralAdapterPort::new(Arc::clone(&adapter)));
-        let perceiver = StructuralPerceiverImpl::new(Arc::clone(&perception_port));
-        let resolve_opts = ResolveOptions::default();
+        let state_center: Arc<InMemoryStateCenter> = Arc::new(InMemoryStateCenter::new(256));
+        let state_center_dyn: Arc<dyn StateCenter> = state_center.clone();
+        let policy_center: Arc<dyn PolicyCenter + Send + Sync> =
+            Arc::new(InMemoryPolicyCenter::new(default_snapshot()));
+        let perceiver = Arc::new(
+            StructuralPerceiverImpl::with_state_center_and_live_policy(
+                Arc::clone(&perception_port),
+                state_center_dyn,
+                Arc::clone(&policy_center),
+            )
+            .await,
+        );
+        let mut lifecycle_rx = bus.subscribe();
+        let perceiver_for_events = Arc::clone(&perceiver);
+        let exec_page_for_events = exec_route.page.clone();
+        let page_id_for_events = page_id;
+        tokio::spawn(async move {
+            while let Ok(event) = lifecycle_rx.recv().await {
+                if let RawEvent::PageLifecycle { page, phase, .. } = event {
+                    if page == page_id_for_events {
+                        let phase_lower = phase.to_ascii_lowercase();
+                        if phase_lower.contains("navigate")
+                            || matches!(phase_lower.as_str(), "open" | "opened" | "close" | "closed")
+                        {
+                            perceiver_for_events.invalidate_for_page(&exec_page_for_events);
+                        }
+                    }
+                }
+            }
+        });
 
+        let resolve_opts = ResolveOptions::default();
         let input_hint = ResolveHint::Css(args.input_selector.clone());
         if let Ok(anchor) = perceiver
             .resolve_anchor(exec_route.clone(), input_hint, resolve_opts.clone())
@@ -1907,10 +2911,8 @@ async fn cmd_demo_real(args: DemoArgs) -> Result<()> {
                 reason = %anchor.reason,
                 "Input anchor resolved"
             );
-            if let Ok(vis) = perceiver
-                .is_visible(exec_route.clone(), &anchor.primary)
-                .await
-            {
+            let mut primary = anchor.primary.clone();
+            if let Ok(vis) = perceiver.is_visible(exec_route.clone(), &mut primary).await {
                 info!(
                     selector = %args.input_selector,
                     visible = vis.ok,
@@ -1934,6 +2936,7 @@ async fn cmd_demo_real(args: DemoArgs) -> Result<()> {
             )
             .await
             .map_err(|err| adapter_error("typing into input", err))?;
+        perceiver.invalidate_for_page(&exec_route.page);
         info!(text = %args.input_text, "Input field populated");
 
         if !args.skip_submit {
@@ -1947,8 +2950,9 @@ async fn cmd_demo_real(args: DemoArgs) -> Result<()> {
                     reason = %anchor.reason,
                     "Submit anchor resolved"
                 );
+                let mut primary = anchor.primary.clone();
                 if let Ok(clickable) = perceiver
-                    .is_clickable(exec_route.clone(), &anchor.primary)
+                    .is_clickable(exec_route.clone(), &mut primary)
                     .await
                 {
                     info!(
@@ -1971,6 +2975,7 @@ async fn cmd_demo_real(args: DemoArgs) -> Result<()> {
             {
                 warn!(?err, "clicking submit button failed");
             } else {
+                perceiver.invalidate_for_page(&exec_route.page);
                 info!("Submit button clicked");
                 let gate = json!({
                     "NetworkQuiet": { "window_ms": 1_000, "max_inflight": 0 }
@@ -1999,6 +3004,15 @@ async fn cmd_demo_real(args: DemoArgs) -> Result<()> {
             }
         }
 
+        let stats = state_center.stats();
+        info!(
+            resolve = stats.perceiver_resolve,
+            judge = stats.perceiver_judge,
+            snapshot = stats.perceiver_snapshot,
+            diff = stats.perceiver_diff,
+            "Perceiver telemetry recorded"
+        );
+
         if let Some(path) = &args.screenshot {
             let bytes = adapter
                 .screenshot(page_id, Duration::from_secs(args.startup_timeout))
@@ -2022,6 +3036,261 @@ async fn cmd_demo_real(args: DemoArgs) -> Result<()> {
             println!("  - {line}");
         }
 
+        Ok(())
+    }
+    .await;
+
+    if let Some(profile_dir) = temp_profile {
+        if let Err(err) = fs::remove_dir_all(&profile_dir).await {
+            warn!(
+                path = %profile_dir.display(),
+                ?err,
+                "failed to remove temporary chrome profile directory"
+            );
+        }
+    }
+
+    result
+}
+
+async fn cmd_perceive(args: PerceiveArgs) -> Result<()> {
+    use perceiver_hub::{PerceptionHub, PerceptionHubImpl, PerceptionOptions};
+    use perceiver_visual::VisualPerceiverImpl;
+    use perceiver_semantic::SemanticPerceiverImpl;
+
+    let attach_existing = args.ws_url.is_some();
+    if !attach_existing {
+        ensure_real_chrome_enabled()?;
+    }
+
+    let temp_profile = if attach_existing {
+        None
+    } else {
+        let dir = PathBuf::from(format!(".soulbrowser-profile-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("creating profile directory {}", dir.display()))?;
+        Some(dir)
+    };
+
+    let (bus, mut rx) = event_bus(256);
+    let mut adapter_cfg = CdpConfig::default();
+    if let Some(url) = &args.ws_url {
+        adapter_cfg.websocket_url = Some(url.clone());
+    }
+    if let Some(path) = &args.chrome_path {
+        adapter_cfg.executable = path.clone();
+    }
+    if args.headful {
+        adapter_cfg.headless = false;
+    }
+    if let Some(profile_dir) = &temp_profile {
+        adapter_cfg.user_data_dir = profile_dir.clone();
+    }
+
+    let adapter = Arc::new(CdpAdapter::new(adapter_cfg, bus.clone()));
+    if let Some(ws) = &args.ws_url {
+        info!(%ws, "Attaching to existing DevTools endpoint");
+    }
+
+    let result = async {
+        Arc::clone(&adapter)
+            .start()
+            .await
+            .map_err(|err| adapter_error("starting CDP adapter", err))?;
+
+        let mut event_log = Vec::new();
+        let page_id = wait_for_page_ready(
+            Arc::clone(&adapter),
+            &mut rx,
+            Duration::from_secs(30),
+            &mut event_log,
+        )
+        .await?;
+        info!(?page_id, url = %args.url, "Page ready; navigating for perception");
+
+        adapter
+            .navigate(page_id, &args.url, Duration::from_secs(30))
+            .await
+            .map_err(|err| adapter_error("navigating to URL", err))?;
+
+        adapter
+            .wait_basic(page_id, "domready".to_string(), Duration::from_secs(30))
+            .await
+            .map_err(|err| adapter_error("waiting for DOM readiness", err))?;
+
+        let frame_stable_gate = json!({ "FrameStable": { "min_stable_ms": 200 } }).to_string();
+        if let Err(err) = adapter
+            .wait_basic(page_id, frame_stable_gate, Duration::from_secs(5))
+            .await
+        {
+            warn!(?err, "frame stability wait failed");
+        }
+
+        sleep(Duration::from_millis(300)).await;
+
+        let exec_route = build_exec_route(&adapter, page_id)?;
+        let perception_port = Arc::new(StructuralAdapterPort::new(Arc::clone(&adapter)));
+        let state_center: Arc<InMemoryStateCenter> = Arc::new(InMemoryStateCenter::new(256));
+        let state_center_dyn: Arc<dyn StateCenter> = state_center.clone();
+        let policy_center: Arc<dyn PolicyCenter + Send + Sync> =
+            Arc::new(InMemoryPolicyCenter::new(default_snapshot()));
+
+        // Create structural perceiver
+        let structural_perceiver = Arc::new(
+            StructuralPerceiverImpl::with_state_center_and_live_policy(
+                Arc::clone(&perception_port),
+                state_center_dyn,
+                Arc::clone(&policy_center),
+            )
+            .await,
+        );
+
+        // Determine which perception modes to enable
+        let enable_visual = args.visual || args.all;
+        let enable_semantic = args.semantic || args.all;
+        let enable_structural = args.structural || args.all;
+
+        // Default to all modes if none specified
+        let (enable_visual, enable_semantic, enable_structural) = if !enable_visual && !enable_semantic && !enable_structural {
+            (true, true, true)
+        } else {
+            (enable_visual, enable_semantic, enable_structural)
+        };
+
+        println!("\n🔍 Multi-Modal Perception Analysis");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("URL: {}", args.url);
+        println!("Modes: {}{}{}",
+            if enable_structural { "📊 Structural " } else { "" },
+            if enable_visual { "👁️  Visual " } else { "" },
+            if enable_semantic { "🧠 Semantic " } else { "" }
+        );
+        println!();
+
+        // Create perception hub
+        let hub = if enable_visual && enable_semantic {
+            let visual_perceiver = Arc::new(VisualPerceiverImpl::new(Arc::clone(&adapter)));
+            let semantic_perceiver = Arc::new(SemanticPerceiverImpl::new(
+                structural_perceiver.clone() as Arc<dyn perceiver_structural::StructuralPerceiver>
+            ));
+            PerceptionHubImpl::new(
+                structural_perceiver,
+                visual_perceiver,
+                semantic_perceiver,
+            )
+        } else if enable_visual {
+            let visual_perceiver = Arc::new(VisualPerceiverImpl::new(Arc::clone(&adapter)));
+            PerceptionHubImpl::structural_only(structural_perceiver)
+                .with_visual(visual_perceiver)
+        } else if enable_semantic {
+            let semantic_perceiver = Arc::new(SemanticPerceiverImpl::new(
+                structural_perceiver.clone() as Arc<dyn perceiver_structural::StructuralPerceiver>
+            ));
+            PerceptionHubImpl::structural_only(structural_perceiver)
+                .with_semantic(semantic_perceiver)
+        } else {
+            PerceptionHubImpl::structural_only(structural_perceiver)
+        };
+
+        // Configure perception options
+        let perception_opts = PerceptionOptions {
+            enable_structural,
+            enable_visual,
+            enable_semantic,
+            enable_insights: args.insights,
+            capture_screenshot: enable_visual,
+            extract_text: enable_semantic,
+            timeout_secs: args.timeout,
+        };
+
+        // Perform multi-modal perception
+        info!("Starting multi-modal perception analysis");
+        let perception = hub.perceive(&exec_route, perception_opts).await
+            .context("multi-modal perception failed")?;
+
+        // Display results
+        println!("📊 Structural Analysis");
+        println!("  DOM nodes: {}", perception.structural.dom_node_count);
+        println!("  Interactive elements: {}", perception.structural.interactive_element_count);
+        println!("  Has forms: {}", perception.structural.has_forms);
+        println!("  Has navigation: {}", perception.structural.has_navigation);
+        println!();
+
+        if let Some(visual) = &perception.visual {
+            println!("👁️  Visual Analysis");
+            println!("  Dominant colors: {} detected", visual.dominant_colors.len());
+            println!("  Avg contrast: {:.2}", visual.avg_contrast);
+            println!("  Viewport utilization: {:.1}%", visual.viewport_utilization * 100.0);
+            println!("  Visual complexity: {:.2}", visual.complexity);
+            println!();
+
+            if let Some(screenshot_path) = &args.screenshot {
+                // Save screenshot using visual perceiver
+                let screenshot = hub.visual().unwrap()
+                    .capture_screenshot(&exec_route, Default::default())
+                    .await
+                    .context("capturing screenshot")?;
+
+                if let Some(parent) = screenshot_path.parent() {
+                    fs::create_dir_all(parent).await.with_context(|| {
+                        format!("creating screenshot directory {}", parent.display())
+                    })?;
+                }
+                fs::write(screenshot_path, &screenshot.data)
+                    .await
+                    .with_context(|| format!("writing screenshot to {}", screenshot_path.display()))?;
+                println!("  Screenshot saved: {}", screenshot_path.display());
+                println!();
+            }
+        }
+
+        if let Some(semantic) = &perception.semantic {
+            println!("🧠 Semantic Analysis");
+            println!("  Content type: {:?}", semantic.content_type);
+            println!("  Page intent: {:?}", semantic.intent);
+            println!("  Language: {} ({:.1}% confidence)",
+                semantic.language,
+                semantic.language_confidence * 100.0
+            );
+            if let Some(readability) = semantic.readability {
+                println!("  Readability score: {:.1}", readability);
+            }
+            println!("  Keywords: {}", semantic.keywords.join(", "));
+            println!("  Summary: {}", semantic.summary);
+            println!();
+        }
+
+        if args.insights && !perception.insights.is_empty() {
+            println!("💡 Cross-Modal Insights");
+            for insight in &perception.insights {
+                println!("  • [{:?}] {} (confidence: {:.0}%)",
+                    insight.insight_type,
+                    insight.description,
+                    insight.confidence * 100.0
+                );
+            }
+            println!();
+        }
+
+        println!("Overall confidence: {:.1}%", perception.confidence * 100.0);
+
+        // Save JSON output if requested
+        if let Some(output_path) = &args.output {
+            let json = serde_json::to_string_pretty(&perception)
+                .context("serializing perception results")?;
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent).await.with_context(|| {
+                    format!("creating output directory {}", parent.display())
+                })?;
+            }
+            fs::write(output_path, json)
+                .await
+                .with_context(|| format!("writing results to {}", output_path.display()))?;
+            println!("\n📄 Results saved to: {}", output_path.display());
+        }
+
+        adapter.shutdown().await;
         Ok(())
     }
     .await;

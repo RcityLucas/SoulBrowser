@@ -1,6 +1,8 @@
 use crate::model::{
-    FeatureFlags, PolicySnapshot, RegistryPolicy, RetryPolicy, SchedulerLimits, SchedulerPolicy,
-    SchedulerTimeouts,
+    FeatureFlags, PerceiverPolicies, PolicySnapshot, RegistryPolicy, RetryPolicy, SchedulerLimits,
+    SchedulerPolicy, SchedulerTimeouts, StructuralCachePolicy, StructuralDiffPolicy,
+    StructuralJudgePolicy, StructuralPerceiverPolicy, StructuralResolvePolicy,
+    StructuralScoreWeights,
 };
 
 pub fn default_snapshot() -> PolicySnapshot {
@@ -32,6 +34,36 @@ pub fn default_snapshot() -> PolicySnapshot {
             state_center_persistence: false,
             metrics_export: false,
             registry_ingest_bus: false,
+        },
+        perceiver: PerceiverPolicies {
+            structural: StructuralPerceiverPolicy {
+                resolve: StructuralResolvePolicy {
+                    max_candidates: 1,
+                    fuzziness: None,
+                    debounce_ms: Some(250),
+                },
+                weights: StructuralScoreWeights {
+                    visibility: 0.05,
+                    accessibility: 0.06,
+                    text: 0.05,
+                    geometry: 0.1,
+                    backend: 0.25,
+                },
+                judge: StructuralJudgePolicy {
+                    minimum_opacity: None,
+                    minimum_visible_area: None,
+                    pointer_events_block: true,
+                },
+                diff: StructuralDiffPolicy {
+                    debounce_ms: None,
+                    max_changes: None,
+                    focus: None,
+                },
+                cache: StructuralCachePolicy {
+                    anchor_ttl_ms: 250,
+                    snapshot_ttl_ms: 1_000,
+                },
+            },
         },
         provenance: Default::default(),
     }

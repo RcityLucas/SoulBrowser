@@ -65,6 +65,14 @@ impl PriorityLane {
         None
     }
 
+    pub fn len_by_priority(&self) -> [usize; 4] {
+        let mut lengths = [0usize; 4];
+        for (idx, queue) in self.queues.iter().enumerate() {
+            lengths[idx] = queue.len();
+        }
+        lengths
+    }
+
     fn try_consume(&mut self, idx: usize) -> Option<Job> {
         if self.queues[idx].is_empty() {
             return None;

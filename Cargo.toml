@@ -13,7 +13,10 @@ members = [
     "crates/scheduler",
     "crates/state-center",
     "crates/policy-center",
-    "crates/perceiver-structural"
+    "crates/perceiver-structural",
+    "crates/perceiver-visual",
+    "crates/perceiver-semantic",
+    "crates/perceiver-hub"
 ]
 resolver = "2"
 
@@ -91,6 +94,9 @@ network-tap-light = { path = "crates/network-tap-light" }
 dashmap = "5"
 parking_lot = "0.12"
 perceiver-structural = { path = "crates/perceiver-structural" }
+perceiver-visual = { path = "crates/perceiver-visual" }
+perceiver-semantic = { path = "crates/perceiver-semantic" }
+perceiver-hub = { path = "crates/perceiver-hub" }
 
 # CLI and argument parsing
 clap = { version = "4.4", features = ["derive", "color", "suggestions"] }

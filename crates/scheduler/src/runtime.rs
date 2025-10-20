@@ -193,6 +193,18 @@ impl LaneManager {
     pub fn is_empty(&self) -> bool {
         self.order.lock().is_empty()
     }
+
+    pub fn depth_by_priority(&self) -> [usize; 4] {
+        let mut totals = [0usize; 4];
+        for lane_entry in self.lanes.iter() {
+            let guard = lane_entry.value().lock();
+            let lengths = guard.len_by_priority();
+            for (idx, len) in lengths.iter().enumerate() {
+                totals[idx] += *len;
+            }
+        }
+        totals
+    }
 }
 
 #[derive(Debug)]
@@ -300,6 +312,10 @@ impl SchedulerRuntime {
 
     pub fn config(&self) -> SchedulerConfig {
         self.config.read().clone()
+    }
+
+    pub fn depth_by_priority(&self) -> [usize; 4] {
+        self.lanes.depth_by_priority()
     }
 
     fn acquire_task_slot(&self, task_id: &str) -> bool {

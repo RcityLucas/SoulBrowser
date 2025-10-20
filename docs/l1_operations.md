@@ -10,7 +10,7 @@
   - `Dispatcher::cancel(action_id)` 取消指定 Action。
   - `Dispatcher::cancel_call(call_id)` 基于外部幂等键撤销排队任务。
   - `Dispatcher::cancel_task(task_id)` 批量取消同一 Task 关联的任务。
-- 内部 metrics 提供 `scheduler::metrics::snapshot()`，输出 enqueued / started / completed / failed / cancelled 计数，可向上游曝光。
+- 内部 metrics 提供 `scheduler::metrics::snapshot()`，输出 enqueued / started / completed / failed / cancelled 计数，可向上游曝光。CLI `soulbrowser scheduler` / `soulbrowser info` / `soulbrowser policy show --json` 复用统一的概览结构，包含捕获时间戳、排队深度、各优先级队列长度、slot 使用情况以及指标计数，便于运维系统直接消费。
 
 ## Registry
 - `RegistryImpl::apply_network_snapshot(page_id, snapshot)` 可注入 L0 网络摘要并刷新 `PageHealth`；`ingest` 模块新增 `NetworkSummary` 事件分支以便通过事件总线传递。

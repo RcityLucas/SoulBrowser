@@ -1,0 +1,36 @@
+[package]
+name = "perceiver-hub"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+tracing = "0.1"
+thiserror = "1.0"
+dashmap = "6.0"
+
+# Internal dependencies - Perceivers
+perceiver-structural = { path = "../perceiver-structural" }
+perceiver-visual = { path = "../perceiver-visual" }
+perceiver-semantic = { path = "../perceiver-semantic" }
+
+# Internal dependencies - Core
+soulbrowser-core-types = { path = "../core-types" }
+cdp-adapter = { path = "../cdp-adapter" }
+soulbrowser-event-bus = { path = "../event-bus" }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = []
+# Enable visual OCR features
+visual-ocr = ["perceiver-visual/ocr"]

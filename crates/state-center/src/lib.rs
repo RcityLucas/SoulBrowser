@@ -99,9 +99,112 @@ impl DispatchEvent {
 }
 
 #[derive(Clone, Debug)]
+pub struct PerceiverEvent {
+    pub route: ExecRoute,
+    pub kind: PerceiverEventKind,
+    pub recorded_at: std::time::SystemTime,
+}
+
+impl PerceiverEvent {
+    pub fn resolve(
+        route: ExecRoute,
+        strategy: String,
+        score: f32,
+        candidate_count: usize,
+        cache_hit: bool,
+        breakdown: Vec<ScoreComponentRecord>,
+        reason: String,
+    ) -> Self {
+        Self {
+            route,
+            kind: PerceiverEventKind::Resolve {
+                strategy,
+                score,
+                candidate_count,
+                cache_hit,
+                breakdown,
+                reason,
+            },
+            recorded_at: std::time::SystemTime::now(),
+        }
+    }
+
+    pub fn judge(
+        route: ExecRoute,
+        check: String,
+        ok: bool,
+        reason: String,
+        facts: serde_json::Value,
+    ) -> Self {
+        Self {
+            route,
+            kind: PerceiverEventKind::Judge {
+                check,
+                ok,
+                reason,
+                facts,
+            },
+            recorded_at: std::time::SystemTime::now(),
+        }
+    }
+
+    pub fn snapshot(route: ExecRoute, cache_hit: bool) -> Self {
+        Self {
+            route,
+            kind: PerceiverEventKind::Snapshot { cache_hit },
+            recorded_at: std::time::SystemTime::now(),
+        }
+    }
+
+    pub fn diff(route: ExecRoute, change_count: usize, changes: Vec<serde_json::Value>) -> Self {
+        Self {
+            route,
+            kind: PerceiverEventKind::Diff {
+                change_count,
+                changes,
+            },
+            recorded_at: std::time::SystemTime::now(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ScoreComponentRecord {
+    pub label: String,
+    pub weight: f32,
+    pub contribution: f32,
+}
+
+#[derive(Clone, Debug)]
+pub enum PerceiverEventKind {
+    Resolve {
+        strategy: String,
+        score: f32,
+        candidate_count: usize,
+        cache_hit: bool,
+        breakdown: Vec<ScoreComponentRecord>,
+        reason: String,
+    },
+    Judge {
+        check: String,
+        ok: bool,
+        reason: String,
+        facts: serde_json::Value,
+    },
+    Snapshot {
+        cache_hit: bool,
+    },
+    Diff {
+        change_count: usize,
+        changes: Vec<serde_json::Value>,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub enum StateEvent {
     Dispatch(DispatchEvent),
     Registry(RegistryEvent),
+    Perceiver(PerceiverEvent),
 }
 
 impl StateEvent {
@@ -116,6 +219,10 @@ impl StateEvent {
     pub fn registry(event: RegistryEvent) -> Self {
         Self::Registry(event)
     }
+
+    pub fn perceiver(event: PerceiverEvent) -> Self {
+        Self::Perceiver(event)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -124,6 +231,10 @@ pub struct StateCenterStats {
     pub dispatch_success: u64,
     pub dispatch_failure: u64,
     pub registry_events: u64,
+    pub perceiver_resolve: u64,
+    pub perceiver_judge: u64,
+    pub perceiver_snapshot: u64,
+    pub perceiver_diff: u64,
 }
 
 #[derive(Debug)]
@@ -169,11 +280,13 @@ pub struct InMemoryStateCenter {
     global_capacity: usize,
     session_capacity: usize,
     page_capacity: usize,
+    frame_capacity: usize,
     task_capacity: usize,
     action_capacity: usize,
     events: Mutex<BoundedRing<StateEvent>>,
     session_events: DashMap<SessionId, Mutex<BoundedRing<StateEvent>>>,
     page_events: DashMap<PageId, Mutex<BoundedRing<StateEvent>>>,
+    frame_events: DashMap<FrameId, Mutex<BoundedRing<StateEvent>>>,
     task_events: DashMap<String, Mutex<BoundedRing<StateEvent>>>,
     action_events: DashMap<String, Mutex<BoundedRing<StateEvent>>>,
     stats: Mutex<StateCenterStats>,
@@ -184,17 +297,20 @@ impl InMemoryStateCenter {
         let global_capacity = capacity.max(1);
         let session_capacity = std::cmp::max(global_capacity / 2, 32);
         let page_capacity = std::cmp::max(global_capacity / 2, 32);
+        let frame_capacity = std::cmp::max(global_capacity / 2, 32);
         let task_capacity = std::cmp::max(global_capacity / 4, 16);
         let action_capacity = std::cmp::max(global_capacity / 4, 16);
         Self {
             global_capacity,
             session_capacity,
             page_capacity,
+            frame_capacity,
             task_capacity,
             action_capacity,
             events: Mutex::new(BoundedRing::new(global_capacity)),
             session_events: DashMap::new(),
             page_events: DashMap::new(),
+            frame_events: DashMap::new(),
             task_events: DashMap::new(),
             action_events: DashMap::new(),
             stats: Mutex::new(StateCenterStats::default()),
@@ -219,6 +335,13 @@ impl InMemoryStateCenter {
     pub fn recent_page(&self, page: &PageId) -> Vec<StateEvent> {
         self.page_events
             .get(page)
+            .map(|entry| entry.value().lock().snapshot())
+            .unwrap_or_default()
+    }
+
+    pub fn recent_frame(&self, frame: &FrameId) -> Vec<StateEvent> {
+        self.frame_events
+            .get(frame)
             .map(|entry| entry.value().lock().snapshot())
             .unwrap_or_default()
     }
@@ -289,6 +412,7 @@ impl StateCenter for NoopStateCenter {
 mod tests {
     use super::*;
 
+    use serde_json::json;
     use soulbrowser_core_types::{ActionId, FrameId, PageId, SessionId};
     use tempfile::NamedTempFile;
 
@@ -302,6 +426,7 @@ mod tests {
         let base_route = mock_route();
         let session_id = base_route.session.clone();
         let page_id = base_route.page.clone();
+        let frame_id = base_route.frame.clone();
         let action_success = ActionId::new();
         let action_failure = ActionId::new();
 
@@ -379,6 +504,8 @@ mod tests {
         assert!(!session_recent.is_empty());
         let page_recent = center.recent_page(&page_id);
         assert!(!page_recent.is_empty());
+        let frame_recent = center.recent_frame(&frame_id);
+        assert!(!frame_recent.is_empty());
         let task_recent = center.recent_task("task-1");
         assert_eq!(task_recent.len(), 2);
         let action_recent = center.recent_action(&action_success.0);
@@ -392,6 +519,72 @@ mod tests {
         assert!(written.contains("\"total_events\""));
         assert!(written.contains("dispatch_success"));
         assert!(written.contains("\"scopes\""));
+    }
+
+    #[tokio::test]
+    async fn perceiver_events_recorded() {
+        let center = InMemoryStateCenter::new(8);
+        let route = mock_route();
+
+        center
+            .append(StateEvent::perceiver(PerceiverEvent::resolve(
+                route.clone(),
+                "css".into(),
+                0.82,
+                3,
+                false,
+                vec![ScoreComponentRecord {
+                    label: "confidence".into(),
+                    weight: 1.0,
+                    contribution: 0.82,
+                }],
+                "score=0.82".into(),
+            )))
+            .await
+            .unwrap();
+
+        center
+            .append(StateEvent::perceiver(PerceiverEvent::judge(
+                route.clone(),
+                "clickable".into(),
+                true,
+                "visible".into(),
+                json!({ "geometry": {"width": 120} }),
+            )))
+            .await
+            .unwrap();
+
+        center
+            .append(StateEvent::perceiver(PerceiverEvent::snapshot(
+                route.clone(),
+                true,
+            )))
+            .await
+            .unwrap();
+
+        center
+            .append(StateEvent::perceiver(PerceiverEvent::diff(
+                route.clone(),
+                4,
+                vec![json!({"kind": "test"})],
+            )))
+            .await
+            .unwrap();
+
+        let stats = center.stats();
+        assert_eq!(stats.perceiver_resolve, 1);
+        assert_eq!(stats.perceiver_judge, 1);
+        assert_eq!(stats.perceiver_snapshot, 1);
+        assert_eq!(stats.perceiver_diff, 1);
+
+        let session_events = center.recent_session(&route.session);
+        assert_eq!(session_events.len(), 4);
+        assert!(session_events
+            .iter()
+            .all(|event| matches!(event, StateEvent::Perceiver(_))));
+
+        let frame_events = center.recent_frame(&route.frame);
+        assert_eq!(frame_events.len(), 4);
     }
 }
 
@@ -421,6 +614,7 @@ struct StateCenterSnapshot {
 enum SerializableStateEvent {
     Dispatch(SerializableDispatchEvent),
     Registry(SerializableRegistryEvent),
+    Perceiver(SerializablePerceiverEvent),
 }
 
 #[derive(Serialize)]
@@ -451,6 +645,24 @@ struct SerializableRegistryEvent {
 }
 
 #[derive(Serialize)]
+struct SerializablePerceiverEvent {
+    phase: &'static str,
+    route: RouteSnapshot,
+    recorded_at_ms: u128,
+    strategy: Option<String>,
+    score: Option<f32>,
+    candidate_count: Option<usize>,
+    cache_hit: Option<bool>,
+    check: Option<String>,
+    ok: Option<bool>,
+    reason: Option<String>,
+    change_count: Option<usize>,
+    score_breakdown: Option<Vec<ScoreComponentRecord>>,
+    facts: Option<serde_json::Value>,
+    changes: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Serialize)]
 struct RouteSnapshot {
     session: String,
     page: String,
@@ -462,6 +674,7 @@ struct RouteSnapshot {
 struct ScopeCounters {
     sessions: Vec<ScopeCount>,
     pages: Vec<ScopeCount>,
+    frames: Vec<ScopeCount>,
     tasks: Vec<ScopeCount>,
     actions: Vec<ScopeCount>,
 }
@@ -478,6 +691,7 @@ impl InMemoryStateCenter {
             StateEvent::Dispatch(dispatch) => {
                 self.push_session_event(&dispatch.route.session, event);
                 self.push_page_event(&dispatch.route.page, event);
+                self.push_frame_event(&dispatch.route.frame, event);
                 if let Some(task_id) = dispatch.task_id.as_ref() {
                     self.push_task_event(task_id, event);
                 }
@@ -490,6 +704,14 @@ impl InMemoryStateCenter {
                 if let Some(page) = registry.page.as_ref() {
                     self.push_page_event(page, event);
                 }
+                if let Some(frame) = registry.frame.as_ref() {
+                    self.push_frame_event(frame, event);
+                }
+            }
+            StateEvent::Perceiver(perceiver) => {
+                self.push_session_event(&perceiver.route.session, event);
+                self.push_page_event(&perceiver.route.page, event);
+                self.push_frame_event(&perceiver.route.frame, event);
             }
         }
     }
@@ -507,6 +729,14 @@ impl InMemoryStateCenter {
             .page_events
             .entry(page.clone())
             .or_insert_with(|| Mutex::new(BoundedRing::new(self.page_capacity)));
+        entry.value_mut().lock().push(event.clone());
+    }
+
+    fn push_frame_event(&self, frame: &FrameId, event: &StateEvent) {
+        let mut entry = self
+            .frame_events
+            .entry(frame.clone())
+            .or_insert_with(|| Mutex::new(BoundedRing::new(self.frame_capacity)));
         entry.value_mut().lock().push(event.clone());
     }
 
@@ -538,6 +768,14 @@ impl InMemoryStateCenter {
                 .collect(),
             pages: self
                 .page_events
+                .iter()
+                .map(|entry| ScopeCount {
+                    id: entry.key().0.clone(),
+                    count: entry.value().lock().len(),
+                })
+                .collect(),
+            frames: self
+                .frame_events
                 .iter()
                 .map(|entry| ScopeCount {
                     id: entry.key().0.clone(),
@@ -578,6 +816,20 @@ impl InMemoryStateCenter {
             StateEvent::Registry(_) => {
                 stats.registry_events = stats.registry_events.saturating_add(1)
             }
+            StateEvent::Perceiver(perceiver) => match &perceiver.kind {
+                PerceiverEventKind::Resolve { .. } => {
+                    stats.perceiver_resolve = stats.perceiver_resolve.saturating_add(1)
+                }
+                PerceiverEventKind::Judge { .. } => {
+                    stats.perceiver_judge = stats.perceiver_judge.saturating_add(1)
+                }
+                PerceiverEventKind::Snapshot { .. } => {
+                    stats.perceiver_snapshot = stats.perceiver_snapshot.saturating_add(1)
+                }
+                PerceiverEventKind::Diff { .. } => {
+                    stats.perceiver_diff = stats.perceiver_diff.saturating_add(1)
+                }
+            },
         }
     }
 }
@@ -587,6 +839,7 @@ impl From<&StateEvent> for SerializableStateEvent {
         match value {
             StateEvent::Dispatch(event) => SerializableStateEvent::Dispatch(event.into()),
             StateEvent::Registry(event) => SerializableStateEvent::Registry(event.into()),
+            StateEvent::Perceiver(event) => SerializableStateEvent::Perceiver(event.into()),
         }
     }
 }
@@ -628,6 +881,86 @@ impl From<&RegistryEvent> for SerializableRegistryEvent {
             frame: event.frame.as_ref().map(|f| f.0.clone()),
             note: event.note.clone(),
             recorded_at_ms: timestamp_ms(event.recorded_at),
+        }
+    }
+}
+
+impl From<&PerceiverEvent> for SerializablePerceiverEvent {
+    fn from(event: &PerceiverEvent) -> Self {
+        let mut strategy = None;
+        let mut score = None;
+        let mut candidate_count = None;
+        let mut cache_hit = None;
+        let mut check = None;
+        let mut ok = None;
+        let mut reason = None;
+        let mut change_count = None;
+        let mut breakdown = None;
+        let mut facts = None;
+        let mut changes_detail = None;
+        let phase = match &event.kind {
+            PerceiverEventKind::Resolve {
+                strategy: strat,
+                score: s,
+                candidate_count: count,
+                cache_hit: cache,
+                breakdown: components,
+                reason: r,
+            } => {
+                strategy = Some(strat.clone());
+                score = Some(*s);
+                candidate_count = Some(*count);
+                cache_hit = Some(*cache);
+                breakdown = Some(components.clone());
+                reason = Some(r.clone());
+                "resolve"
+            }
+            PerceiverEventKind::Judge {
+                check: chk,
+                ok: success,
+                reason: msg,
+                facts: payload,
+            } => {
+                check = Some(chk.clone());
+                ok = Some(*success);
+                reason = Some(msg.clone());
+                facts = Some(payload.clone());
+                "judge"
+            }
+            PerceiverEventKind::Snapshot { cache_hit: cache } => {
+                cache_hit = Some(*cache);
+                "snapshot"
+            }
+            PerceiverEventKind::Diff {
+                change_count: changes,
+                changes: detail,
+            } => {
+                change_count = Some(*changes);
+                changes_detail = Some(detail.clone());
+                "diff"
+            }
+        };
+
+        Self {
+            phase,
+            route: RouteSnapshot {
+                session: event.route.session.0.clone(),
+                page: event.route.page.0.clone(),
+                frame: event.route.frame.0.clone(),
+                mutex_key: event.route.mutex_key.clone(),
+            },
+            recorded_at_ms: timestamp_ms(event.recorded_at),
+            strategy,
+            score,
+            candidate_count,
+            cache_hit,
+            check,
+            ok,
+            reason,
+            change_count,
+            score_breakdown: breakdown,
+            facts,
+            changes: changes_detail,
         }
     }
 }

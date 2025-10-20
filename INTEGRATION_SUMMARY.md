@@ -25,6 +25,11 @@ SoulBrowser now routes the full CLI surface (start, run, record, replay, export,
 - ✅ Removed references to old soul_integration module
 - ✅ Commented out deprecated tests
 
+#### 4. **Perceiver Telemetry**
+- Structural perceiver now streams resolve/judge/snapshot/diff events into the state center
+- CLI demo logs per-run perceiver metrics for quick inspection
+- Added `soulbrowser perceiver` CLI command to inspect recent perceiver telemetry with filters
+
 ### Current Architecture
 
 ```
