@@ -1,5 +1,4 @@
 ///! Content type and intent classification
-
 use crate::{errors::*, models::*};
 use regex::Regex;
 
@@ -138,8 +137,7 @@ impl Classifier {
             && transactional_score > interactive_score
         {
             PageIntent::Transactional
-        } else if navigational_score > transactional_score
-            && navigational_score > interactive_score
+        } else if navigational_score > transactional_score && navigational_score > interactive_score
         {
             PageIntent::Navigational
         } else if interactive_score > 0 {

@@ -22,6 +22,12 @@ chromiumoxide = { version = "0.5", default-features = false, features = ["tokio-
 chromiumoxide_types = "0.5"
 rand = "0.8"
 anyhow = "1.0"
+lazy_static = "1.4"
+prometheus = "0.13"
+network-tap-light = { path = "../network-tap-light" }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 default = []

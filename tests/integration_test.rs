@@ -196,7 +196,7 @@ mod full_stack {
         assert!(tools.contains(&"click".to_string()));
         assert!(tools.contains(&"type-text".to_string()));
         assert!(tools.contains(&"wait-for-element".to_string()));
-        assert!(tools.contains(&"screenshot".to_string()));
+        assert!(tools.contains(&"take-screenshot".to_string()));
 
         // Test tool builder
         let builder = ToolBuilder::new("click")

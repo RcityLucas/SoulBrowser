@@ -1,12 +1,7 @@
 ///! Main semantic perceiver implementation
-
 use crate::{
-    classifier::Classifier,
-    errors::*,
-    keywords::KeywordExtractor,
-    language::LanguageDetector,
-    models::*,
-    summarizer::Summarizer,
+    classifier::Classifier, errors::*, keywords::KeywordExtractor, language::LanguageDetector,
+    models::*, summarizer::Summarizer,
 };
 use async_trait::async_trait;
 use perceiver_structural::StructuralPerceiver;
@@ -81,7 +76,11 @@ impl SemanticPerceiverImpl {
 
         // Extract text nodes (simplified approach)
         if let Some(dom_obj) = snapshot.dom_raw.as_object() {
-            Self::extract_text_from_value(&dom_obj.get("nodes").unwrap_or(&serde_json::Value::Null), &mut body_text, &mut headings);
+            Self::extract_text_from_value(
+                &dom_obj.get("nodes").unwrap_or(&serde_json::Value::Null),
+                &mut body_text,
+                &mut headings,
+            );
         }
 
         let body = body_text.join(" ");
@@ -89,7 +88,7 @@ impl SemanticPerceiverImpl {
 
         Ok(ExtractedText {
             body,
-            title: None, // TODO: Extract from DOM
+            title: None,       // TODO: Extract from DOM
             description: None, // TODO: Extract from meta tags
             headings,
             links: vec![], // TODO: Extract links
@@ -98,7 +97,11 @@ impl SemanticPerceiverImpl {
     }
 
     /// Recursively extract text from JSON value
-    fn extract_text_from_value(value: &serde_json::Value, body_text: &mut Vec<String>, headings: &mut Vec<String>) {
+    fn extract_text_from_value(
+        value: &serde_json::Value,
+        body_text: &mut Vec<String>,
+        headings: &mut Vec<String>,
+    ) {
         match value {
             serde_json::Value::Object(obj) => {
                 // Check for node type
@@ -176,40 +179,33 @@ impl SemanticPerceiver for SemanticPerceiverImpl {
         // Content classification (run in blocking task)
         let text_clone = text.clone();
         let classifier = self.classifier.clone();
-        let content_type = tokio::task::spawn_blocking(move || {
-            classifier.classify_content_type(&text_clone)
-        })
-        .await
-        .map_err(|e| SemanticError::AnalysisFailed(format!("Task join error: {}", e)))??;
+        let content_type =
+            tokio::task::spawn_blocking(move || classifier.classify_content_type(&text_clone))
+                .await
+                .map_err(|e| SemanticError::AnalysisFailed(format!("Task join error: {}", e)))??;
 
         // Intent classification
         let text_clone = text.clone();
         let classifier = self.classifier.clone();
-        let intent = tokio::task::spawn_blocking(move || {
-            classifier.classify_intent(&text_clone)
-        })
-        .await
-        .map_err(|e| SemanticError::AnalysisFailed(format!("Task join error: {}", e)))??;
+        let intent = tokio::task::spawn_blocking(move || classifier.classify_intent(&text_clone))
+            .await
+            .map_err(|e| SemanticError::AnalysisFailed(format!("Task join error: {}", e)))??;
 
         // Summarization
         let text_clone = text.clone();
         let summarizer = self.summarizer.clone();
-        let summary = tokio::task::spawn_blocking(move || {
-            summarizer.summarize(&text_clone)
-        })
-        .await
-        .map_err(|e| SemanticError::SummarizationFailed(format!("Task join error: {}", e)))??;
+        let summary = tokio::task::spawn_blocking(move || summarizer.summarize(&text_clone))
+            .await
+            .map_err(|e| SemanticError::SummarizationFailed(format!("Task join error: {}", e)))??;
 
         // Keyword extraction
         let keywords = if options.extract_keywords {
             let text_clone = text.clone();
             let options_clone = options.clone();
             let extractor = self.keyword_extractor.clone();
-            tokio::task::spawn_blocking(move || {
-                extractor.extract(&text_clone, &options_clone)
-            })
-            .await
-            .map_err(|e| SemanticError::AnalysisFailed(format!("Task join error: {}", e)))??
+            tokio::task::spawn_blocking(move || extractor.extract(&text_clone, &options_clone))
+                .await
+                .map_err(|e| SemanticError::AnalysisFailed(format!("Task join error: {}", e)))??
         } else {
             std::collections::HashMap::new()
         };

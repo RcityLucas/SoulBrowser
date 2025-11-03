@@ -5,6 +5,8 @@
 
 # Generated run outputs
 /soulbrowser-output/
+/.soulbrowser-profile/
+**/.soulbrowser-profile/
 
 # Local tooling and editor configs
 /.idea/

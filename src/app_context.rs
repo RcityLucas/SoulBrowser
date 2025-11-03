@@ -8,6 +8,7 @@ use parking_lot::RwLock as SyncRwLock;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
@@ -18,15 +19,21 @@ use crate::{
     storage::StorageManager,
     tools::BrowserToolManager,
 };
+use cdp_adapter::CdpAdapter;
+use l6_observe::{
+    exporter as obs_exporter, guard::LabelMap as ObsLabelMap, metrics as obs_metrics,
+    tracing as obs_tracing,
+};
 use soulbrowser_core_types::{ExecRoute, SoulError};
 use soulbrowser_event_bus::InMemoryBus;
 use soulbrowser_policy_center::{
     default_snapshot, load_snapshot, InMemoryPolicyCenter, PolicyCenter, PolicyView,
 };
 use soulbrowser_registry::{IngestHandle, Registry, RegistryEvent, RegistryImpl};
-use soulbrowser_scheduler::model::DispatchRequest;
 use soulbrowser_scheduler::{
-    api::SchedulerService, executor::ToolExecutor as SchedulerToolExecutor, model::SchedulerConfig,
+    api::SchedulerService,
+    executor::{ToolDispatchResult, ToolExecutor as SchedulerToolExecutor},
+    model::{DispatchRequest, SchedulerConfig},
     runtime::SchedulerRuntime,
 };
 use soulbrowser_state_center::{InMemoryStateCenter, StateCenter, StateCenterStats, StateEvent};
@@ -169,6 +176,9 @@ impl AppContext {
         ));
         scheduler_service.start().await;
 
+        obs_metrics::ensure_metrics();
+        obs_exporter::ensure_prometheus();
+
         {
             let mut policy_rx = policy_center.subscribe();
             let scheduler_runtime = Arc::clone(&scheduler_runtime);
@@ -246,9 +256,10 @@ impl AppContext {
 
         let (l0_bridge, l0_handles) = L0Bridge::new(
             registry.clone(),
-            Arc::clone(&state_center_dyn),
+            Arc::clone(&state_center_dyn_send),
             default_session.clone(),
-        );
+        )
+        .await;
 
         Ok(Self {
             storage,
@@ -338,9 +349,18 @@ impl AppContext {
         self.state_center.stats()
     }
 
+    pub fn state_center(&self) -> Arc<InMemoryStateCenter> {
+        self.state_center.clone()
+    }
+
     #[allow(dead_code)]
     pub fn l0_handles(&self) -> &L0Handles {
         &self.l0_handles
+    }
+
+    /// Attach a CDP adapter so that L0 permissions broker can drive Browser.setPermission.
+    pub async fn attach_cdp_adapter(&self, adapter: &Arc<CdpAdapter>) {
+        self.l0_handles.attach_cdp_adapter(adapter).await;
     }
 }
 
@@ -382,18 +402,52 @@ impl ToolManagerExecutorAdapter {
     }
 }
 
+const METRIC_SCHED_DISPATCHES: &str = "soul.l1.scheduler.dispatches";
+const METRIC_SCHED_LATENCY: &str = "soul.l1.scheduler.dispatch_latency_ms";
+
 #[async_trait::async_trait]
 impl SchedulerToolExecutor for ToolManagerExecutorAdapter {
-    async fn execute(&self, request: DispatchRequest, route: ExecRoute) -> Result<(), SoulError> {
+    async fn execute(
+        &self,
+        request: DispatchRequest,
+        route: ExecRoute,
+    ) -> Result<ToolDispatchResult, SoulError> {
+        let start = Instant::now();
+        let span = obs_tracing::tool_span(&request.tool_call.tool);
+        let _guard = span.enter();
+
         let subject = route.frame.0.clone();
-        self.tools
-            .execute(
+        let result = self
+            .tools
+            .execute_with_route(
                 &request.tool_call.tool,
                 &subject,
                 request.tool_call.payload.clone(),
+                Some(route.clone()),
             )
-            .await
-            .map(|_| ())
-            .map_err(|err| SoulError::new(err.to_string()))
+            .await;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        obs_tracing::observe_latency(&span, duration_ms);
+
+        let mut labels: ObsLabelMap = ObsLabelMap::new();
+        labels.insert("tool".into(), request.tool_call.tool.clone());
+
+        match result {
+            Ok(output) => {
+                labels.insert("success".into(), "true".into());
+                obs_metrics::inc(METRIC_SCHED_DISPATCHES, labels.clone());
+                obs_metrics::observe(METRIC_SCHED_LATENCY, duration_ms, labels);
+                Ok(ToolDispatchResult {
+                    output: Some(output),
+                })
+            }
+            Err(err) => {
+                labels.insert("success".into(), "false".into());
+                obs_metrics::inc(METRIC_SCHED_DISPATCHES, labels.clone());
+                obs_metrics::observe(METRIC_SCHED_LATENCY, duration_ms, labels);
+                Err(SoulError::new(err.to_string()))
+            }
+        }
     }
 }

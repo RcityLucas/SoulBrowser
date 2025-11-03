@@ -16,6 +16,7 @@ use soulbrowser_core_types::{
 use crate::{
     api::Registry,
     errors::RegistryError,
+    metrics,
     model::{FrameCtx, LifeState, PageCtx, SessionCtx},
 };
 
@@ -80,6 +81,7 @@ impl RegistryImpl {
             }
             guard.session.clone()
         };
+        metrics::record_page_health_update(snapshot);
         self.emit_registry_event(
             RegistryAction::PageHealthUpdated,
             Some(session),
@@ -88,6 +90,14 @@ impl RegistryImpl {
             None,
         );
         Ok(())
+    }
+
+    pub fn update_page_url(&self, page: &PageId, url: String) {
+        if let Ok(page_ctx) = self.ensure_page(page) {
+            let mut guard = page_ctx.write();
+            guard.url = Some(url);
+            guard.last_active_at = now();
+        }
     }
 
     fn emit_registry_event(
@@ -278,6 +288,7 @@ impl RegistryImpl {
 
         self.frames
             .insert(frame_id.clone(), Arc::new(RwLock::new(frame_ctx)));
+        metrics::set_frame_count(self.frames.len());
 
         if page_ctx.focused_frame.is_none() {
             page_ctx.focused_frame = page_ctx.main_frame.clone().or(Some(frame_id.clone()));
@@ -306,6 +317,7 @@ impl RegistryImpl {
         let page_id = frame_ctx.page.clone();
 
         self.remove_frame_recursive(frame);
+        metrics::set_frame_count(self.frames.len());
 
         let page_arc = self.ensure_page(&page_id)?;
         let mut page_ctx = page_arc.write();
@@ -360,6 +372,7 @@ impl Registry for RegistryImpl {
     async fn session_create(&self, profile: &str) -> Result<SessionId, SoulError> {
         let (id, ctx) = SessionCtx::new(profile);
         self.sessions.insert(id.clone(), Arc::new(RwLock::new(ctx)));
+        metrics::set_session_count(self.sessions.len());
         self.emit_registry_event(
             RegistryAction::SessionCreated,
             Some(id.clone()),
@@ -395,6 +408,8 @@ impl Registry for RegistryImpl {
             .insert(frame_id.clone(), Arc::new(RwLock::new(frame_ctx)));
         self.pages
             .insert(page_id.clone(), Arc::new(RwLock::new(page_ctx)));
+        metrics::set_page_count(self.pages.len());
+        metrics::set_frame_count(self.frames.len());
 
         if let Some(session_entry) = self.sessions.get(&session) {
             let mut session = session_entry.value().write();
@@ -451,6 +466,8 @@ impl Registry for RegistryImpl {
             None,
             None,
         );
+        metrics::set_page_count(self.pages.len());
+        metrics::set_frame_count(self.frames.len());
         Ok(())
     }
 

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "defaults": {
+    "allow": ["clipboard_read"],
+    "deny": [],
+    "ttl": "session"
+  },
+  "sites": [
+    {
+      "match_pattern": "https://*.example.com",
+      "allow": ["clipboard_read", "clipboard_write"],
+      "deny": [],
+      "ttl": "30m",
+      "notes": "Sample policy allowing clipboard for example.com"
+    }
+  ]
+}

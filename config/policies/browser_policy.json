@@ -36,6 +36,18 @@
     }
   },
   {
+    "when": { "Http": { "method": "POST", "path_glob": "browser://session/select" } },
+    "bind": {
+      "resource": "browser:session:select",
+      "action": "Invoke",
+      "attrs_template": {
+        "operation": "select",
+        "channel": "automation"
+      },
+      "attrs_from_body": true
+    }
+  },
+  {
     "when": { "Http": { "method": "POST", "path_glob": "browser://session/screenshot" } },
     "bind": {
       "resource": "browser:session:screenshot",

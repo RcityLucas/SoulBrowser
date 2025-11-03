@@ -1,0 +1,26 @@
+pub mod audit;
+pub mod errors;
+pub mod guard;
+pub mod hooks;
+pub mod host_api;
+pub mod kill_switch;
+pub mod manifest;
+pub mod metrics;
+pub mod policy;
+pub mod privacy;
+pub mod registry;
+pub mod runtime;
+pub mod sandbox;
+
+pub use audit::{NoopAudit, PluginAuditEvent};
+pub use errors::{PluginError, PluginResult};
+pub use guard::PluginGuard;
+pub use hooks::HookCtx;
+pub use host_api::{HostApi, HostContext, LogLevel, NoopHostApi};
+pub use kill_switch::KillSwitch;
+pub use manifest::{Permissions, PluginManifest, ProviderSpec};
+pub use metrics::observe_call;
+pub use policy::{HookAllow, PluginPolicyHandle, PluginPolicyView, TenantPolicy, Trust};
+pub use registry::{PluginRecord, PluginRegistry, PluginStatus};
+pub use runtime::PluginRuntime;
+pub use sandbox::SandboxHost;

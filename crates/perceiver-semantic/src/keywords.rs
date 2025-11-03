@@ -1,5 +1,4 @@
 ///! Keyword extraction module
-
 use crate::{errors::*, models::*};
 use std::collections::HashMap;
 use unicode_segmentation::UnicodeSegmentation;
@@ -19,16 +18,18 @@ impl KeywordExtractor {
     }
 
     /// Extract keywords from text
-    pub fn extract(&self, text: &ExtractedText, options: &SemanticOptions) -> Result<HashMap<String, f64>> {
+    pub fn extract(
+        &self,
+        text: &ExtractedText,
+        options: &SemanticOptions,
+    ) -> Result<HashMap<String, f64>> {
         let all_text = text.all_text();
         let words = self.tokenize(&all_text);
 
         // Filter out stop words and short words
         let filtered_words: Vec<String> = words
             .into_iter()
-            .filter(|w| {
-                w.len() > 2 && !self.stop_words.contains(&w.to_lowercase())
-            })
+            .filter(|w| w.len() > 2 && !self.stop_words.contains(&w.to_lowercase()))
             .collect();
 
         // Calculate term frequency
@@ -79,18 +80,16 @@ impl KeywordExtractor {
 
     /// Tokenize text into words
     fn tokenize(&self, text: &str) -> Vec<String> {
-        text.unicode_words()
-            .map(|w| w.to_string())
-            .collect()
+        text.unicode_words().map(|w| w.to_string()).collect()
     }
 
     /// Get common English stop words
     fn get_common_stop_words() -> Vec<String> {
         vec![
-            "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
-            "has", "he", "in", "is", "it", "its", "of", "on", "that", "the",
-            "to", "was", "will", "with", "the", "this", "but", "they", "have",
-            "had", "what", "when", "where", "who", "which", "why", "how",
+            "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "he", "in",
+            "is", "it", "its", "of", "on", "that", "the", "to", "was", "will", "with", "the",
+            "this", "but", "they", "have", "had", "what", "when", "where", "who", "which", "why",
+            "how",
         ]
         .iter()
         .map(|s| s.to_string())

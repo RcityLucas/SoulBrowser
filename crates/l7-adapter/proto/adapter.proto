@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package l7.adapter;
+
+message RunToolRequest {
+  string tenant_id = 1;
+  string tool = 2;
+  string params_json = 3;
+  string routing_json = 4;
+  string options_json = 5;
+  uint64 timeout_ms = 6;
+  string idempotency_key = 7;
+  string trace_id = 8;
+}
+
+message RunToolResponse {
+  string status = 1;
+  string data_json = 2;
+  string trace_id = 3;
+  string action_id = 4;
+}
+
+service AdapterService {
+  rpc RunTool (RunToolRequest) returns (RunToolResponse);
+}

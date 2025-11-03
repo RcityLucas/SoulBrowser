@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use soulbrowser_core_types::{ActionId, ExecRoute, RoutingHint, SoulError, ToolCall};
 use tokio::sync::oneshot;
 
@@ -84,22 +85,30 @@ pub struct DispatchOutput {
     pub route: ExecRoute,
     pub error: Option<SoulError>,
     pub timeline: DispatchTimeline,
+    pub output: Option<Value>,
 }
 
 impl DispatchOutput {
-    pub fn ok(route: ExecRoute, timeline: DispatchTimeline) -> Self {
+    pub fn ok(route: ExecRoute, timeline: DispatchTimeline, output: Option<Value>) -> Self {
         Self {
             route,
             error: None,
             timeline,
+            output,
         }
     }
 
-    pub fn err(route: ExecRoute, error: SoulError, timeline: DispatchTimeline) -> Self {
+    pub fn err(
+        route: ExecRoute,
+        error: SoulError,
+        timeline: DispatchTimeline,
+        output: Option<Value>,
+    ) -> Self {
         Self {
             route,
             error: Some(error),
             timeline,
+            output,
         }
     }
 }

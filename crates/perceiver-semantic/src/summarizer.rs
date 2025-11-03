@@ -1,5 +1,4 @@
 ///! Content summarization module
-
 use crate::{errors::*, models::*};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -205,8 +204,7 @@ mod tests {
     fn test_summarize() {
         let summarizer = Summarizer::new();
         let text = ExtractedText {
-            body: "This is the first sentence. This is the second. This is the third."
-                .to_string(),
+            body: "This is the first sentence. This is the second. This is the third.".to_string(),
             title: Some("Test Title".to_string()),
             description: None,
             headings: vec!["Heading One".to_string(), "Heading Two".to_string()],

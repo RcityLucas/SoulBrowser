@@ -1,0 +1,50 @@
+.previewPage {
+  display: flex;
+  gap: 24px;
+  height: 100%;
+}
+
+.preview {
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar {
+  width: 300px;
+  flex-shrink: 0;
+}
+
+.card {
+  background: #1f1f1f;
+  border: 1px solid #303030;
+  height: 100%;
+}
+
+.canvasContainer {
+  position: relative;
+  width: 100%;
+  height: calc(100vh - 200px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.canvas {
+  max-width: 100%;
+  max-height: 100%;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
+.noPreview {
+  color: #8c8c8c;
+  font-size: 16px;
+}
+
+.frameInfo {
+  font-size: 12px;
+  color: #8c8c8c;
+  margin-top: 4px;
+}

@@ -34,10 +34,12 @@ L0: Runtime & Adapters [In-flight]
 - **Policy center**: `soulbrowser policy show`/`override` exposes current limits and allows runtime overrides (with TTL) that feed into the scheduler/registry.
 - **Feature flags**: legacy examples/tests are gated behind `legacy-examples` / `legacy-tests` to keep the default build green.
 
-See `docs/l0_development_plan.md` for detailed progress and `docs/l1_development_plan.md` for the upcoming kernel roadmap.
+See `docs/PRODUCT_COMPLETION_PLAN.md` for the consolidated roadmap, `docs/L0_ACTUAL_PROGRESS.md` for runtime status details, and `docs/AI_BROWSER_EXPERIENCE_PLAN.md` for the upcoming AI browser experience work.
 ```
 
 ## 🚀 Quick Start
+
+> 📖 **New User?** Start with our [快速开始指南](docs/快速开始指南.md) for a 5-minute walkthrough!
 
 ```bash
 # Clone the repository
@@ -59,6 +61,16 @@ SOULBROWSER_DISABLE_SANDBOX=1 \
 cargo run -- demo \
     --chrome-path /path/to/chrome \
     --screenshot soulbrowser-output/demo.png
+```
+
+### 🎯 30-Second Demo
+```bash
+# Enable Chrome connection
+export SOULBROWSER_USE_REAL_CHROME=1
+export SOULBROWSER_DISABLE_SANDBOX=1
+
+# Run intelligent demo
+soulbrowser demo --headful --screenshot demo-result.png
 ```
 
 ### Real Browser Demo
@@ -85,6 +97,24 @@ cargo run -- demo \
   --ws-url ws://127.0.0.1:9222/devtools/browser/<id> \
   --screenshot soulbrowser-output/demo.png
 ```
+
+### L7 Gateway Surfaces
+
+The `gateway` command exposes the external adapter interfaces (HTTP, optional gRPC, optional WebDriver bridge) on top of the live scheduler and state center:
+
+```bash
+# Start HTTP adapter on 8710 and the WebDriver bridge on 9515
+soulbrowser gateway \
+  --http 127.0.0.1:8710 \
+  --webdriver 127.0.0.1:9515
+
+# Provide custom policy definitions if needed
+soulbrowser gateway \
+  --adapter-policy config/policies/adapter_policy.yaml \
+  --webdriver-policy config/policies/wd_bridge_policy.yaml
+```
+
+The HTTP adapter serves `/healthz` and `/v1/tools/run`, enforcing per-tenant limits from the adapter policy. The WebDriver bridge offers a Selenium-compatible façade that routes into SoulBrowser tools. All surfaces share the same scheduler runtime, metrics, and privacy guards, and shut down cleanly on `Ctrl+C`.
 
 ### Multi-Modal Perception Analysis
 
@@ -221,7 +251,30 @@ High-level tools that combine perception, action, and validation:
 - `click` - Intelligent clicking with fallback
 - `type-text` - Robust text input
 - `wait-for-element` - Smart waiting strategies
+- `take-screenshot` - Streams real PNG bytes via the CDP adapter (falls back to a stub when no browser session is available)
 - And 8 more specialized tools...
+
+The `take-screenshot` tool now emits a richer payload including `byte_len`, `content_type`, the resolved execution `route`, and raw `bytes`. When the CLI is connected to a real Chromium instance (set `SOULBROWSER_USE_REAL_CHROME=1`), the tool will create or reuse a CDP page for the current `ExecRoute` before returning actual viewport pixels. When running against the noop adapter, the tool gracefully returns a small placeholder buffer so existing scenarios keep working.
+
+```jsonc
+{
+  "success": true,
+  "output": {
+    "status": "captured",
+    "byte_len": 495832,
+    "content_type": "image/png",
+    "route": {
+      "session": "3f4a...",
+      "page": "8b12...",
+      "frame": "8b12..."
+    },
+    "filename": "capture.png",
+    "bytes": [137, 80, 78, 71, ...]
+  }
+}
+```
+
+If the adapter cannot attach to a browser session, the tool reports a `status: failed` payload with diagnostic metadata while the page pipeline continues executing.
 
 ## 🔄 Data Flow
 
@@ -231,7 +284,7 @@ High-level tools that combine perception, action, and validation:
 4. **Validation** → Post-condition gates verify success
 5. **Observation** → Unified envelope returned to agent
 6. **Persistence** → L4 stores events and snapshots
-7. **Monitoring** → L6 tracks metrics and timeline
+7. **Monitoring** → L6 tracks metrics and timeline（默认启动 `--metrics-port 9090` 暴露 `/metrics` Prometheus 指标，`--metrics-port 0` 可关闭）
 
 ## 🧾 Automation Script DSL
 
@@ -268,6 +321,8 @@ endif
  Loops accept numeric counts (or templated values), `if` supports `==` / `!=` comparisons against parameters or `set` locals, and `parallel` runs branches concurrently up to the configured `parallel_instances` limit (override per block with `parallel N`).
 
 ## 🧪 Development
+
+> 👨‍💻 **Developer?** Check out our [开发环境搭建指南](docs/开发环境搭建指南.md) for complete setup instructions!
 
 ```bash
 # Run core test suites
@@ -322,11 +377,30 @@ cargo clippy
 
 ## ⚙️ Configuration
 
+> ⚙️ **Need Help with Config?** See our [配置参考手册](docs/配置参考手册.md) for complete configuration options!
+
 - **Policy files**: Edit `config/policies/browser_policy.json` or point `SOUL_POLICY_PATH` to a custom JSON file.
 - **Strict authorization**: `SOUL_STRICT_AUTHZ=true` forces authorization decisions to respect the facade result without route-policy fallback.
 - **Quota persistence**: Adjust `SOUL_QUOTA_PERSIST_MS` / `SOUL_QUOTA_REFRESH_MS` for disk sync and reload cadence.
 - See `config/config.yaml.example` for a complete configuration template.
 - For a deeper overview of the soul-base integration, see `docs/soul_base_components.md`.
+
+## 📚 Documentation
+
+### 🚀 Getting Started
+- [快速开始指南](docs/快速开始指南.md) - 5分钟快速上手
+- [CLI参考手册](docs/CLI参考手册.md) - 完整的命令行指南
+- [配置参考手册](docs/配置参考手册.md) - 详细的配置选项
+
+### 🛠️ Development
+- [开发环境搭建指南](docs/开发环境搭建指南.md) - 完整的开发环境设置
+- [核心组件API参考](docs/核心组件API参考.md) - 核心 Crates API 文档
+- [故障排除手册](docs/故障排除手册.md) - 问题诊断和解决方案
+
+### 📖 Architecture & Design
+- [项目结构概览](docs/project_structure.md) - 项目组织和结构说明
+- [Soul-Base组件集成](docs/soul_base_components.md) - 集成架构说明
+- [文档缺失分析与补充计划](docs/文档缺失分析与补充计划.md) - 文档状态和计划
 
 ## 🤝 Contributing
 
@@ -341,6 +415,13 @@ MIT OR Apache-2.0
 > "Like a gardener tending to a digital garden, SoulBrowser nurtures each interaction, 
 > understanding that every click creates ripples, every navigation opens new realms, 
 > and every observation teaches us about the living web."
+
+## 🆘 Need Help?
+
+- 🐛 **Found a Bug?** [Report it](https://github.com/your-org/SoulBrowser/issues)
+- 💡 **Have an idea?** [Share it](https://github.com/your-org/SoulBrowser/discussions)
+- ❓ **Need Support?** Check our [故障排除手册](docs/故障排除手册.md)
+- 📖 **Want to Learn?** Start with [快速开始指南](docs/快速开始指南.md)
 
 ---
 

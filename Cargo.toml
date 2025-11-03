@@ -13,10 +13,27 @@ members = [
     "crates/scheduler",
     "crates/state-center",
     "crates/policy-center",
+    "crates/event-store",
+    "crates/snapshot-store",
+    "crates/recipes",
     "crates/perceiver-structural",
     "crates/perceiver-visual",
     "crates/perceiver-semantic",
-    "crates/perceiver-hub"
+    "crates/perceiver-hub",
+    "crates/action-primitives",
+    "crates/action-locator",
+    "crates/action-gate",
+    "crates/action-flow",
+    "crates/agent-core",
+    "crates/tool-click",
+    "crates/tool-type-text",
+    "crates/tool-select-option",
+    "crates/l6-observe",
+    "crates/l6-timeline",
+    "crates/l6-privacy",
+    "crates/l7-adapter",
+    "crates/l7-plugin",
+    "crates/l7-wd-bridge"
 ]
 resolver = "2"
 
@@ -91,12 +108,26 @@ soulbrowser-state-center = { path = "crates/state-center" }
 soulbrowser-policy-center = { path = "crates/policy-center" }
 cdp-adapter = { path = "crates/cdp-adapter" }
 network-tap-light = { path = "crates/network-tap-light" }
+action-primitives = { path = "crates/action-primitives" }
+agent-core = { path = "crates/agent-core" }
 dashmap = "5"
 parking_lot = "0.12"
 perceiver-structural = { path = "crates/perceiver-structural" }
 perceiver-visual = { path = "crates/perceiver-visual" }
 perceiver-semantic = { path = "crates/perceiver-semantic" }
 perceiver-hub = { path = "crates/perceiver-hub" }
+permissions-broker = { path = "crates/permissions-broker" }
+url = "2.5"
+base64 = "0.22"
+prometheus = "0.13"
+lazy_static = "1.4"
+axum = { version = "0.7", features = ["tokio"] }
+openssl = { version = "0.10", features = ["vendored"] }
+l6-observe = { path = "crates/l6-observe" }
+l6-timeline = { path = "crates/l6-timeline" }
+event-store = { path = "crates/event-store" }
+l7-adapter = { path = "crates/l7-adapter" }
+l7-wd-bridge = { path = "crates/l7-wd-bridge" }
 
 # CLI and argument parsing
 clap = { version = "4.4", features = ["derive", "color", "suggestions"] }
@@ -116,10 +147,12 @@ anyhow = "1.0"
 # Logging & Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 
 # Configuration and directories
 config = "0.14"
 dirs = "5.0"
+tempfile = "3.8"
 
 # Time & Date
 chrono = { version = "0.4", features = ["serde"] }
@@ -145,7 +178,14 @@ soulbase-tools = { path = "../soul-base-main/soul-base-main/crates/soulbase-tool
 
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3.8"
+serial_test = "2.0"
+l6-privacy = { path = "crates/l6-privacy" }
+l7-adapter = { path = "crates/l7-adapter" }
+tower = { version = "0.4", features = ["util"] }
+serde_json = "1.0"
+assert_cmd = "2.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
 
 [build-dependencies]
 chrono = { version = "0.4", features = ["serde"] }

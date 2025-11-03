@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use soulbrowser_core_types::{ActionId, ExecRoute, SoulError};
 use soulbrowser_registry::Registry;
@@ -11,6 +11,7 @@ use crate::executor::ToolExecutor;
 use crate::metrics;
 use crate::model::{DispatchOutput, DispatchRequest, DispatchTimeline, SubmitHandle};
 use crate::runtime::{ReadyJob, SchedulerRuntime};
+use serde_json::Value;
 use soulbrowser_state_center::{DispatchEvent, StateCenter, StateEvent};
 
 pub struct Orchestrator<R, E>
@@ -178,16 +179,21 @@ where
     let tool_name = request.tool_call.tool.clone();
     let mut attempt: u32 = 0;
     metrics::record_started(&tool_name);
+    let job_timer = Instant::now();
     loop {
         let exec =
             tokio::time::timeout(timeout, executor.execute(request.clone(), route.clone())).await;
         let current_err = match exec {
-            Ok(Ok(())) => {
+            Ok(Ok(outcome)) => {
                 let timeline = runtime.finish_job(ready);
                 if let Some(tx) = completion.take() {
-                    let _ = tx.send(DispatchOutput::ok(route.clone(), timeline.clone()));
+                    let _ = tx.send(DispatchOutput::ok(
+                        route.clone(),
+                        timeline.clone(),
+                        outcome.output.clone(),
+                    ));
                 }
-                metrics::record_completed(&tool_name);
+                metrics::record_completed(&tool_name, job_timer.elapsed());
                 log_timeline(
                     state_center,
                     &route,
@@ -199,6 +205,7 @@ where
                     attempt,
                     &action_id,
                     task_id.as_deref(),
+                    outcome.output.as_ref(),
                 )
                 .await;
                 return Ok(());
@@ -215,9 +222,10 @@ where
                     route.clone(),
                     final_err.clone(),
                     timeline.clone(),
+                    None,
                 ));
             }
-            metrics::record_failed(&tool_name);
+            metrics::record_failed(&tool_name, job_timer.elapsed());
             log_failure(
                 state_center,
                 &route,
@@ -230,6 +238,7 @@ where
                 attempt + 1,
                 &action_id,
                 task_id.as_deref(),
+                None,
             )
             .await;
             return Err(final_err);
@@ -252,6 +261,7 @@ async fn log_timeline(
     attempts: u32,
     action_id: &ActionId,
     task_id: Option<&str>,
+    output: Option<&Value>,
 ) {
     let (queue_wait_ms, run_ms) = compute_durations(timeline);
     info!(
@@ -276,6 +286,7 @@ async fn log_timeline(
         run_ms,
         pending,
         slots_available,
+        output.cloned(),
     ));
     if let Err(err) = state_center.append(event).await {
         warn!("state center append failed: {err}");
@@ -295,6 +306,7 @@ async fn log_failure(
     attempts: u32,
     action_id: &ActionId,
     task_id: Option<&str>,
+    output: Option<&Value>,
 ) {
     let (queue_wait_ms, run_ms) = compute_durations(timeline);
     warn!(
@@ -321,6 +333,7 @@ async fn log_failure(
         pending,
         slots_available,
         error.clone(),
+        output.cloned(),
     ));
     if let Err(err) = state_center.append(event).await {
         warn!("state center append failed: {err}");
@@ -358,6 +371,7 @@ async fn log_cancelled(
         pending,
         slots_available,
         SoulError::new("cancelled"),
+        None,
     ));
     if let Err(err) = state_center.append(event).await {
         warn!("state center append failed: {err}");
@@ -383,7 +397,7 @@ fn record_failure_metrics(_wait_ms: u64, _run_ms: u64, _attempts: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::ToolExecutor;
+    use crate::executor::{ToolDispatchResult, ToolExecutor};
     use crate::model::{CallOptions, DispatchRequest, Priority, SchedulerConfig};
     use soulbrowser_core_types::{ExecRoute, FrameId, PageId, RoutingHint, SessionId, ToolCall};
     use soulbrowser_registry::SessionCtx;
@@ -438,10 +452,10 @@ mod tests {
             &self,
             _request: DispatchRequest,
             _route: ExecRoute,
-        ) -> Result<(), SoulError> {
+        ) -> Result<ToolDispatchResult, SoulError> {
             let mut guard = self.executions.lock().await;
             *guard += 1;
-            Ok(())
+            Ok(ToolDispatchResult { output: None })
         }
     }
 
@@ -453,7 +467,7 @@ mod tests {
             &self,
             _request: DispatchRequest,
             _route: ExecRoute,
-        ) -> Result<(), SoulError> {
+        ) -> Result<ToolDispatchResult, SoulError> {
             Err(SoulError::new("executor failure"))
         }
     }

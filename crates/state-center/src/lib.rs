@@ -34,6 +34,7 @@ pub struct DispatchEvent {
     pub pending: usize,
     pub slots_available: usize,
     pub error: Option<SoulError>,
+    pub output: Option<serde_json::Value>,
     pub recorded_at: std::time::SystemTime,
 }
 
@@ -49,6 +50,7 @@ impl DispatchEvent {
         run_ms: u64,
         pending: usize,
         slots_available: usize,
+        output: Option<serde_json::Value>,
     ) -> Self {
         Self {
             action_id,
@@ -63,6 +65,7 @@ impl DispatchEvent {
             pending,
             slots_available,
             error: None,
+            output,
             recorded_at: std::time::SystemTime::now(),
         }
     }
@@ -79,6 +82,7 @@ impl DispatchEvent {
         pending: usize,
         slots_available: usize,
         error: SoulError,
+        output: Option<serde_json::Value>,
     ) -> Self {
         Self {
             action_id,
@@ -93,6 +97,7 @@ impl DispatchEvent {
             pending,
             slots_available,
             error: Some(error),
+            output,
             recorded_at: std::time::SystemTime::now(),
         }
     }
@@ -442,6 +447,7 @@ mod tests {
                 20,
                 0,
                 4,
+                None,
             )))
             .await
             .unwrap();
@@ -459,6 +465,7 @@ mod tests {
                 1,
                 3,
                 SoulError::new("fail"),
+                None,
             )))
             .await
             .unwrap();
@@ -475,6 +482,7 @@ mod tests {
                 30,
                 2,
                 2,
+                None,
             )))
             .await
             .unwrap();
@@ -600,6 +608,7 @@ pub enum RegistryAction {
     FrameDetached,
     HealthProbeTick,
     PageHealthUpdated,
+    PermissionsApplied,
 }
 
 #[derive(Serialize)]

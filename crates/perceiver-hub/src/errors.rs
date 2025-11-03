@@ -1,5 +1,4 @@
 ///! Error types for perception hub
-
 use thiserror::Error;
 
 /// Errors that can occur in the perception hub

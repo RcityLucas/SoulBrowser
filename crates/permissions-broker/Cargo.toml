@@ -15,6 +15,9 @@ tokio = { version = "1.39", features = ["sync", "time"] }
 tracing = "0.1"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 humantime = "2.1"
+dashmap = "5.5"
+serde_yaml = "0.9"
+cdp-adapter = { path = "../cdp-adapter" }
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread"] }

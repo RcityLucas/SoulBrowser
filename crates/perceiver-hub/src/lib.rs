@@ -41,7 +41,6 @@
 ///! # Ok(())
 ///! # }
 ///! ```
-
 pub mod errors;
 pub mod hub;
 pub mod models;

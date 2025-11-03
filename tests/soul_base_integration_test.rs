@@ -161,31 +161,34 @@ async fn test_soul_base_tools() {
         .await
         .expect("Should list tools");
 
-    // Verify we have the expected tools
-    assert!(tools.len() >= 4, "Should have at least 4 browser tools");
+    // Verify we have the expected tools (new IDs and legacy aliases)
+    assert!(tools.len() >= 12, "Should have at least 12 primary tools");
 
     let tool_ids: Vec<String> = tools.iter().map(|t| t.manifest.id.0.clone()).collect();
     assert!(
-        tool_ids.contains(&"browser.navigate".to_string()),
-        "Should have navigate tool"
+        tool_ids.contains(&"navigate-to-url".to_string()),
+        "Should have navigate-to-url tool"
     );
     assert!(
-        tool_ids.contains(&"browser.click".to_string()),
+        tool_ids.contains(&"click".to_string()),
         "Should have click tool"
     );
     assert!(
-        tool_ids.contains(&"browser.type".to_string()),
-        "Should have type tool"
+        tool_ids.contains(&"type-text".to_string()),
+        "Should have type-text tool"
     );
     assert!(
-        tool_ids.contains(&"browser.screenshot".to_string()),
+        tool_ids.contains(&"take-screenshot".to_string()),
         "Should have screenshot tool"
     );
+    // Legacy aliases remain available for backward compatibility
+    assert!(tool_ids.contains(&"browser.navigate".to_string()));
+    assert!(tool_ids.contains(&"browser.click".to_string()));
 
     // Test tool execution
     let result = tool_manager
         .execute(
-            "browser.navigate",
+            "navigate-to-url",
             "demo-user",
             serde_json::json!({"url": "https://example.com"}),
         )
@@ -199,7 +202,18 @@ async fn test_soul_base_tools() {
     );
     assert_eq!(
         result["metadata"]["tool_id"].as_str().unwrap(),
-        "browser.navigate",
+        "navigate-to-url",
         "Tool ID should match"
     );
+
+    // Alias still dispatches
+    let alias_result = tool_manager
+        .execute(
+            "browser.navigate",
+            "demo-user",
+            serde_json::json!({"url": "https://example.com"}),
+        )
+        .await
+        .expect("Alias should execute navigate tool");
+    assert!(alias_result["success"].as_bool().unwrap_or(false));
 }

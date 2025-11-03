@@ -179,6 +179,41 @@ impl SessionReplayer {
                         }
                     }
                 }
+                "select" => {
+                    if let (Some(selector), Some(value)) = (
+                        event.data.get("selector").and_then(|v| v.as_str()),
+                        event.data.get("value").and_then(|v| v.as_str()),
+                    ) {
+                        let selector = resolve_template(selector, overrides);
+                        let value = resolve_template(value, overrides);
+                        let match_kind = event
+                            .data
+                            .get("match_kind")
+                            .and_then(|v| v.as_str())
+                            .map(|s| resolve_template(s, overrides));
+                        let mode = event
+                            .data
+                            .get("mode")
+                            .and_then(|v| v.as_str())
+                            .map(|s| resolve_template(s, overrides));
+                        if let Err(e) = page
+                            .select_option(
+                                &selector,
+                                &value,
+                                match_kind.as_deref(),
+                                mode.as_deref(),
+                            )
+                            .await
+                        {
+                            errors.push(format!("Select failed: {}", e));
+                            if fail_fast {
+                                break;
+                            }
+                        } else {
+                            events_replayed += 1;
+                        }
+                    }
+                }
                 "screenshot" => {
                     if let Some(filename) = event.data.get("filename").and_then(|v| v.as_str()) {
                         let filename = resolve_template(filename, overrides);

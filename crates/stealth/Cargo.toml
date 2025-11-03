@@ -12,9 +12,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 tokio = { version = "1.39", features = ["sync", "time"] }
+parking_lot = "0.12"
+rand = { version = "0.8", features = ["std"] }
 tracing = "0.1"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 dashmap = "5.5"
+serde_yaml = "0.9"
+cdp-adapter = { path = "../cdp-adapter" }
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread"] }

@@ -2,6 +2,7 @@
 //!
 //! Exposes modules for integration testing
 
+pub mod agent;
 pub mod app_context;
 pub mod auth;
 pub mod browser_impl;
@@ -9,6 +10,7 @@ pub mod config;
 pub mod errors;
 pub mod interceptors;
 pub mod l0_bridge;
+pub mod metrics;
 pub mod policy;
 pub mod storage;
 pub mod tools;

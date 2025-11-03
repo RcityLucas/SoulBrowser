@@ -53,6 +53,7 @@ pub mod ids {
 
 pub mod error {
     use serde::{Deserialize, Serialize};
+    use std::fmt;
     use thiserror::Error;
 
     /// High-level error categories surfaced by the adapter.
@@ -76,6 +77,18 @@ pub mod error {
         pub retriable: bool,
         pub data: Option<serde_json::Value>,
     }
+
+    impl fmt::Display for AdapterError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.kind)?;
+            if let Some(hint) = &self.hint {
+                write!(f, ": {}", hint)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl std::error::Error for AdapterError {}
 
     impl AdapterError {
         pub fn new(kind: AdapterErrorKind) -> Self {
@@ -118,6 +131,11 @@ pub mod events {
             phase: String,
             ts: u64,
         },
+        PageNavigated {
+            page: PageId,
+            url: String,
+            ts: u64,
+        },
         NetworkSummary {
             page: PageId,
             req: u64,
@@ -129,10 +147,22 @@ pub mod events {
             window_ms: u64,
             since_last_activity_ms: u64,
         },
+        NetworkActivity {
+            page: PageId,
+            signal: NetworkSignal,
+        },
         Error {
             page: Option<PageId>,
             message: String,
         },
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum NetworkSignal {
+        RequestWillBeSent,
+        ResponseReceived { status: i64 },
+        LoadingFinished,
+        LoadingFailed,
     }
 
     /// Subscription filter placeholder; will expand with real predicates.
@@ -154,6 +184,7 @@ pub mod config {
         pub default_deadline_ms: u64,
         pub retry_backoff_ms: u64,
         pub websocket_url: Option<String>,
+        pub heartbeat_interval_ms: u64,
     }
 
     impl Default for CdpConfig {
@@ -165,6 +196,7 @@ pub mod config {
                 default_deadline_ms: 30_000,
                 retry_backoff_ms: 250,
                 websocket_url: None,
+                heartbeat_interval_ms: 15_000,
             }
         }
     }
@@ -203,6 +235,11 @@ pub mod adapter {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     use dashmap::DashMap;
+    use network_tap_light::{
+        config::TapConfig as NetworkTapConfig, MaintenanceHandle as NetworkTapHandle,
+        NetworkSnapshot as TapSnapshot, NetworkTapLight, PageId as TapPageId,
+        TapError as NetworkTapError, TapEvent as NetworkTapEvent,
+    };
     use serde::Deserialize;
     use serde_json::{json, Number, Value};
     use std::env;
@@ -214,7 +251,7 @@ pub mod adapter {
     use tokio::time::sleep;
     use tokio::{select, spawn};
     use tokio_util::sync::CancellationToken;
-    use tracing::{debug, info};
+    use tracing::{debug, info, warn};
 
     /// Shared event bus type alias used by the adapter scaffold.
     pub type EventBus = broadcast::Sender<RawEvent>;
@@ -259,6 +296,39 @@ pub mod adapter {
             page: PageId,
             deadline: std::time::Duration,
         ) -> Result<Vec<u8>, AdapterError>;
+        async fn grant_permissions(
+            &self,
+            origin: &str,
+            permissions: &[String],
+        ) -> Result<(), AdapterError>;
+        async fn reset_permissions(
+            &self,
+            origin: &str,
+            permissions: &[String],
+        ) -> Result<(), AdapterError>;
+        async fn set_user_agent(
+            &self,
+            page: PageId,
+            user_agent: &str,
+            accept_language: Option<&str>,
+            platform: Option<&str>,
+            locale: Option<&str>,
+        ) -> Result<(), AdapterError>;
+        async fn set_timezone(&self, page: PageId, timezone: &str) -> Result<(), AdapterError>;
+        async fn set_device_metrics(
+            &self,
+            page: PageId,
+            width: u32,
+            height: u32,
+            device_scale_factor: f64,
+            mobile: bool,
+        ) -> Result<(), AdapterError>;
+        async fn set_touch_emulation(
+            &self,
+            page: PageId,
+            enabled: bool,
+        ) -> Result<(), AdapterError>;
+
         async fn set_network_tap(&self, page: PageId, enabled: bool) -> Result<(), AdapterError>;
 
         async fn dom_snapshot(
@@ -286,74 +356,15 @@ pub mod adapter {
         targets: DashMap<String, PageId>,
         sessions: DashMap<String, PageId>,
         frames: DashMap<String, FrameEntry>,
-        network_stats: DashMap<PageId, NetworkStats>,
         page_activity: DashMap<PageId, Instant>,
+        network_tap: Arc<NetworkTapLight>,
+        tap_maintenance: Mutex<Option<NetworkTapHandle>>,
     }
 
     #[derive(Clone, Copy, Debug)]
     struct FrameEntry {
         page: PageId,
         frame: FrameId,
-    }
-
-    #[derive(Clone, Debug)]
-    struct NetworkStats {
-        requests: u64,
-        responses_2xx: u64,
-        responses_4xx: u64,
-        responses_5xx: u64,
-        inflight: i64,
-        last_activity: Instant,
-    }
-
-    impl NetworkStats {
-        fn new() -> Self {
-            Self {
-                requests: 0,
-                responses_2xx: 0,
-                responses_4xx: 0,
-                responses_5xx: 0,
-                inflight: 0,
-                last_activity: Instant::now(),
-            }
-        }
-
-        fn register_request(&mut self) {
-            self.requests += 1;
-            self.inflight += 1;
-            self.last_activity = Instant::now();
-        }
-
-        fn register_response(&mut self, status: i64) {
-            match status {
-                200..=299 => self.responses_2xx += 1,
-                400..=499 => self.responses_4xx += 1,
-                500..=599 => self.responses_5xx += 1,
-                _ => {}
-            }
-            self.last_activity = Instant::now();
-        }
-
-        fn register_complete(&mut self) {
-            if self.inflight > 0 {
-                self.inflight -= 1;
-            }
-            self.last_activity = Instant::now();
-        }
-
-        fn snapshot(&self) -> (u64, u64, u64, u64, u64, bool, u64) {
-            let since_last = self.last_activity.elapsed().as_millis() as u64;
-            let quiet = self.inflight == 0 && since_last >= 1_000;
-            (
-                self.requests,
-                self.responses_2xx,
-                self.responses_4xx,
-                self.responses_5xx,
-                self.inflight.max(0) as u64,
-                quiet,
-                since_last,
-            )
-        }
     }
 
     impl CdpAdapter {
@@ -373,6 +384,8 @@ pub mod adapter {
             bus: EventBus,
             transport: Arc<dyn CdpTransport>,
         ) -> Self {
+            let (network_tap, _) = NetworkTapLight::with_config(NetworkTapConfig::default(), 512);
+            let network_tap = Arc::new(network_tap);
             Self {
                 browser_id: BrowserId::new(),
                 cfg,
@@ -384,8 +397,9 @@ pub mod adapter {
                 targets: DashMap::new(),
                 sessions: DashMap::new(),
                 frames: DashMap::new(),
-                network_stats: DashMap::new(),
                 page_activity: DashMap::new(),
+                network_tap,
+                tap_maintenance: Mutex::new(None),
             }
         }
 
@@ -398,9 +412,19 @@ pub mod adapter {
         }
 
         pub async fn start(self: Arc<Self>) -> Result<(), AdapterError> {
+            {
+                let mut maintenance = self.tap_maintenance.lock().await;
+                if maintenance.is_none() {
+                    let handle = self.network_tap.spawn_maintenance();
+                    *maintenance = Some(handle);
+                }
+            }
             self.transport.start().await?;
             let loop_task = spawn(Self::event_loop(Arc::clone(&self)));
-            self.tasks.lock().await.push(loop_task);
+            let forward_task = self.spawn_tap_forwarder();
+            let mut guard = self.tasks.lock().await;
+            guard.push(loop_task);
+            guard.push(forward_task);
             info!(target: "cdp-adapter", "event loop started (real CDP wiring pending)");
             if self.cfg.websocket_url.is_none() {
                 self.ensure_initial_page().await?;
@@ -414,6 +438,9 @@ pub mod adapter {
             while let Some(handle) = handles.pop() {
                 let _ = handle.await;
             }
+            if let Some(handle) = self.tap_maintenance.lock().await.take() {
+                let _ = handle.shutdown().await;
+            }
         }
 
         pub fn register_page(
@@ -425,10 +452,117 @@ pub mod adapter {
         ) {
             self.registry
                 .insert_page(page, session, target_id, cdp_session);
+            self.schedule_tap_enable(page);
+        }
+
+        pub async fn create_page(&self, url: &str) -> Result<PageId, AdapterError> {
+            let response = self
+                .send_command("Target.createTarget", json!({ "url": url }))
+                .await?;
+            let target_id = response
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    AdapterError::new(AdapterErrorKind::Internal)
+                        .with_hint("createTarget missing targetId")
+                })?
+                .to_string();
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(entry) = self.targets.get(&target_id) {
+                    let page = *entry.value();
+                    if self
+                        .registry
+                        .get(&page)
+                        .map(|ctx| ctx.cdp_session.is_some())
+                        .unwrap_or(false)
+                    {
+                        return Ok(page);
+                    }
+                }
+
+                if Instant::now() >= deadline {
+                    return Err(AdapterError::new(AdapterErrorKind::Internal)
+                        .with_hint("Timed out waiting for target attach"));
+                }
+
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        fn tap_page_id(page: PageId) -> TapPageId {
+            TapPageId(page.0)
+        }
+
+        fn schedule_tap_enable(&self, page: PageId) {
+            let tap = Arc::clone(&self.network_tap);
+            let tap_page = Self::tap_page_id(page);
+            spawn(async move {
+                if let Err(err) = tap.enable(tap_page).await {
+                    warn!(target: "cdp-adapter", ?err, "network tap enable failed");
+                }
+            });
+        }
+
+        fn schedule_tap_disable(&self, page: PageId) {
+            let tap = Arc::clone(&self.network_tap);
+            let tap_page = Self::tap_page_id(page);
+            spawn(async move {
+                if let Err(err) = tap.disable(tap_page).await {
+                    if !matches!(err, NetworkTapError::PageNotEnabled) {
+                        warn!(target: "cdp-adapter", ?err, "network tap disable failed");
+                    }
+                }
+            });
+        }
+
+        async fn tap_ingest(&self, page: PageId, event: NetworkTapEvent) {
+            let tap_page = Self::tap_page_id(page);
+            if let Err(err) = self.network_tap.ingest(tap_page, event).await {
+                if matches!(err, NetworkTapError::PageNotEnabled) {
+                    self.schedule_tap_enable(page);
+                } else {
+                    warn!(target: "cdp-adapter", ?err, "network tap ingest failed");
+                }
+            }
+        }
+
+        fn is_snapshot_quiet(snapshot: &TapSnapshot, window_ms: u64, max_inflight: u32) -> bool {
+            snapshot.inflight <= max_inflight as u64
+                && snapshot.since_last_activity_ms >= window_ms
+                && snapshot.quiet
+        }
+
+        fn spawn_tap_forwarder(self: &Arc<Self>) -> JoinHandle<()> {
+            let adapter = Arc::clone(self);
+            spawn(async move {
+                let mut rx = adapter.network_tap.bus.subscribe();
+                loop {
+                    tokio::select! {
+                        _ = adapter.shutdown.cancelled() => {
+                            break;
+                        }
+                        summary = rx.recv() => {
+                            match summary {
+                                Ok(summary) => adapter.emit_tap_summary(&summary),
+                                Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    continue;
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    }
+                }
+            })
         }
 
         async fn event_loop(self: Arc<Self>) {
             debug!(target: "cdp-adapter", "event loop entered");
+            const MIN_BACKOFF: Duration = Duration::from_millis(100);
+            const MAX_BACKOFF: Duration = Duration::from_secs(5);
+            let mut backoff = MIN_BACKOFF;
+
             loop {
                 select! {
                     _ = self.shutdown.cancelled() => {
@@ -436,13 +570,67 @@ pub mod adapter {
                     }
                     event = self.transport.next_event() => {
                         match event {
-                            Some(ev) => self.handle_event(ev).await,
-                            None => break,
+                            Some(ev) => {
+                                backoff = MIN_BACKOFF;
+                                self.handle_event(ev).await;
+                            }
+                            None => {
+                                if self.shutdown.is_cancelled() {
+                                    break;
+                                }
+                                self.handle_transport_disconnect();
+                                warn!(target = "cdp-adapter", "transport stream ended; attempting restart");
+                                if let Err(err) = self.transport.start().await {
+                                    warn!(target = "cdp-adapter", ?err, "transport restart failed");
+                                }
+                                if self.shutdown.is_cancelled() {
+                                    break;
+                                }
+                                sleep(backoff).await;
+                                if backoff < MAX_BACKOFF {
+                                    backoff += MIN_BACKOFF;
+                                    if backoff > MAX_BACKOFF {
+                                        backoff = MAX_BACKOFF;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
             debug!(target: "cdp-adapter", "event loop exiting");
+        }
+
+        fn handle_transport_disconnect(&self) {
+            let existing_pages: Vec<PageId> = self
+                .registry
+                .iter()
+                .into_iter()
+                .map(|(page, _)| page)
+                .collect();
+            let had_pages = !existing_pages.is_empty();
+
+            for page in existing_pages {
+                self.emit_page_event(page, None, None, "closed", timestamp_now());
+                self.schedule_tap_disable(page);
+                self.registry.remove_page(&page);
+            }
+
+            self.targets.clear();
+            self.sessions.clear();
+            self.frames.clear();
+            self.page_activity.clear();
+
+            let message = if had_pages {
+                "cdp transport restarted; active pages were reset"
+            } else {
+                "cdp transport restarted"
+            };
+
+            let _ = self.bus.send(RawEvent::Error {
+                page: None,
+                message: message.to_string(),
+            });
         }
 
         async fn handle_event(&self, event: TransportEvent) {
@@ -468,6 +656,9 @@ pub mod adapter {
                 }
                 "Target.detachedFromTarget" => {
                     self.on_target_detached(event.params)?;
+                }
+                "Target.targetInfoChanged" => {
+                    self.on_target_info_changed(event).await?;
                 }
                 "Page.lifecycleEvent" => {
                     self.on_page_lifecycle(event).await?;
@@ -495,8 +686,7 @@ pub mod adapter {
                 }
                 _ => {
                     debug!(target: "cdp-adapter", method = %event.method, "unhandled cdp event");
-                    return Err(AdapterError::new(AdapterErrorKind::Internal)
-                        .with_hint(format!("unhandled cdp event: {}", event.method)));
+                    return Ok(());
                 }
             }
             Ok(())
@@ -516,9 +706,9 @@ pub mod adapter {
             let session = SessionId::new();
 
             self.targets.insert(target_id.clone(), page_id);
-            self.network_stats.insert(page_id, NetworkStats::new());
             self.registry
                 .insert_page(page_id, session, Some(target_id), None);
+            self.schedule_tap_enable(page_id);
 
             if let Some(url) = payload.target_info.url.filter(|u| !u.is_empty()) {
                 self.registry.set_recent_url(&page_id, url);
@@ -536,9 +726,9 @@ pub mod adapter {
             if let Some((_, page)) = self.targets.remove(&payload.target_id) {
                 self.sessions.retain(|_, v| *v != page);
                 self.frames.retain(|_, entry| entry.page != page);
-                self.network_stats.remove(&page);
                 self.page_activity.remove(&page);
                 self.registry.remove_page(&page);
+                self.schedule_tap_disable(page);
                 self.emit_page_event(page, None, None, "closed", timestamp_now());
             }
             Ok(())
@@ -646,16 +836,31 @@ pub mod adapter {
             Ok(())
         }
 
+        async fn on_target_info_changed(&self, event: TransportEvent) -> Result<(), AdapterError> {
+            let payload: TargetInfoChangedParams =
+                serde_json::from_value(event.params).map_err(|err| {
+                    AdapterError::new(AdapterErrorKind::Internal).with_hint(err.to_string())
+                })?;
+
+            if payload.target_info.target_type != "page" {
+                return Ok(());
+            }
+
+            if let Some(page_entry) = self.targets.get(&payload.target_info.target_id) {
+                let page = *page_entry.value();
+                if let Some(url) = payload.target_info.url.as_ref().filter(|u| !u.is_empty()) {
+                    self.registry.set_recent_url(&page, url.clone());
+                    self.emit_navigation_event(page, url.clone(), timestamp_now());
+                }
+            }
+
+            Ok(())
+        }
+
         async fn on_network_request(&self, event: TransportEvent) -> Result<(), AdapterError> {
             if let Some(page) = self.page_from_session(event.session_id.as_ref()) {
-                let mut entry = self
-                    .network_stats
-                    .entry(page)
-                    .or_insert_with(NetworkStats::new);
-                entry.value_mut().register_request();
-                let snapshot = entry.value().clone();
-                drop(entry);
-                self.emit_network_summary(page, snapshot);
+                self.tap_ingest(page, NetworkTapEvent::RequestWillBeSent)
+                    .await;
             }
             Ok(())
         }
@@ -667,38 +872,28 @@ pub mod adapter {
                 })?;
 
             if let Some(page) = self.page_from_session(event.session_id.as_ref()) {
-                let mut entry = self
-                    .network_stats
-                    .entry(page)
-                    .or_insert_with(NetworkStats::new);
-                entry.value_mut().register_response(payload.response.status);
-                let snapshot = entry.value().clone();
-                drop(entry);
-                self.emit_network_summary(page, snapshot);
+                self.tap_ingest(
+                    page,
+                    NetworkTapEvent::ResponseReceived {
+                        status: payload.response.status,
+                    },
+                )
+                .await;
             }
             Ok(())
         }
 
         async fn on_network_finished(&self, event: TransportEvent) -> Result<(), AdapterError> {
             if let Some(page) = self.page_from_session(event.session_id.as_ref()) {
-                if let Some(mut entry) = self.network_stats.get_mut(&page) {
-                    entry.value_mut().register_complete();
-                    let snapshot = entry.value().clone();
-                    drop(entry);
-                    self.emit_network_summary(page, snapshot);
-                }
+                self.tap_ingest(page, NetworkTapEvent::LoadingFinished)
+                    .await;
             }
             Ok(())
         }
 
         async fn on_network_failed(&self, event: TransportEvent) -> Result<(), AdapterError> {
             if let Some(page) = self.page_from_session(event.session_id.as_ref()) {
-                if let Some(mut entry) = self.network_stats.get_mut(&page) {
-                    entry.value_mut().register_complete();
-                    let snapshot = entry.value().clone();
-                    drop(entry);
-                    self.emit_network_summary(page, snapshot);
-                }
+                self.tap_ingest(page, NetworkTapEvent::LoadingFailed).await;
             }
             Ok(())
         }
@@ -748,19 +943,24 @@ pub mod adapter {
             });
         }
 
-        fn emit_network_summary(&self, page: PageId, stats: NetworkStats) {
-            let (req, res2xx, res4xx, res5xx, inflight, quiet, since_last) = stats.snapshot();
+        fn emit_navigation_event(&self, page: PageId, url: String, ts: u64) {
+            self.page_activity.insert(page, Instant::now());
+            let _ = self.bus.send(RawEvent::PageNavigated { page, url, ts });
+        }
+
+        fn emit_tap_summary(&self, summary: &network_tap_light::NetworkSummary) {
             metrics::record_network_summary();
+            let page = PageId(summary.page.0);
             let _ = self.bus.send(RawEvent::NetworkSummary {
                 page,
-                req,
-                res2xx,
-                res4xx,
-                res5xx,
-                inflight,
-                quiet,
-                window_ms: 1_000,
-                since_last_activity_ms: since_last,
+                req: summary.req,
+                res2xx: summary.res2xx,
+                res4xx: summary.res4xx,
+                res5xx: summary.res5xx,
+                inflight: summary.inflight,
+                quiet: summary.quiet,
+                window_ms: summary.window_ms,
+                since_last_activity_ms: summary.since_last_activity_ms,
             });
         }
 
@@ -814,17 +1014,11 @@ pub mod adapter {
                         .with_hint("wait_basic NetworkQuiet timed out"));
                 }
 
-                let snapshot = {
-                    let entry = self
-                        .network_stats
-                        .entry(page)
-                        .or_insert_with(NetworkStats::new);
-                    entry.value().snapshot()
-                };
-
-                let (_, _, _, _, inflight, _, since_last) = snapshot;
-                if inflight <= max_inflight as u64 && since_last >= window_ms {
-                    return Ok(());
+                let tap_page = Self::tap_page_id(page);
+                if let Some(snapshot) = self.network_tap.current_snapshot(tap_page).await {
+                    if Self::is_snapshot_quiet(&snapshot, window_ms, max_inflight) {
+                        return Ok(());
+                    }
                 }
 
                 sleep(std::time::Duration::from_millis(100)).await;
@@ -859,10 +1053,22 @@ pub mod adapter {
 
         #[allow(dead_code)]
         async fn send_command(&self, method: &str, params: Value) -> Result<Value, AdapterError> {
-            metrics::record_command();
-            self.transport
+            let start = Instant::now();
+            metrics::record_command(method);
+            match self
+                .transport
                 .send_command(CommandTarget::Browser, method, params)
                 .await
+            {
+                Ok(value) => {
+                    metrics::record_command_success(method, start.elapsed());
+                    Ok(value)
+                }
+                Err(err) => {
+                    metrics::record_command_failure(method);
+                    Err(err)
+                }
+            }
         }
 
         async fn send_page_command(
@@ -872,10 +1078,22 @@ pub mod adapter {
             params: Value,
         ) -> Result<Value, AdapterError> {
             if let Some(session) = self.registry.get_cdp_session(&page) {
-                metrics::record_command();
-                self.transport
+                let start = Instant::now();
+                metrics::record_command(method);
+                match self
+                    .transport
                     .send_command(CommandTarget::Session(session), method, params)
                     .await
+                {
+                    Ok(value) => {
+                        metrics::record_command_success(method, start.elapsed());
+                        Ok(value)
+                    }
+                    Err(err) => {
+                        metrics::record_command_failure(method);
+                        Err(err)
+                    }
+                }
             } else {
                 Err(AdapterError::new(AdapterErrorKind::Internal)
                     .with_hint(format!("missing cdp session for page {page:?}")))
@@ -953,6 +1171,12 @@ pub mod adapter {
     struct DetachedFromTargetParams {
         #[serde(rename = "sessionId")]
         session_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TargetInfoChangedParams {
+        #[serde(rename = "targetInfo")]
+        target_info: TargetInfoPayload,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1047,11 +1271,16 @@ pub mod adapter {
             &self,
             page: PageId,
             url: &str,
-            _deadline: std::time::Duration,
+            deadline: std::time::Duration,
         ) -> Result<(), AdapterError> {
             self.send_page_command(page, "Page.navigate", json!({ "url": url }))
                 .await?;
             self.registry.set_recent_url(&page, url.to_string());
+            let start = Instant::now();
+            let deadline_at = start
+                .checked_add(deadline)
+                .unwrap_or_else(|| start + Duration::from_secs(30));
+            self.wait_for_dom_ready(page, deadline_at).await?;
             Ok(())
         }
 
@@ -1130,18 +1359,44 @@ pub mod adapter {
             selector: &str,
             _deadline: std::time::Duration,
         ) -> Result<(), AdapterError> {
-            self
-                .send_page_command(
+            self.wait_for_page_ready(page).await?;
+            let anchors = self
+                .query(
                     page,
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": format!(
-                            "(() => {{ const el=document.querySelector(\"{}\"); if(el) el.click(); }})();",
-                            selector,
-                        ),
-                        "awaitPromise": true,
-                    }),
+                    QuerySpec {
+                        selector: selector.to_string(),
+                        scope: QueryScope::Document,
+                    },
                 )
+                .await?;
+
+            let anchor = anchors.first().cloned().ok_or_else(|| {
+                AdapterError::new(AdapterErrorKind::Internal)
+                    .with_hint(format!("click target not found for selector '{selector}'"))
+            })?;
+
+            let press_payload = json!({
+                "type": "mousePressed",
+                "x": anchor.x,
+                "y": anchor.y,
+                "button": "left",
+                "buttons": 1,
+                "clickCount": 1,
+                "pointerType": "mouse",
+            });
+            self.send_page_command(page, "Input.dispatchMouseEvent", press_payload)
+                .await?;
+
+            let release_payload = json!({
+                "type": "mouseReleased",
+                "x": anchor.x,
+                "y": anchor.y,
+                "button": "left",
+                "buttons": 1,
+                "clickCount": 1,
+                "pointerType": "mouse",
+            });
+            self.send_page_command(page, "Input.dispatchMouseEvent", release_payload)
                 .await?;
             Ok(())
         }
@@ -1153,19 +1408,61 @@ pub mod adapter {
             text: &str,
             _deadline: std::time::Duration,
         ) -> Result<(), AdapterError> {
-            self
+            self.wait_for_page_ready(page).await?;
+            let selector_literal = serde_json::to_string(&selector).map_err(|err| {
+                AdapterError::new(AdapterErrorKind::Internal).with_hint(err.to_string())
+            })?;
+
+            let focus_expression = format!(
+                "(() => {{\n    const el = document.querySelector({selector});\n    if (!el) {{ return {{ status: 'not-found' }}; }}\n    if (typeof el.focus === 'function') {{ el.focus(); }}\n    return {{ status: 'focused' }};\n}})()",
+                selector = selector_literal
+            );
+
+            let focus_response = self
                 .send_page_command(
                     page,
                     "Runtime.evaluate",
                     json!({
-                        "expression": format!(
-                            "(() => {{ const el=document.querySelector(\"{}\"); if(el) {{ el.value=\"{}\"; el.dispatchEvent(new Event('input',{{bubbles:true}})); }} }})();",
-                            selector,
-                            text.replace('"', "\\\""),
-                        ),
-                        "awaitPromise": true,
+                        "expression": focus_expression,
+                        "returnByValue": true,
                     }),
                 )
+                .await?;
+
+            let status = focus_response
+                .get("result")
+                .and_then(|res| res.get("value"))
+                .and_then(|val| val.get("status"))
+                .and_then(|val| val.as_str())
+                .unwrap_or("unknown");
+
+            if status != "focused" {
+                return Err(AdapterError::new(AdapterErrorKind::Internal)
+                    .with_hint(format!("failed to focus element for selector '{selector}'")));
+            }
+
+            for ch in text.chars() {
+                let text_str = ch.to_string();
+                let key = match ch {
+                    '\n' | '\r' => "Enter".to_string(),
+                    '\t' => "Tab".to_string(),
+                    _ => text_str.clone(),
+                };
+
+                self.send_page_command(
+                    page,
+                    "Input.dispatchKeyEvent",
+                    json!({
+                        "type": "char",
+                        "text": text_str,
+                        "unmodifiedText": text_str,
+                        "key": key,
+                    }),
+                )
+                .await?;
+            }
+
+            self.send_page_command(page, "Input.insertText", json!({ "text": text }))
                 .await?;
             Ok(())
         }
@@ -1176,34 +1473,79 @@ pub mod adapter {
             spec: SelectSpec,
             _deadline: std::time::Duration,
         ) -> Result<(), AdapterError> {
-            let selector_literal = serde_json::to_string(&spec.selector).map_err(|err| {
+            self.wait_for_page_ready(page).await?;
+
+            let SelectSpec {
+                selector,
+                value,
+                match_label,
+            } = spec;
+
+            let selector_literal = serde_json::to_string(&selector).map_err(|err| {
                 AdapterError::new(AdapterErrorKind::Internal).with_hint(err.to_string())
             })?;
-            let value_literal = serde_json::to_string(&spec.value).map_err(|err| {
-                AdapterError::new(AdapterErrorKind::Internal).with_hint(err.to_string())
-            })?;
-            let match_label_flag = if spec.match_label { "true" } else { "false" };
 
-            let expression = format!(
-                "(() => {{\n    const scope = document;\n    if (!scope) {{ return {{ status: 'no-document' }}; }}\n    let el;\n    try {{\n        el = scope.querySelector({selector});\n    }} catch (err) {{\n        return {{ status: 'invalid-selector', reason: String(err) }};\n    }}\n    if (!el) {{ return {{ status: 'not-found' }}; }}\n    const targetValue = {value};\n    const options = Array.from(el.options || []);\n    let option = options.find(opt => opt.value === targetValue);\n    if (!option && {match_label}) {{\n        option = options.find(opt => opt.text === targetValue);\n    }}\n    if (!option && typeof el.value === 'string') {{\n        // fallback: set value directly
-        el.value = targetValue;\n    }} else if (option) {{\n        el.value = option.value;\n    }} else {{\n        return {{ status: 'option-missing' }};\n    }}\n    el.dispatchEvent(new Event('input', {{ bubbles: true }}));\n    el.dispatchEvent(new Event('change', {{ bubbles: true }}));\n    return {{ status: 'selected', value: el.value }};\n}})()",
-                selector = selector_literal,
-                value = value_literal,
-                match_label = match_label_flag
-            );
-
-            let response = self
+            let evaluate_response = self
                 .send_page_command(
                     page,
                     "Runtime.evaluate",
                     json!({
-                        "expression": expression,
+                        "expression": format!("document.querySelector({selector})", selector = selector_literal),
+                        "objectGroup": "soulbrowser-select",
+                        "returnByValue": false,
+                    }),
+                )
+                .await?;
+
+            let object_id = evaluate_response
+                .get("result")
+                .and_then(|res| res.get("objectId"))
+                .and_then(|val| val.as_str())
+                .ok_or_else(|| {
+                    AdapterError::new(AdapterErrorKind::Internal)
+                        .with_hint("selectOption target element not found")
+                })?
+                .to_string();
+
+            const SELECT_FN: &str = r#"
+function(targetValue, matchLabel) {
+    if (!this) { return { status: 'not-found' }; }
+    const options = Array.from(this.options || []);
+    let option = options.find(opt => opt.value === targetValue);
+    if (!option && matchLabel) {
+        option = options.find(opt => opt.text === targetValue);
+    }
+    if (!option && typeof this.value === 'string') {
+        this.value = targetValue;
+    } else if (option) {
+        this.value = option.value;
+    } else {
+        return { status: 'option-missing' };
+    }
+    this.dispatchEvent(new Event('input', { bubbles: true }));
+    this.dispatchEvent(new Event('change', { bubbles: true }));
+    return { status: 'selected', value: this.value };
+}
+"#;
+
+            let call_response = self
+                .send_page_command(
+                    page,
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_id.clone(),
+                        "functionDeclaration": SELECT_FN.trim(),
+                        "arguments": [
+                            { "value": value },
+                            { "value": match_label },
+                        ],
+                        "awaitPromise": true,
                         "returnByValue": true,
                     }),
                 )
                 .await?;
 
-            let result_obj = response
+            let result_obj = call_response
                 .get("result")
                 .and_then(|res| res.get("value"))
                 .and_then(|val| val.as_object())
@@ -1216,6 +1558,14 @@ pub mod adapter {
                 .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
+
+            let _ = self
+                .send_page_command(
+                    page,
+                    "Runtime.releaseObject",
+                    json!({ "objectId": object_id }),
+                )
+                .await;
 
             match status {
                 "selected" => Ok(()),
@@ -1286,14 +1636,132 @@ pub mod adapter {
                     }),
                 )
                 .await?;
-                if !self.network_stats.contains_key(&page) {
-                    self.network_stats.insert(page, NetworkStats::new());
-                }
+                self.schedule_tap_enable(page);
             } else {
                 self.send_page_command(page, "Network.disable", Value::Object(Default::default()))
                     .await?;
-                self.network_stats.remove(&page);
+                self.schedule_tap_disable(page);
             }
+            Ok(())
+        }
+
+        async fn grant_permissions(
+            &self,
+            origin: &str,
+            permissions: &[String],
+        ) -> Result<(), AdapterError> {
+            if permissions.is_empty() {
+                return Ok(());
+            }
+            self.send_command(
+                "Browser.grantPermissions",
+                json!({
+                    "origin": origin,
+                    "permissions": permissions,
+                }),
+            )
+            .await?;
+            Ok(())
+        }
+
+        async fn reset_permissions(
+            &self,
+            origin: &str,
+            permissions: &[String],
+        ) -> Result<(), AdapterError> {
+            let mut params = serde_json::Map::new();
+            params.insert("origin".into(), Value::String(origin.to_string()));
+            if !permissions.is_empty() {
+                let list = permissions
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect::<Vec<Value>>();
+                params.insert("permissions".into(), Value::Array(list));
+            }
+            self.send_command("Browser.resetPermissions", Value::Object(params))
+                .await?;
+            Ok(())
+        }
+
+        async fn set_user_agent(
+            &self,
+            page: PageId,
+            user_agent: &str,
+            accept_language: Option<&str>,
+            platform: Option<&str>,
+            locale: Option<&str>,
+        ) -> Result<(), AdapterError> {
+            let mut params = serde_json::Map::new();
+            params.insert("userAgent".into(), Value::String(user_agent.to_string()));
+            if let Some(lang) = accept_language {
+                params.insert("acceptLanguage".into(), Value::String(lang.to_string()));
+            }
+            if let Some(platform) = platform {
+                params.insert("platform".into(), Value::String(platform.to_string()));
+            }
+            self.send_page_command(
+                page,
+                "Emulation.setUserAgentOverride",
+                Value::Object(params),
+            )
+            .await?;
+
+            if let Some(locale) = locale {
+                self.send_page_command(
+                    page,
+                    "Emulation.setLocaleOverride",
+                    json!({ "locale": locale }),
+                )
+                .await?;
+            }
+
+            Ok(())
+        }
+
+        async fn set_timezone(&self, page: PageId, timezone: &str) -> Result<(), AdapterError> {
+            self.send_page_command(
+                page,
+                "Emulation.setTimezoneOverride",
+                json!({ "timezoneId": timezone }),
+            )
+            .await?;
+            Ok(())
+        }
+
+        async fn set_device_metrics(
+            &self,
+            page: PageId,
+            width: u32,
+            height: u32,
+            device_scale_factor: f64,
+            mobile: bool,
+        ) -> Result<(), AdapterError> {
+            self.send_page_command(
+                page,
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": width,
+                    "height": height,
+                    "deviceScaleFactor": device_scale_factor,
+                    "mobile": mobile,
+                }),
+            )
+            .await?;
+            Ok(())
+        }
+
+        async fn set_touch_emulation(
+            &self,
+            page: PageId,
+            enabled: bool,
+        ) -> Result<(), AdapterError> {
+            self.send_page_command(
+                page,
+                "Emulation.setTouchEmulationEnabled",
+                json!({ "enabled": enabled }),
+            )
+            .await?;
             Ok(())
         }
 
@@ -1424,15 +1892,18 @@ pub mod adapter {
     mod tests {
         use super::*;
         use crate::transport::TransportEvent;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use serde_json::Value;
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::time::Instant;
         use tokio::sync::mpsc;
 
         struct MockTransport {
             started: AtomicBool,
             rx: Mutex<mpsc::Receiver<TransportEvent>>,
             commands: Mutex<Vec<(String, Value)>>,
-            response: Mutex<Option<Value>>,
+            responses: Mutex<VecDeque<Value>>,
         }
 
         impl MockTransport {
@@ -1443,7 +1914,7 @@ pub mod adapter {
                         started: AtomicBool::new(false),
                         rx: Mutex::new(rx),
                         commands: Mutex::new(Vec::new()),
-                        response: Mutex::new(None),
+                        responses: Mutex::new(VecDeque::new()),
                     }),
                     tx,
                 )
@@ -1458,7 +1929,7 @@ pub mod adapter {
             }
 
             async fn set_response(&self, value: Value) {
-                *self.response.lock().await = Some(value);
+                self.responses.lock().await.push_back(value);
             }
         }
 
@@ -1484,12 +1955,69 @@ pub mod adapter {
                     .lock()
                     .await
                     .push((method.to_string(), params));
-                Ok(self.response.lock().await.take().unwrap_or(Value::Null))
+                Ok(self
+                    .responses
+                    .lock()
+                    .await
+                    .pop_front()
+                    .unwrap_or(Value::Null))
+            }
+        }
+
+        struct DisconnectingTransport {
+            start_calls: AtomicUsize,
+            next_calls: AtomicUsize,
+            rx: Mutex<mpsc::Receiver<TransportEvent>>,
+        }
+
+        impl DisconnectingTransport {
+            fn new_pair() -> (Arc<Self>, mpsc::Sender<TransportEvent>) {
+                let (tx, rx) = mpsc::channel(16);
+                (
+                    Arc::new(Self {
+                        start_calls: AtomicUsize::new(0),
+                        next_calls: AtomicUsize::new(0),
+                        rx: Mutex::new(rx),
+                    }),
+                    tx,
+                )
+            }
+
+            fn start_calls(&self) -> usize {
+                self.start_calls.load(Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait]
+        impl CdpTransport for DisconnectingTransport {
+            async fn start(&self) -> Result<(), AdapterError> {
+                self.start_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn next_event(&self) -> Option<TransportEvent> {
+                let call = self.next_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    return None;
+                }
+                let mut guard = self.rx.lock().await;
+                guard.recv().await
+            }
+
+            async fn send_command(
+                &self,
+                _target: CommandTarget,
+                _method: &str,
+                _params: Value,
+            ) -> Result<Value, AdapterError> {
+                Ok(Value::Null)
             }
         }
 
         #[tokio::test]
-        async fn event_loop_broadcasts_transport_events() {
+        async fn ignores_unknown_events() {
+            use tokio::time::{timeout, Duration as TokioDuration};
+
             let (bus, mut rx) = crate::event_bus(8);
             let (transport, tx) = MockTransport::new_pair();
             let adapter = Arc::new(CdpAdapter::with_transport(
@@ -1510,13 +2038,11 @@ pub mod adapter {
             .await
             .unwrap();
 
-            let event = rx.recv().await.expect("receive raw event");
-            match event {
-                RawEvent::Error { message, .. } => {
-                    assert!(message.contains("Test.Event"));
-                }
-                other => panic!("unexpected event: {:?}", other),
-            }
+            let result = timeout(TokioDuration::from_millis(100), rx.recv()).await;
+            assert!(
+                result.is_err(),
+                "unexpected raw event broadcast: {result:?}"
+            );
 
             adapter.shutdown().await;
         }
@@ -1537,6 +2063,15 @@ pub mod adapter {
             let page = PageId::new();
             let session = SessionId::new();
             adapter.register_page(page, session, None, Some("mock-session".into()));
+
+            transport.set_response(Value::Null).await;
+            transport
+                .set_response(json!({
+                    "result": {
+                        "value": "complete"
+                    }
+                }))
+                .await;
 
             adapter
                 .navigate(
@@ -1565,7 +2100,103 @@ pub mod adapter {
         }
 
         #[tokio::test]
+        async fn event_loop_recovers_after_transport_disconnect() {
+            use tokio::time::{sleep, timeout, Duration as TokioDuration};
+
+            let (bus, mut rx) = crate::event_bus(8);
+            let (transport, tx) = DisconnectingTransport::new_pair();
+            let adapter = Arc::new(CdpAdapter::with_transport(
+                CdpConfig::default(),
+                bus,
+                transport.clone() as Arc<dyn CdpTransport>,
+            ));
+
+            let stale_page = PageId::new();
+            let stale_session = SessionId::new();
+            let stale_target = "stale-target".to_string();
+            let stale_cdp_session = "stale-session".to_string();
+
+            adapter.registry.insert_page(
+                stale_page,
+                stale_session,
+                Some(stale_target.clone()),
+                Some(stale_cdp_session.clone()),
+            );
+            adapter.targets.insert(stale_target.clone(), stale_page);
+            adapter
+                .sessions
+                .insert(stale_cdp_session.clone(), stale_page);
+            adapter.page_activity.insert(stale_page, Instant::now());
+
+            crate::metrics::reset();
+            Arc::clone(&adapter).start().await.expect("start adapter");
+            assert_eq!(transport.start_calls(), 1);
+
+            timeout(TokioDuration::from_millis(200), async {
+                while transport.start_calls() < 2 {
+                    sleep(TokioDuration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("transport restart");
+
+            tx.send(TransportEvent {
+                method: "Target.targetCreated".into(),
+                params: json!({
+                    "targetInfo": {
+                        "targetId": "page-1",
+                        "type": "page",
+                        "url": "https://example.com"
+                    }
+                }),
+                session_id: None,
+            })
+            .await
+            .unwrap();
+
+            let mut saw_closed = false;
+            let mut saw_opened = false;
+            let mut saw_error = false;
+
+            for _ in 0..6 {
+                let evt = timeout(TokioDuration::from_millis(200), rx.recv())
+                    .await
+                    .expect("receive raw event")
+                    .expect("raw event payload");
+                match evt {
+                    RawEvent::PageLifecycle { page, phase, .. } => {
+                        if phase == "closed" && page == stale_page {
+                            saw_closed = true;
+                        } else if phase == "opened" {
+                            saw_opened = true;
+                        }
+                    }
+                    RawEvent::PageNavigated { page, .. } => {
+                        if page == stale_page {
+                            saw_opened = true;
+                        }
+                    }
+                    RawEvent::Error { .. } => saw_error = true,
+                    _ => {}
+                }
+                if saw_closed && saw_opened && saw_error {
+                    break;
+                }
+            }
+
+            assert!(saw_closed, "expected closed lifecycle for stale page");
+            assert!(saw_opened, "expected opened lifecycle after restart");
+            assert!(saw_error, "expected transport restart error notification");
+            assert!(adapter.targets.get(&stale_target).is_none());
+            assert!(adapter.registry.get(&stale_page).is_none());
+            assert!(adapter.page_activity.get(&stale_page).is_none());
+
+            adapter.shutdown().await;
+        }
+
+        #[tokio::test]
         async fn network_events_emit_summaries_and_metrics() {
+            use tokio::time::Duration as TokioDuration;
             let (bus, mut rx) = crate::event_bus(8);
             let (transport, _tx) = MockTransport::new_pair();
             let adapter = Arc::new(CdpAdapter::with_transport(
@@ -1590,7 +2221,6 @@ pub mod adapter {
             );
             adapter.targets.insert(target_id, page);
             adapter.sessions.insert(cdp_session.clone(), page);
-            adapter.network_stats.insert(page, NetworkStats::new());
 
             adapter
                 .handle_event(TransportEvent {
@@ -1608,17 +2238,20 @@ pub mod adapter {
                 })
                 .await;
 
-            let mut summaries = 0;
-            while let Ok(evt) = rx.try_recv() {
-                if let RawEvent::NetworkSummary { .. } = evt {
-                    summaries += 1;
+            tokio::time::timeout(TokioDuration::from_millis(500), async {
+                loop {
+                    if let Ok(evt) = rx.recv().await {
+                        if let RawEvent::NetworkSummary { .. } = evt {
+                            break;
+                        }
+                    }
                 }
-            }
-
-            assert!(summaries >= 2);
+            })
+            .await
+            .expect("network summary event");
 
             let snapshot = crate::metrics::snapshot();
-            assert!(snapshot.network_summaries >= 2);
+            assert!(snapshot.network_summaries >= 1);
             assert!(snapshot.events >= 2);
 
             adapter.shutdown().await;
@@ -1667,6 +2300,7 @@ pub mod adapter {
 
         #[tokio::test]
         async fn wait_basic_network_quiet_resolves_on_stats() {
+            use network_tap_light::NetworkSnapshot;
             let (bus, _rx) = crate::event_bus(8);
             let (transport, _tx) = MockTransport::new_pair();
             let adapter = Arc::new(CdpAdapter::with_transport(
@@ -1680,18 +2314,29 @@ pub mod adapter {
             let page = PageId::new();
             let session = SessionId::new();
             adapter.register_page(page, session, None, Some("mock-session".into()));
+            adapter
+                .network_tap
+                .enable(CdpAdapter::tap_page_id(page))
+                .await
+                .expect("enable tap page");
 
-            adapter.network_stats.insert(
-                page,
-                NetworkStats {
-                    requests: 10,
-                    responses_2xx: 10,
-                    responses_4xx: 0,
-                    responses_5xx: 0,
-                    inflight: 0,
-                    last_activity: Instant::now() - Duration::from_millis(2_000),
-                },
-            );
+            adapter
+                .network_tap
+                .update_snapshot(
+                    CdpAdapter::tap_page_id(page),
+                    NetworkSnapshot {
+                        req: 10,
+                        res2xx: 10,
+                        res4xx: 0,
+                        res5xx: 0,
+                        inflight: 0,
+                        quiet: true,
+                        window_ms: 500,
+                        since_last_activity_ms: 2_000,
+                    },
+                )
+                .await
+                .expect("update snapshot");
 
             let gate = serde_json::to_string(&WaitGate::NetworkQuiet {
                 window_ms: 500,
@@ -1699,13 +2344,15 @@ pub mod adapter {
             })
             .expect("serialize gate");
 
+            let baseline = transport.commands().await.len();
+
             adapter
                 .wait_basic(page, gate, std::time::Duration::from_secs(1))
                 .await
                 .expect("wait_basic network quiet");
 
-            let commands = transport.commands().await;
-            assert!(commands.is_empty());
+            let after = transport.commands().await.len();
+            assert_eq!(after, baseline);
 
             adapter.shutdown().await;
         }
@@ -1726,6 +2373,7 @@ pub mod adapter {
             let session = SessionId::new();
             adapter.register_page(page, session, None, Some("mock-session".into()));
 
+            transport.set_response(Value::Null).await;
             transport
                 .set_response(json!({
                     "documents": [ { "nodeName": "#document" } ],
@@ -1743,6 +2391,7 @@ pub mod adapter {
                 vec!["".to_string(), "html".to_string()]
             );
 
+            transport.set_response(Value::Null).await;
             transport
                 .set_response(json!({
                     "nodes": [ { "role": { "type": "document" } } ],
@@ -1827,6 +2476,243 @@ pub mod adapter {
         }
 
         #[tokio::test]
+        async fn grant_permissions_dispatches_browser_command() {
+            let (bus, _rx) = crate::event_bus(8);
+            let (transport, _tx) = MockTransport::new_pair();
+            let adapter = Arc::new(CdpAdapter::with_transport(
+                CdpConfig::default(),
+                bus,
+                transport.clone() as Arc<dyn CdpTransport>,
+            ));
+
+            crate::metrics::reset();
+            Arc::clone(&adapter).start().await.expect("start adapter");
+
+            adapter
+                .grant_permissions("https://example.com", &vec!["clipboardRead".into()])
+                .await
+                .expect("grant permissions");
+
+            let commands = transport.commands().await;
+            let entry = commands
+                .iter()
+                .find(|(method, _)| method == "Browser.grantPermissions")
+                .expect("grant command");
+            assert_eq!(
+                "https://example.com",
+                entry.1.get("origin").and_then(|v| v.as_str()).unwrap()
+            );
+            let perms = entry
+                .1
+                .get("permissions")
+                .and_then(|v| v.as_array())
+                .expect("permissions array");
+            assert_eq!(perms, &vec![Value::String("clipboardRead".into())]);
+
+            adapter.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn reset_permissions_dispatches_browser_command() {
+            let (bus, _rx) = crate::event_bus(8);
+            let (transport, _tx) = MockTransport::new_pair();
+            let adapter = Arc::new(CdpAdapter::with_transport(
+                CdpConfig::default(),
+                bus,
+                transport.clone() as Arc<dyn CdpTransport>,
+            ));
+
+            crate::metrics::reset();
+            Arc::clone(&adapter).start().await.expect("start adapter");
+
+            adapter
+                .reset_permissions("https://example.com", &vec!["camera".into()])
+                .await
+                .expect("reset permissions");
+
+            let commands = transport.commands().await;
+            let entry = commands
+                .iter()
+                .find(|(method, _)| method == "Browser.resetPermissions")
+                .expect("reset command");
+            assert_eq!(
+                "https://example.com",
+                entry.1.get("origin").and_then(|v| v.as_str()).unwrap()
+            );
+            let perms = entry
+                .1
+                .get("permissions")
+                .and_then(|v| v.as_array())
+                .expect("permissions array");
+            assert_eq!(perms, &vec![Value::String("camera".into())]);
+
+            adapter.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn set_user_agent_dispatches_emulation_override() {
+            let (bus, _rx) = crate::event_bus(8);
+            let (transport, _tx) = MockTransport::new_pair();
+            let adapter = Arc::new(CdpAdapter::with_transport(
+                CdpConfig::default(),
+                bus,
+                transport.clone() as Arc<dyn CdpTransport>,
+            ));
+
+            crate::metrics::reset();
+            Arc::clone(&adapter).start().await.expect("start adapter");
+
+            let page = PageId::new();
+            let session = SessionId::new();
+            adapter.register_page(page, session, None, Some("session-ua".into()));
+
+            adapter
+                .set_user_agent(
+                    page,
+                    "Mozilla/5.0",
+                    Some("en-US"),
+                    Some("Win32"),
+                    Some("en-US"),
+                )
+                .await
+                .expect("set user agent");
+
+            let commands = transport.commands().await;
+            let ua_cmd = commands
+                .iter()
+                .find(|(method, _)| method == "Emulation.setUserAgentOverride")
+                .expect("user agent command");
+            assert_eq!(
+                ua_cmd.1.get("userAgent").and_then(|v| v.as_str()),
+                Some("Mozilla/5.0")
+            );
+            assert_eq!(
+                ua_cmd.1.get("acceptLanguage").and_then(|v| v.as_str()),
+                Some("en-US")
+            );
+            assert_eq!(
+                ua_cmd.1.get("platform").and_then(|v| v.as_str()),
+                Some("Win32")
+            );
+
+            let locale_cmd = commands
+                .iter()
+                .find(|(method, _)| method == "Emulation.setLocaleOverride")
+                .expect("locale command");
+            assert_eq!(
+                locale_cmd.1.get("locale").and_then(|v| v.as_str()),
+                Some("en-US")
+            );
+
+            adapter.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn set_timezone_dispatches_emulation_override() {
+            let (bus, _rx) = crate::event_bus(8);
+            let (transport, _tx) = MockTransport::new_pair();
+            let adapter = Arc::new(CdpAdapter::with_transport(
+                CdpConfig::default(),
+                bus,
+                transport.clone() as Arc<dyn CdpTransport>,
+            ));
+
+            crate::metrics::reset();
+            Arc::clone(&adapter).start().await.expect("start adapter");
+
+            let page = PageId::new();
+            let session = SessionId::new();
+            adapter.register_page(page, session, None, Some("session-tz".into()));
+
+            adapter
+                .set_timezone(page, "America/Los_Angeles")
+                .await
+                .expect("set timezone");
+
+            let commands = transport.commands().await;
+            let entry = commands
+                .iter()
+                .find(|(method, _)| method == "Emulation.setTimezoneOverride")
+                .expect("timezone command");
+            assert_eq!(
+                entry.1.get("timezoneId").and_then(|v| v.as_str()),
+                Some("America/Los_Angeles")
+            );
+
+            adapter.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn set_device_metrics_dispatches_emulation_override() {
+            let (bus, _rx) = crate::event_bus(8);
+            let (transport, _tx) = MockTransport::new_pair();
+            let adapter = Arc::new(CdpAdapter::with_transport(
+                CdpConfig::default(),
+                bus,
+                transport.clone() as Arc<dyn CdpTransport>,
+            ));
+
+            crate::metrics::reset();
+            Arc::clone(&adapter).start().await.expect("start adapter");
+
+            let page = PageId::new();
+            let session = SessionId::new();
+            adapter.register_page(page, session, None, Some("session-metrics".into()));
+
+            adapter
+                .set_device_metrics(page, 1280, 720, 1.5, false)
+                .await
+                .expect("set device metrics");
+
+            let commands = transport.commands().await;
+            let entry = commands
+                .iter()
+                .find(|(method, _)| method == "Emulation.setDeviceMetricsOverride")
+                .expect("metrics command");
+            assert_eq!(entry.1.get("width").and_then(|v| v.as_u64()), Some(1280));
+            assert_eq!(entry.1.get("height").and_then(|v| v.as_u64()), Some(720));
+            assert_eq!(
+                entry.1.get("deviceScaleFactor").and_then(|v| v.as_f64()),
+                Some(1.5)
+            );
+            assert_eq!(entry.1.get("mobile").and_then(|v| v.as_bool()), Some(false));
+
+            adapter.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn set_touch_emulation_dispatches_command() {
+            let (bus, _rx) = crate::event_bus(8);
+            let (transport, _tx) = MockTransport::new_pair();
+            let adapter = Arc::new(CdpAdapter::with_transport(
+                CdpConfig::default(),
+                bus,
+                transport.clone() as Arc<dyn CdpTransport>,
+            ));
+
+            crate::metrics::reset();
+            Arc::clone(&adapter).start().await.expect("start adapter");
+
+            let page = PageId::new();
+            let session = SessionId::new();
+            adapter.register_page(page, session, None, Some("session-touch".into()));
+
+            adapter
+                .set_touch_emulation(page, true)
+                .await
+                .expect("set touch emulation");
+
+            let commands = transport.commands().await;
+            let entry = commands
+                .iter()
+                .find(|(method, _)| method == "Emulation.setTouchEmulationEnabled")
+                .expect("touch command");
+            assert_eq!(entry.1.get("enabled").and_then(|v| v.as_bool()), Some(true));
+
+            adapter.shutdown().await;
+        }
+
+        #[tokio::test]
         async fn select_option_dispatches_events() {
             let (bus, _rx) = crate::event_bus(8);
             let (transport, _tx) = MockTransport::new_pair();
@@ -1846,6 +2732,14 @@ pub mod adapter {
                 .set_response(json!({
                     "result": {
                         "type": "object",
+                        "objectId": "remote-1"
+                    }
+                }))
+                .await;
+
+            transport
+                .set_response(json!({
+                    "result": {
                         "value": { "status": "selected", "value": "choice" }
                     }
                 }))
@@ -1868,6 +2762,118 @@ pub mod adapter {
             assert!(commands
                 .iter()
                 .any(|(method, _)| method == "Runtime.evaluate"));
+            assert!(commands
+                .iter()
+                .any(|(method, _)| method == "Runtime.callFunctionOn"));
+            assert!(commands
+                .iter()
+                .any(|(method, _)| method == "Runtime.releaseObject"));
+
+            adapter.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn click_dispatches_mouse_events() {
+            let (bus, _rx) = crate::event_bus(8);
+            let (transport, _tx) = MockTransport::new_pair();
+            let adapter = Arc::new(CdpAdapter::with_transport(
+                CdpConfig::default(),
+                bus,
+                transport.clone() as Arc<dyn CdpTransport>,
+            ));
+
+            Arc::clone(&adapter).start().await.expect("start adapter");
+
+            let page = PageId::new();
+            let session = SessionId::new();
+            adapter.register_page(page, session, None, Some("mock-session".into()));
+
+            transport
+                .set_response(json!({
+                    "result": {
+                        "value": [
+                            { "x": 42.0, "y": 24.0, "backendNodeId": null }
+                        ]
+                    }
+                }))
+                .await;
+
+            adapter
+                .click(page, "button.primary", std::time::Duration::from_secs(2))
+                .await
+                .expect("click dispatch succeeds");
+
+            let commands = transport.commands().await;
+            let mut mouse_events: Vec<&Value> = commands
+                .iter()
+                .filter(|(method, _)| method == "Input.dispatchMouseEvent")
+                .map(|(_, params)| params)
+                .collect();
+            assert_eq!(mouse_events.len(), 2);
+            mouse_events.sort_by_key(|params| {
+                params
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            });
+
+            let pressed = mouse_events
+                .iter()
+                .find(|params| params.get("type").and_then(|v| v.as_str()) == Some("mousePressed"))
+                .expect("mousePressed event present");
+            assert_eq!(pressed.get("x").and_then(|v| v.as_f64()), Some(42.0));
+            assert_eq!(pressed.get("y").and_then(|v| v.as_f64()), Some(24.0));
+
+            assert!(
+                mouse_events
+                    .iter()
+                    .any(|params| params.get("type").and_then(|v| v.as_str())
+                        == Some("mouseReleased"))
+            );
+
+            adapter.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn type_text_dispatches_key_events() {
+            let (bus, _rx) = crate::event_bus(8);
+            let (transport, _tx) = MockTransport::new_pair();
+            let adapter = Arc::new(CdpAdapter::with_transport(
+                CdpConfig::default(),
+                bus,
+                transport.clone() as Arc<dyn CdpTransport>,
+            ));
+
+            Arc::clone(&adapter).start().await.expect("start adapter");
+
+            let page = PageId::new();
+            let session = SessionId::new();
+            adapter.register_page(page, session, None, Some("mock-session".into()));
+
+            transport
+                .set_response(json!({
+                    "result": {
+                        "value": { "status": "focused" }
+                    }
+                }))
+                .await;
+
+            adapter
+                .type_text(page, "#search", "ok", std::time::Duration::from_secs(2))
+                .await
+                .expect("type_text dispatch succeeds");
+
+            let commands = transport.commands().await;
+            let key_events: Vec<&Value> = commands
+                .iter()
+                .filter(|(method, _)| method == "Input.dispatchKeyEvent")
+                .map(|(_, params)| params)
+                .collect();
+            assert_eq!(key_events.len(), 2);
+            assert!(commands
+                .iter()
+                .any(|(method, _)| method == "Input.insertText"));
 
             adapter.shutdown().await;
         }

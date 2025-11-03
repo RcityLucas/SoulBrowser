@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use cdp_adapter::{EventBus, PageId, RawEvent};
-use tokio::task::JoinHandle;
 use tokio::select;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -94,6 +94,12 @@ impl LifecycleWatcher {
         match event {
             RawEvent::PageLifecycle { page, phase, .. } => {
                 Self::handle_lifecycle_phase(*page, phase, anchor_cache, snapshot_cache);
+            }
+            RawEvent::PageNavigated { page, .. } => {
+                Self::handle_lifecycle_phase(*page, "navigate", anchor_cache, snapshot_cache);
+            }
+            RawEvent::NetworkActivity { .. } => {
+                // Network activity does not affect cached DOM structures
             }
             RawEvent::NetworkSummary { .. } => {
                 // Network events don't change DOM structure, no invalidation needed
@@ -196,27 +202,28 @@ mod tests {
 
         let page = cdp_adapter::PageId::new();
         let cache_key = format!("{:?}::test-selector", page);
-        anchor_cache.put(cache_key.clone(), crate::model::AnchorResolution {
-            primary: crate::model::AnchorDescriptor {
-                strategy: "test".into(),
-                value: serde_json::Value::Null,
-                frame_id: soulbrowser_core_types::FrameId::new(),
-                confidence: 1.0,
-                backend_node_id: None,
-                geometry: None,
+        anchor_cache.put(
+            cache_key.clone(),
+            crate::model::AnchorResolution {
+                primary: crate::model::AnchorDescriptor {
+                    strategy: "test".into(),
+                    value: serde_json::Value::Null,
+                    frame_id: soulbrowser_core_types::FrameId::new(),
+                    confidence: 1.0,
+                    backend_node_id: None,
+                    geometry: None,
+                },
+                candidates: vec![],
+                reason: "test".into(),
+                score: crate::model::ScoreBreakdown {
+                    total: 1.0,
+                    components: vec![],
+                },
             },
-            candidates: vec![],
-            reason: "test".into(),
-            score: crate::model::ScoreBreakdown {
-                total: 1.0,
-                components: vec![],
-            },
-        });
-
-        let mut watcher = LifecycleWatcher::new(
-            Arc::clone(&anchor_cache),
-            Arc::clone(&snapshot_cache),
         );
+
+        let mut watcher =
+            LifecycleWatcher::new(Arc::clone(&anchor_cache), Arc::clone(&snapshot_cache));
         watcher.start(bus.clone());
 
         // Emit navigate event
@@ -245,27 +252,28 @@ mod tests {
 
         let page = cdp_adapter::PageId::new();
         let cache_key = format!("{:?}::test-selector", page);
-        anchor_cache.put(cache_key.clone(), crate::model::AnchorResolution {
-            primary: crate::model::AnchorDescriptor {
-                strategy: "test".into(),
-                value: serde_json::Value::Null,
-                frame_id: soulbrowser_core_types::FrameId::new(),
-                confidence: 1.0,
-                backend_node_id: None,
-                geometry: None,
+        anchor_cache.put(
+            cache_key.clone(),
+            crate::model::AnchorResolution {
+                primary: crate::model::AnchorDescriptor {
+                    strategy: "test".into(),
+                    value: serde_json::Value::Null,
+                    frame_id: soulbrowser_core_types::FrameId::new(),
+                    confidence: 1.0,
+                    backend_node_id: None,
+                    geometry: None,
+                },
+                candidates: vec![],
+                reason: "test".into(),
+                score: crate::model::ScoreBreakdown {
+                    total: 1.0,
+                    components: vec![],
+                },
             },
-            candidates: vec![],
-            reason: "test".into(),
-            score: crate::model::ScoreBreakdown {
-                total: 1.0,
-                components: vec![],
-            },
-        });
-
-        let mut watcher = LifecycleWatcher::new(
-            Arc::clone(&anchor_cache),
-            Arc::clone(&snapshot_cache),
         );
+
+        let mut watcher =
+            LifecycleWatcher::new(Arc::clone(&anchor_cache), Arc::clone(&snapshot_cache));
         watcher.start(bus.clone());
 
         // Emit domcontentloaded event

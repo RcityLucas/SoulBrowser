@@ -1,0 +1,21 @@
+pub mod auth;
+pub mod bootstrap;
+pub mod errors;
+pub mod events;
+pub mod grpc;
+pub mod guard;
+pub mod http;
+pub mod idempotency;
+pub mod map;
+pub mod mcp;
+pub mod plugins;
+pub mod policy;
+pub mod ports;
+pub mod privacy;
+pub mod schema;
+pub mod trace;
+
+pub use bootstrap::AdapterBootstrap;
+pub use errors::{AdapterError, AdapterResult};
+pub use http::router;
+pub use policy::{AdapterPolicyHandle, AdapterPolicyView, TenantPolicy};

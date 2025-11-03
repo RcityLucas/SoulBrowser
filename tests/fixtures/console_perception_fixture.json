@@ -1,0 +1,59 @@
+{
+  "success": true,
+  "stdout": "fixture stdout",
+  "stderr": "",
+  "perception": {
+    "structural": {
+      "snapshot_id": "snapshot-123",
+      "dom_node_count": 42,
+      "interactive_element_count": 5,
+      "has_forms": true,
+      "has_navigation": true
+    },
+    "visual": {
+      "screenshot_id": "shot-123",
+      "dominant_colors": [
+        [255, 255, 255],
+        [0, 0, 0],
+        [67, 56, 202]
+      ],
+      "avg_contrast": 4.5,
+      "viewport_utilization": 0.82,
+      "complexity": 0.34
+    },
+    "semantic": {
+      "content_type": "Portal",
+      "intent": "Navigation",
+      "language": "en",
+      "language_confidence": 0.97,
+      "summary": "Fixture page summary",
+      "keywords": [
+        "fixture",
+        "example",
+        "test"
+      ],
+      "readability": 62.0
+    },
+    "insights": [
+      {
+        "insight_type": "Performance",
+        "description": "Fixture DOM is moderate in size",
+        "confidence": 0.65,
+        "sources": [
+          "Structural"
+        ]
+      },
+      {
+        "insight_type": "UserExperience",
+        "description": "Fixture viewport usage is healthy",
+        "confidence": 0.72,
+        "sources": [
+          "Visual",
+          "Semantic"
+        ]
+      }
+    ],
+    "confidence": 0.88
+  },
+  "screenshot_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAF/gL+JrpedwAAAABJRU5ErkJggg=="
+}

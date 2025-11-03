@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>SoulBrowser · Visual Testing Console</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f6fb;
+      --fg: #1e1f25;
+      --accent: #3b82f6;
+      --card: #ffffffdd;
+      --border: #d1d5db;
+      --danger: #dc2626;
+      --success: #15803d;
+      font-family: "Inter", system-ui, sans-serif;
+    }
+    body {
+      margin: 0;
+      background: linear-gradient(135deg, rgba(59,130,246,0.15), rgba(255,255,255,0.9));
+      min-height: 100vh;
+      color: var(--fg);
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 3rem 1.5rem 4rem;
+    }
+    main {
+      max-width: 1080px;
+      width: 100%;
+    }
+    h1 {
+      font-size: 2.2rem;
+      margin-bottom: 0.5rem;
+      color: #0f172a;
+    }
+    p.subtitle {
+      margin-top: 0;
+      color: #475569;
+      font-size: 1rem;
+    }
+    form {
+      display: grid;
+      gap: 1rem;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      padding: 1.5rem;
+      background: var(--card);
+      border-radius: 16px;
+      box-shadow: 0 18px 38px rgba(15, 23, 42, 0.08);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      margin-bottom: 1.5rem;
+      backdrop-filter: blur(12px);
+    }
+    label {
+      font-weight: 600;
+      display: block;
+      margin-bottom: 0.35rem;
+    }
+    input[type="text"],
+    input[type="number"],
+    select {
+      width: 100%;
+      padding: 0.65rem 0.75rem;
+      border-radius: 10px;
+      border: 1px solid rgba(148, 163, 184, 0.4);
+      background: #fff;
+      font-size: 0.95rem;
+      box-sizing: border-box;
+    }
+    .checkboxes {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .checkboxes label {
+      display: flex;
+      align-items: center;
+      font-weight: 500;
+      gap: 0.35rem;
+    }
+    button[type="submit"] {
+      grid-column: 1 / -1;
+      padding: 0.9rem 1.2rem;
+      border-radius: 12px;
+      border: none;
+      background: var(--accent);
+      color: white;
+      font-weight: 600;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    button[type="submit"]:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 12px 26px rgba(59, 130, 246, 0.25);
+    }
+    section.card {
+      background: var(--card);
+      border-radius: 16px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      box-shadow: 0 16px 32px rgba(15, 23, 42, 0.06);
+      backdrop-filter: blur(12px);
+    }
+    section.card h2 {
+      margin-top: 0;
+      margin-bottom: 0.75rem;
+      font-size: 1.25rem;
+      color: #0f172a;
+    }
+    pre {
+      background: rgba(15, 23, 42, 0.85);
+      color: #e2e8f0;
+      padding: 1rem;
+      border-radius: 12px;
+      max-height: 320px;
+      overflow: auto;
+      font-size: 0.9rem;
+    }
+    pre.empty {
+      color: #94a3b8;
+      font-style: italic;
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-weight: 600;
+    }
+    .status.spinner::before {
+      content: "";
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      border: 2px solid rgba(59, 130, 246, 0.35);
+      border-top-color: rgba(59, 130, 246, 1);
+      animation: spin 0.8s linear infinite;
+    }
+    .status.success { color: var(--success); }
+    .status.error { color: var(--danger); }
+    img#screenshot {
+      max-width: 100%;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      display: none;
+    }
+    details summary {
+      cursor: pointer;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+    }
+    details pre {
+      margin-top: 0.5rem;
+    }
+    footer {
+      text-align: center;
+      color: #64748b;
+      font-size: 0.85rem;
+      margin-top: 2rem;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>SoulBrowser · Visual Testing Console</h1>
+      <p class="subtitle">Run structural, visual, and semantic perception against a live Chrome instance. Configure the URL, perception modes, and inspect raw outputs without leaving the browser.</p>
+    </header>
+
+    <form id="perception-form">
+      <div>
+        <label for="url">Target URL</label>
+        <input type="text" id="url" name="url" value="https://example.com" required />
+      </div>
+      <div>
+        <label for="timeout">Timeout (seconds)</label>
+        <input type="number" id="timeout" name="timeout" min="5" max="300" value="45" />
+      </div>
+      <div>
+        <label for="mode">Mode</label>
+        <select id="mode" name="mode">
+          <option value="auto" selected>Auto (choose from checkboxes)</option>
+          <option value="all">All modes</option>
+          <option value="structural">Structural only</option>
+          <option value="visual">Visual only</option>
+          <option value="semantic">Semantic only</option>
+        </select>
+      </div>
+      <div>
+        <label>Perception channels</label>
+        <div class="checkboxes">
+          <label><input type="checkbox" id="structural" checked /> Structural</label>
+          <label><input type="checkbox" id="visual" checked /> Visual</label>
+          <label><input type="checkbox" id="semantic" checked /> Semantic</label>
+          <label><input type="checkbox" id="insights" checked /> Insights</label>
+          <label><input type="checkbox" id="capture" checked /> Capture screenshot</label>
+        </div>
+      </div>
+      <button type="submit">Run Perception</button>
+    </form>
+
+    <section class="card" id="status-card">
+      <h2>Status</h2>
+      <div id="status" class="status">Idle</div>
+    </section>
+
+    <section class="card">
+      <h2>Perception Output</h2>
+      <details open>
+        <summary>JSON</summary>
+        <pre id="json" class="empty">No perception data yet.</pre>
+      </details>
+      <details>
+        <summary>stdout</summary>
+        <pre id="stdout" class="empty">No output yet.</pre>
+      </details>
+      <details>
+        <summary>stderr</summary>
+        <pre id="stderr" class="empty">No output yet.</pre>
+      </details>
+      <div id="screenshot-wrapper" style="margin-top: 1rem; display:none;">
+        <h3>Screenshot</h3>
+        <img id="screenshot" alt="Perception screenshot" />
+      </div>
+    </section>
+
+    <footer>
+      Tip: In constrained environments (e.g. WSL), start Chrome on your host with <code>--remote-debugging-port</code> and set <code>SOULBROWSER_WS_URL</code> before launching the server.
+    </footer>
+  </main>
+
+  <script>
+    const form = document.getElementById('perception-form');
+    const statusEl = document.getElementById('status');
+    const jsonEl = document.getElementById('json');
+    const stdoutEl = document.getElementById('stdout');
+    const stderrEl = document.getElementById('stderr');
+    const screenshotWrapper = document.getElementById('screenshot-wrapper');
+    const screenshotImg = document.getElementById('screenshot');
+
+    function setStatus(text, state) {
+      statusEl.textContent = text;
+      statusEl.className = 'status ' + (state || '');
+    }
+
+    function setPre(element, content) {
+      if (content && content.trim() !== '') {
+        element.textContent = content;
+        element.classList.remove('empty');
+      } else {
+        element.textContent = 'No output yet.';
+        element.classList.add('empty');
+      }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const url = document.getElementById('url').value.trim();
+      const timeout = parseInt(document.getElementById('timeout').value, 10) || 45;
+      const mode = document.getElementById('mode').value;
+      const structural = document.getElementById('structural').checked;
+      const visual = document.getElementById('visual').checked;
+      const semantic = document.getElementById('semantic').checked;
+      const insights = document.getElementById('insights').checked;
+      const capture = document.getElementById('capture').checked;
+
+      if (!url) {
+        setStatus('Please enter a valid URL.', 'error');
+        return;
+      }
+
+      setStatus('Running perception…', 'spinner');
+      setPre(jsonEl, '');
+      setPre(stdoutEl, '');
+      setPre(stderrEl, '');
+      screenshotWrapper.style.display = 'none';
+
+      const payload = {
+        url,
+        timeout,
+        screenshot: capture,
+        insights,
+      };
+
+      if (mode !== 'auto') {
+        payload.mode = mode;
+      } else {
+        payload.structural = structural;
+        payload.visual = visual;
+        payload.semantic = semantic;
+      }
+
+      try {
+        const response = await fetch('/api/perceive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        const data = await response.json();
+        setPre(stdoutEl, data.stdout || '');
+        setPre(stderrEl, data.stderr || '');
+
+        if (data.perception) {
+          setPre(jsonEl, JSON.stringify(data.perception, null, 2));
+        } else {
+          setPre(jsonEl, '');
+        }
+
+        if (data.screenshot_base64) {
+          screenshotImg.src = `data:image/png;base64,${data.screenshot_base64}`;
+          screenshotWrapper.style.display = 'block';
+          screenshotImg.style.display = 'block';
+        } else {
+          screenshotWrapper.style.display = 'none';
+        }
+
+        if (response.ok && data.success) {
+          setStatus('Perception completed successfully.', 'success');
+        } else {
+          const msg = data.error || 'Perception failed.';
+          setStatus(msg, 'error');
+        }
+      } catch (error) {
+        console.error(error);
+        setStatus('Request failed: ' + error, 'error');
+      }
+    });
+  </script>
+</body>
+</html>

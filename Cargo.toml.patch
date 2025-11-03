@@ -1,0 +1,11 @@
+*** Begin Patch
+*** Update File: Cargo.toml
+@@
+ members = [
+     "crates/core-types",
+     "crates/action-primitives",
+@@
+-    "crates/perceiver-hub",
++    "crates/perceiver-hub",
++    "crates/l6-observe",
+*** End Patch

@@ -1,8 +1,7 @@
 ///! Multi-modal perception hub implementation
-
 use crate::{errors::*, models::*};
 use async_trait::async_trait;
-use perceiver_semantic::{SemanticPerceiver, SemanticOptions};
+use perceiver_semantic::{SemanticOptions, SemanticPerceiver};
 use perceiver_structural::StructuralPerceiver;
 use perceiver_visual::{ScreenshotOptions, VisualPerceiver};
 use soulbrowser_core_types::ExecRoute;
@@ -91,8 +90,8 @@ impl PerceptionHubImpl {
             snapshot_id: snapshot.id.0.clone(),
             dom_node_count,
             interactive_element_count: 0, // TODO: Count from DOM
-            has_forms: false,              // TODO: Detect from DOM
-            has_navigation: false,         // TODO: Detect from DOM
+            has_forms: false,             // TODO: Detect from DOM
+            has_navigation: false,        // TODO: Detect from DOM
         })
     }
 
@@ -175,7 +174,9 @@ impl PerceptionHubImpl {
             if structural.dom_node_count > 1000 && sem.content_type == ContentType::Article {
                 insights.push(CrossModalInsight {
                     insight_type: InsightType::ContentStructureAlignment,
-                    description: "Complex DOM structure for article content - may impact performance".to_string(),
+                    description:
+                        "Complex DOM structure for article content - may impact performance"
+                            .to_string(),
                     confidence: 0.75,
                     sources: vec![PerceiverType::Structural, PerceiverType::Semantic],
                 });
@@ -198,7 +199,9 @@ impl PerceptionHubImpl {
                 if readability < 50.0 && vis.avg_contrast < 3.0 {
                     insights.push(CrossModalInsight {
                         insight_type: InsightType::AccessibilityIssue,
-                        description: "Low readability combined with poor contrast - accessibility concern".to_string(),
+                        description:
+                            "Low readability combined with poor contrast - accessibility concern"
+                                .to_string(),
                         confidence: 0.80,
                         sources: vec![PerceiverType::Visual, PerceiverType::Semantic],
                     });
@@ -210,7 +213,10 @@ impl PerceptionHubImpl {
         if structural.dom_node_count > 2000 {
             insights.push(CrossModalInsight {
                 insight_type: InsightType::Performance,
-                description: format!("Large DOM tree ({} nodes) may impact rendering performance", structural.dom_node_count),
+                description: format!(
+                    "Large DOM tree ({} nodes) may impact rendering performance",
+                    structural.dom_node_count
+                ),
                 confidence: 0.70,
                 sources: vec![PerceiverType::Structural],
             });
@@ -260,7 +266,9 @@ impl PerceptionHubImpl {
         let color_complexity = (metrics.color_palette.len() as f64 / 10.0).min(1.0);
         let contrast_factor = (metrics.avg_contrast_ratio / 7.0).min(1.0);
 
-        (color_complexity * 0.6 + contrast_factor * 0.4).max(0.0).min(1.0)
+        (color_complexity * 0.6 + contrast_factor * 0.4)
+            .max(0.0)
+            .min(1.0)
     }
 }
 
@@ -276,22 +284,23 @@ impl PerceptionHub for PerceptionHubImpl {
 
         // Run analyses in parallel where possible
         let structural_fut = self.analyze_structural(route);
-        let visual_fut = self.analyze_visual(route, options.enable_visual && options.capture_screenshot);
-        let semantic_fut = self.analyze_semantic(route, options.enable_semantic && options.extract_text);
+        let visual_fut =
+            self.analyze_visual(route, options.enable_visual && options.capture_screenshot);
+        let semantic_fut =
+            self.analyze_semantic(route, options.enable_semantic && options.extract_text);
 
         // Execute with timeout
-        let (structural, visual, semantic) = tokio::time::timeout(
-            timeout,
-            async {
-                tokio::try_join!(
-                    async { structural_fut.await },
-                    async { visual_fut.await },
-                    async { semantic_fut.await }
-                )
-            },
-        )
+        let (structural, visual, semantic) = tokio::time::timeout(timeout, async {
+            tokio::try_join!(
+                async { structural_fut.await },
+                async { visual_fut.await },
+                async { semantic_fut.await }
+            )
+        })
         .await
-        .map_err(|_| HubError::Timeout(format!("Analysis timeout after {}s", options.timeout_secs)))??;
+        .map_err(|_| {
+            HubError::Timeout(format!("Analysis timeout after {}s", options.timeout_secs))
+        })??;
 
         // Generate insights
         let insights = if options.enable_insights {
@@ -362,6 +371,8 @@ mod tests {
 
         // Should generate performance insight for large DOM
         assert!(!insights.is_empty());
-        assert!(insights.iter().any(|i| i.insight_type == InsightType::Performance));
+        assert!(insights
+            .iter()
+            .any(|i| i.insight_type == InsightType::Performance));
     }
 }

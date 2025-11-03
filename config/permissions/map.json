@@ -1,0 +1,8 @@
+{
+  "clipboard_read": "clipboardRead",
+  "clipboard_write": "clipboardWrite",
+  "notifications": "notifications",
+  "geolocation": "geolocation",
+  "camera": "camera",
+  "microphone": "microphone"
+}

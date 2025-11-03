@@ -27,7 +27,11 @@ pub fn diff_with_policy(
                 let mut diff = DomAxDiff::empty();
                 diff.base = Some(base.id.clone());
                 diff.current = Some(current.id.clone());
-                if let Some(focus) = policy.focus.as_ref().and_then(DiffPolicyFocus::to_model_focus) {
+                if let Some(focus) = policy
+                    .focus
+                    .as_ref()
+                    .and_then(DiffPolicyFocus::to_model_focus)
+                {
                     diff.focus = Some(focus);
                 }
                 diff.changes.push(json!({
@@ -46,10 +50,13 @@ pub fn diff_with_policy(
             if let Some(model_focus) = focus.to_model_focus() {
                 diff.focus = Some(model_focus);
             }
-            diff.changes.insert(0, json!({
-                "kind": "focus",
-                "focus": focus.to_json(),
-            }));
+            diff.changes.insert(
+                0,
+                json!({
+                    "kind": "focus",
+                    "focus": focus.to_json(),
+                }),
+            );
         }
         if let Some(max) = policy.max_changes {
             if diff.changes.len() > max {

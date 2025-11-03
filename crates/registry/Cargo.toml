@@ -19,6 +19,8 @@ soulbrowser-event-bus = { path = "../event-bus" }
 soulbrowser-policy-center = { path = "../policy-center" }
 soulbrowser-state-center = { path = "../state-center" }
 network-tap-light = { path = "../network-tap-light" }
+lazy_static = "1.4"
+prometheus = "0.13"
 
 [features]
 default = []

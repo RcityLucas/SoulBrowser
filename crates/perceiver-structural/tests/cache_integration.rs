@@ -179,7 +179,10 @@ impl CdpPerceptionPort for CdpPerceptionAdapter {
         route: &ExecRoute,
         _scope: &perceiver_structural::Scope,
         _level: perceiver_structural::SnapLevel,
-    ) -> Result<perceiver_structural::model::SampledPair, perceiver_structural::errors::PerceiverError> {
+    ) -> Result<
+        perceiver_structural::model::SampledPair,
+        perceiver_structural::errors::PerceiverError,
+    > {
         // Simplified implementation for testing
         let page = cdp_adapter::PageId(uuid::Uuid::parse_str(&route.page.0).unwrap());
 
@@ -194,7 +197,9 @@ impl CdpPerceptionPort for CdpPerceptionAdapter {
             )
             .await
             .map_err(|_| {
-                perceiver_structural::errors::PerceiverError::SamplingFailed("dom snapshot failed".into())
+                perceiver_structural::errors::PerceiverError::SamplingFailed(
+                    "dom snapshot failed".into(),
+                )
             })?;
 
         Ok(perceiver_structural::model::SampledPair {
@@ -208,7 +213,10 @@ impl CdpPerceptionPort for CdpPerceptionAdapter {
         route: &ExecRoute,
         hint: &ResolveHint,
         _scope: &perceiver_structural::Scope,
-    ) -> Result<Vec<perceiver_structural::AnchorDescriptor>, perceiver_structural::errors::PerceiverError> {
+    ) -> Result<
+        Vec<perceiver_structural::AnchorDescriptor>,
+        perceiver_structural::errors::PerceiverError,
+    > {
         let page = cdp_adapter::PageId(uuid::Uuid::parse_str(&route.page.0).unwrap());
 
         match hint {

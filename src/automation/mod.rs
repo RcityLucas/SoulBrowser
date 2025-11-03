@@ -66,6 +66,13 @@ pub trait AutomationRuntimeAdapter: Send {
     async fn navigate(&mut self, url: &str) -> Result<()>;
     async fn click(&mut self, selector: &str) -> Result<()>;
     async fn type_text(&mut self, selector: &str, text: &str) -> Result<()>;
+    async fn select_option(
+        &mut self,
+        selector: &str,
+        value: &str,
+        match_kind: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<()>;
     async fn screenshot(&mut self, filename: &str) -> Result<()>;
 }
 
@@ -231,6 +238,35 @@ impl AutomationEngineInner {
                 self.record_event(
                     "type",
                     serde_json::json!({ "selector": selector, "text": text_val }),
+                )
+                .await?;
+            }
+            ActionCommand::Select {
+                selector,
+                value,
+                match_kind,
+                mode,
+            } => {
+                let selector = context.resolve_template(selector);
+                let value = context.resolve_template(value);
+                let match_kind_val = match_kind.as_ref().map(|mk| context.resolve_template(mk));
+                let mode_val = mode.as_ref().map(|m| context.resolve_template(m));
+                runtime
+                    .select_option(
+                        &selector,
+                        &value,
+                        match_kind_val.as_deref(),
+                        mode_val.as_deref(),
+                    )
+                    .await?;
+                self.record_event(
+                    "select",
+                    serde_json::json!({
+                        "selector": selector,
+                        "value": value,
+                        "match_kind": match_kind_val,
+                        "mode": mode_val
+                    }),
                 )
                 .await?;
             }
@@ -457,6 +493,19 @@ impl AutomationRuntimeAdapter for BrowserAutomationClient {
             .context("Failed to type text")
     }
 
+    async fn select_option(
+        &mut self,
+        selector: &str,
+        value: &str,
+        match_kind: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<()> {
+        self.page
+            .select_option(selector, value, match_kind, mode)
+            .await
+            .context("Failed to select option")
+    }
+
     async fn screenshot(&mut self, filename: &str) -> Result<()> {
         self.page
             .screenshot(filename)
@@ -553,7 +602,16 @@ enum AutomationCommand {
 enum ActionCommand {
     Navigate(String),
     Click(String),
-    Type { selector: String, text: String },
+    Type {
+        selector: String,
+        text: String,
+    },
+    Select {
+        selector: String,
+        value: String,
+        match_kind: Option<String>,
+        mode: Option<String>,
+    },
     Screenshot(String),
     Wait(String),
 }
@@ -743,6 +801,45 @@ impl ScriptParser {
                 Ok(ActionCommand::Type {
                     selector: args[0].to_string(),
                     text: args[1..].join(" "),
+                })
+            }
+            "select" => {
+                if args.len() < 2 {
+                    return Err(anyhow!(
+                        "select requires selector and value on line {}",
+                        self.current_line
+                    ));
+                }
+                let raw_selector = args[0];
+                let raw_value = args[1];
+                let selector = raw_selector
+                    .strip_prefix("selector=")
+                    .unwrap_or(raw_selector)
+                    .to_string();
+                let value = raw_value
+                    .strip_prefix("value=")
+                    .unwrap_or(raw_value)
+                    .to_string();
+                let mut match_kind = None;
+                let mut mode = None;
+                for token in args.iter().skip(2) {
+                    if let Some(kind) = token.strip_prefix("match=") {
+                        match_kind = Some(kind.to_string());
+                    } else if let Some(m) = token.strip_prefix("mode=") {
+                        mode = Some(m.to_string());
+                    } else {
+                        return Err(anyhow!(
+                            "Unsupported select argument '{}' on line {}",
+                            token,
+                            self.current_line
+                        ));
+                    }
+                }
+                Ok(ActionCommand::Select {
+                    selector,
+                    value,
+                    match_kind,
+                    mode,
                 })
             }
             "screenshot" => {
@@ -1122,6 +1219,20 @@ endparallel
             Ok(())
         }
 
+        async fn select_option(
+            &mut self,
+            selector: &str,
+            value: &str,
+            match_kind: Option<&str>,
+            mode: Option<&str>,
+        ) -> Result<()> {
+            self.factory.record(format!(
+                "select:{selector}:{value}:{:?}:{:?}",
+                match_kind, mode
+            ));
+            Ok(())
+        }
+
         async fn screenshot(&mut self, filename: &str) -> Result<()> {
             self.factory.record(format!("screenshot:{filename}"));
             Ok(())
@@ -1151,6 +1262,7 @@ endparallel
         writeln!(tmp, "set target https://example.com").unwrap();
         writeln!(tmp, "navigate {{target}}").unwrap();
         writeln!(tmp, "click #submit").unwrap();
+        writeln!(tmp, "select #country us match=value").unwrap();
         tmp.flush().unwrap();
 
         let script_path = tmp.path().to_path_buf();
@@ -1160,9 +1272,10 @@ endparallel
             .expect("execute script");
 
         let events = mock_factory.events();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0], "navigate:{target}");
         assert_eq!(events[1], "click:#submit");
+        assert_eq!(events[2], "select:#country:us:Some(\"value\"):None");
     }
 
     #[derive(Clone, Default)]

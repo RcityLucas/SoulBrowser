@@ -3,7 +3,7 @@ use std::convert::TryInto;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chromiumoxide::async_process::Child;
@@ -18,11 +18,11 @@ use serde_json::json;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 use tokio::task::JoinHandle;
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use crate::config::CdpConfig;
 use crate::error::{AdapterError, AdapterErrorKind};
-use crate::metrics;
 use crate::util::extract_ws_url;
 
 #[derive(Clone, Debug)]
@@ -78,9 +78,10 @@ type RuntimeFactory = Arc<
     dyn Fn(CdpConfig) -> BoxFuture<'static, Result<Arc<RuntimeState>, AdapterError>> + Send + Sync,
 >;
 
+#[derive(Clone)]
 pub struct ChromiumTransport {
     cfg: CdpConfig,
-    state: OnceCell<Mutex<Option<Arc<RuntimeState>>>>,
+    state: Arc<OnceCell<Mutex<Option<Arc<RuntimeState>>>>>,
     factory: RuntimeFactory,
 }
 
@@ -95,7 +96,7 @@ impl ChromiumTransport {
 
         Self {
             cfg,
-            state: OnceCell::new(),
+            state: Arc::new(OnceCell::new()),
             factory,
         }
     }
@@ -119,7 +120,7 @@ impl ChromiumTransport {
     fn with_factory(cfg: CdpConfig, factory: RuntimeFactory) -> Self {
         Self {
             cfg,
-            state: OnceCell::new(),
+            state: Arc::new(OnceCell::new()),
             factory,
         }
     }
@@ -174,7 +175,6 @@ impl CdpTransport for ChromiumTransport {
         params: Value,
     ) -> Result<Value, AdapterError> {
         let runtime = self.runtime().await?;
-        let start = Instant::now();
         match runtime
             .send_internal(
                 target,
@@ -184,14 +184,8 @@ impl CdpTransport for ChromiumTransport {
             )
             .await
         {
-            Ok(value) => {
-                metrics::record_command_success(start.elapsed());
-                Ok(value)
-            }
-            Err(err) => {
-                metrics::record_command_failure();
-                Err(err)
-            }
+            Ok(value) => Ok(value),
+            Err(err) => Err(err),
         }
     }
 }
@@ -207,6 +201,7 @@ struct RuntimeState {
     command_tx: mpsc::Sender<ControlMessage>,
     events_rx: Mutex<mpsc::Receiver<TransportEvent>>,
     loop_task: JoinHandle<()>,
+    heartbeat_task: Option<JoinHandle<()>>,
     child: Mutex<Option<Child>>,
     alive: Arc<AtomicBool>,
 }
@@ -229,6 +224,8 @@ impl RuntimeState {
 
         let alive = Arc::new(AtomicBool::new(true));
         let loop_alive = alive.clone();
+        let heartbeat_alive = alive.clone();
+        let heartbeat_tx = command_tx.clone();
 
         let loop_task = tokio::spawn(async move {
             let result = Self::run_loop(conn, command_rx, events_tx).await;
@@ -238,12 +235,20 @@ impl RuntimeState {
             }
         });
 
+        let heartbeat_task = Self::spawn_heartbeat(
+            heartbeat_tx,
+            heartbeat_alive,
+            Duration::from_millis(cfg.heartbeat_interval_ms),
+            Duration::from_millis(cfg.default_deadline_ms),
+        );
+
         info!(target: "cdp-transport", url = %ws_url, "chromium connection established");
 
         Ok(Self {
             command_tx,
             events_rx: Mutex::new(events_rx),
             loop_task,
+            heartbeat_task,
             child: Mutex::new(child),
             alive,
         })
@@ -265,6 +270,7 @@ impl RuntimeState {
                 command_tx,
                 events_rx: Mutex::new(events_rx),
                 loop_task,
+                heartbeat_task: None,
                 child: Mutex::new(None),
                 alive: alive.clone(),
             }),
@@ -310,6 +316,70 @@ impl RuntimeState {
     async fn next_event(&self) -> Option<TransportEvent> {
         let mut guard = self.events_rx.lock().await;
         guard.recv().await
+    }
+
+    fn spawn_heartbeat(
+        sender: mpsc::Sender<ControlMessage>,
+        alive: Arc<AtomicBool>,
+        interval_duration: Duration,
+        deadline: Duration,
+    ) -> Option<JoinHandle<()>> {
+        if interval_duration.as_millis() == 0 {
+            return None;
+        }
+
+        let response_deadline = if deadline > Duration::from_secs(5) {
+            Duration::from_secs(5)
+        } else {
+            deadline
+        };
+
+        Some(tokio::spawn(async move {
+            let mut ticker = interval(interval_duration);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            while alive.load(Ordering::Relaxed) {
+                ticker.tick().await;
+
+                if !alive.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let (resp_tx, resp_rx) = oneshot::channel();
+                let message = ControlMessage {
+                    target: CommandTarget::Browser,
+                    method: "Browser.getVersion".to_string(),
+                    params: Value::Object(Default::default()),
+                    responder: resp_tx,
+                };
+
+                if sender.send(message).await.is_err() {
+                    debug!(target: "cdp-transport", "heartbeat send failed (channel closed)");
+                    break;
+                }
+
+                match tokio::time::timeout(response_deadline, resp_rx).await {
+                    Ok(Ok(Ok(_))) => {
+                        // keep-alive succeeded
+                    }
+                    Ok(Ok(Err(err))) => {
+                        warn!(target: "cdp-transport", ?err, "heartbeat command error");
+                        break;
+                    }
+                    Ok(Err(_)) => {
+                        debug!(
+                            target: "cdp-transport",
+                            "heartbeat response channel closed"
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        warn!(target: "cdp-transport", "heartbeat timed out");
+                        break;
+                    }
+                }
+            }
+        }))
     }
 
     fn browser_config(cfg: &CdpConfig) -> Result<BrowserConfig, AdapterError> {
@@ -577,6 +647,9 @@ impl Drop for RuntimeState {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Relaxed);
         self.loop_task.abort();
+        if let Some(handle) = &self.heartbeat_task {
+            handle.abort();
+        }
 
         if let Ok(mut guard) = self.child.try_lock() {
             if let Some(mut child) = guard.take() {

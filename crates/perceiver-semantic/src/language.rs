@@ -1,5 +1,4 @@
 ///! Language detection module
-
 use crate::{errors::*, models::*};
 use whatlang::{detect, Lang};
 

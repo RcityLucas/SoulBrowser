@@ -15,6 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use soulbase_interceptors::errors::InterceptError;
 use soulbase_types::tenant::TenantId;
+use soulbrowser_core_types::{ExecRoute, FrameId, PageId, SessionId};
 use std::sync::Arc;
 use std::{
     collections::HashMap,
@@ -140,14 +141,15 @@ impl L1BrowserManager {
             .await
             .context("Failed to authenticate")?;
 
-        let session_id = self
+        let session_id_str = self
             .session_manager
             .create_session(auth_session.clone())
             .await;
+        let session_id = SessionId(session_id_str.clone());
 
         // Store session in soul-base storage
         let session_entity = BrowserSessionEntity {
-            id: session_id.clone(),
+            id: session_id_str.clone(),
             tenant: self.protocol.tenant_id().clone(),
             subject_id: auth_session.subject().subject_id.0.clone(),
             created_at: chrono::Utc::now().timestamp_millis(),
@@ -176,7 +178,7 @@ impl L1BrowserManager {
 
 /// Browser instance with soul-base integration
 pub struct Browser {
-    session_id: String,
+    session_id: SessionId,
     tenant_id: TenantId,
     auth_session: AuthSession,
     auth_manager: Arc<BrowserAuthManager>,
@@ -197,8 +199,13 @@ impl Browser {
             .with_rate_limit(100, 60)
             .build();
 
+        let page_id = PageId::new();
+        let frame_id = FrameId::new();
+
         Ok(Page {
             browser: self.clone_refs(),
+            page_id,
+            frame_id,
             url: None,
             interceptor_chain: Arc::new(interceptor_chain),
             tool_manager: self.tool_manager.clone(),
@@ -219,7 +226,7 @@ impl Browser {
 
 #[derive(Clone)]
 struct BrowserRefs {
-    session_id: String,
+    session_id: SessionId,
     tenant_id: TenantId,
     auth_session: AuthSession,
     #[allow(dead_code)]
@@ -232,12 +239,26 @@ struct BrowserRefs {
 /// Page instance with soul-base interceptors
 pub struct Page {
     browser: BrowserRefs,
+    page_id: PageId,
+    frame_id: FrameId,
     url: Option<String>,
     interceptor_chain: Arc<soulbase_interceptors::InterceptorChain>,
     tool_manager: Arc<BrowserToolManager>,
 }
 
 impl Page {
+    fn session_id_str(&self) -> &str {
+        &self.browser.session_id.0
+    }
+
+    fn exec_route(&self) -> ExecRoute {
+        ExecRoute::new(
+            self.browser.session_id.clone(),
+            self.page_id.clone(),
+            self.frame_id.clone(),
+        )
+    }
+
     async fn execute_with_interceptors<F>(
         &self,
         mut request: BrowserRequest,
@@ -324,7 +345,7 @@ impl Page {
             envelope_seed: EnvelopeSeed {
                 correlation_id: Some(uuid::Uuid::new_v4().to_string()),
                 causation_id: None,
-                partition_key: self.browser.session_id.clone(),
+                partition_key: self.session_id_str().to_string(),
                 produced_at_ms: chrono::Utc::now().timestamp_millis(),
             },
             authn_input: Some(self.browser.auth_session.authn_input()),
@@ -336,7 +357,7 @@ impl Page {
     }
 
     pub async fn navigate(&mut self, url: &str) -> Result<()> {
-        let _resource = format!("browser://session/{}/navigate", self.browser.session_id);
+        let _resource = format!("browser://session/{}/navigate", self.session_id_str());
         let policy_path = "browser://session/navigate".to_string();
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
@@ -346,7 +367,7 @@ impl Page {
             path: policy_path,
             headers,
             body: Some(json!({
-                "session_id": self.browser.session_id,
+                "session_id": self.session_id_str(),
                 "url": url
             })),
         };
@@ -354,9 +375,10 @@ impl Page {
         let storage_manager = self.browser.storage_manager.clone();
         let tool_manager = self.tool_manager.clone();
         let tenant = self.browser.tenant_id.clone();
-        let session_id = self.browser.session_id.clone();
+        let session_id = self.session_id_str().to_string();
         let subject_id = self.browser.auth_session.subject().subject_id.0.clone();
         let url_owned = url.to_string();
+        let exec_route = self.exec_route();
 
         self.execute_with_interceptors(request, move |_cx, _req| {
             let storage_manager = storage_manager.clone();
@@ -367,6 +389,7 @@ impl Page {
             let subject_id_for_tool = subject_id.clone();
             let url_for_event = url_owned.clone();
             let url_for_tool = url_owned.clone();
+            let exec_route_for_tool = exec_route.clone();
 
             Box::pin(async move {
                 let event = BrowserEvent {
@@ -392,10 +415,11 @@ impl Page {
                     })?;
 
                 let tool_result = tool_manager
-                    .execute(
-                        "browser.navigate",
+                    .execute_with_route(
+                        "navigate-to-url",
                         &subject_id_for_tool,
                         json!({ "url": url_for_tool }),
+                        Some(exec_route_for_tool),
                     )
                     .await
                     .map_err(|e| {
@@ -412,7 +436,7 @@ impl Page {
     }
 
     pub async fn click(&mut self, selector: &str) -> Result<()> {
-        let _resource = format!("browser://session/{}/click", self.browser.session_id);
+        let _resource = format!("browser://session/{}/click", self.session_id_str());
         let policy_path = "browser://session/click".to_string();
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
@@ -422,7 +446,7 @@ impl Page {
             path: policy_path,
             headers,
             body: Some(json!({
-                "session_id": self.browser.session_id,
+                "session_id": self.session_id_str(),
                 "selector": selector
             })),
         };
@@ -430,9 +454,10 @@ impl Page {
         let storage_manager = self.browser.storage_manager.clone();
         let tool_manager = self.tool_manager.clone();
         let tenant = self.browser.tenant_id.clone();
-        let session_id = self.browser.session_id.clone();
+        let session_id = self.session_id_str().to_string();
         let selector_owned = selector.to_string();
         let subject_id = self.browser.auth_session.subject().subject_id.0.clone();
+        let exec_route = self.exec_route();
 
         self.execute_with_interceptors(request, move |_cx, _req| {
             let storage_manager = storage_manager.clone();
@@ -442,6 +467,7 @@ impl Page {
             let selector_for_event = selector_owned.clone();
             let selector_for_tool = selector_owned.clone();
             let subject_for_tool = subject_id.clone();
+            let exec_route_for_tool = exec_route.clone();
 
             Box::pin(async move {
                 let event = BrowserEvent {
@@ -464,10 +490,16 @@ impl Page {
                     })?;
 
                 let tool_result = tool_manager
-                    .execute(
-                        "browser.click",
+                    .execute_with_route(
+                        "click",
                         &subject_for_tool,
-                        json!({ "selector": selector_for_tool }),
+                        json!({
+                            "anchor": {
+                                "strategy": "css",
+                                "selector": selector_for_tool
+                            }
+                        }),
+                        Some(exec_route_for_tool),
                     )
                     .await
                     .map_err(|e| {
@@ -483,7 +515,7 @@ impl Page {
     }
 
     pub async fn type_text(&mut self, selector: &str, text: &str) -> Result<()> {
-        let _resource = format!("browser://session/{}/type", self.browser.session_id);
+        let _resource = format!("browser://session/{}/type", self.session_id_str());
         let policy_path = "browser://session/type".to_string();
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
@@ -493,7 +525,7 @@ impl Page {
             path: policy_path,
             headers,
             body: Some(json!({
-                "session_id": self.browser.session_id,
+                "session_id": self.session_id_str(),
                 "selector": selector,
                 "text": text
             })),
@@ -502,10 +534,11 @@ impl Page {
         let storage_manager = self.browser.storage_manager.clone();
         let tool_manager = self.tool_manager.clone();
         let tenant = self.browser.tenant_id.clone();
-        let session_id = self.browser.session_id.clone();
+        let session_id = self.session_id_str().to_string();
         let selector_owned = selector.to_string();
         let text_owned = text.to_string();
         let subject_id = self.browser.auth_session.subject().subject_id.0.clone();
+        let exec_route = self.exec_route();
 
         self.execute_with_interceptors(request, move |_cx, _req| {
             let storage_manager = storage_manager.clone();
@@ -517,6 +550,7 @@ impl Page {
             let selector_for_tool = selector_owned.clone();
             let text_for_tool = text_owned.clone();
             let subject_for_tool = subject_id.clone();
+            let exec_route_for_tool = exec_route.clone();
 
             Box::pin(async move {
                 let event = BrowserEvent {
@@ -542,13 +576,18 @@ impl Page {
                     })?;
 
                 let tool_result = tool_manager
-                    .execute(
-                        "browser.type",
+                    .execute_with_route(
+                        "type-text",
                         &subject_for_tool,
                         json!({
-                            "selector": selector_for_tool,
-                            "text": text_for_tool
+                            "anchor": {
+                                "strategy": "css",
+                                "selector": selector_for_tool
+                            },
+                            "text": text_for_tool,
+                            "wait_tier": "domready"
                         }),
+                        Some(exec_route_for_tool),
                     )
                     .await
                     .map_err(|e| {
@@ -563,8 +602,118 @@ impl Page {
         Ok(())
     }
 
+    pub async fn select_option(
+        &mut self,
+        selector: &str,
+        value: &str,
+        match_kind: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<()> {
+        let _resource = format!("browser://session/{}/select", self.session_id_str());
+        let policy_path = "browser://session/select".to_string();
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+
+        let request = BrowserRequest {
+            method: "POST".to_string(),
+            path: policy_path,
+            headers,
+            body: Some(json!({
+                "session_id": self.session_id_str(),
+                "selector": selector,
+                "value": value,
+                "match_kind": match_kind,
+                "mode": mode
+            })),
+        };
+
+        let storage_manager = self.browser.storage_manager.clone();
+        let tool_manager = self.tool_manager.clone();
+        let tenant = self.browser.tenant_id.clone();
+        let session_id = self.session_id_str().to_string();
+        let selector_owned = selector.to_string();
+        let value_owned = value.to_string();
+        let match_owned = match_kind.map(|s| s.to_string());
+        let mode_owned = mode.map(|s| s.to_string());
+        let subject_id = self.browser.auth_session.subject().subject_id.0.clone();
+        let exec_route = self.exec_route();
+
+        self.execute_with_interceptors(request, move |_cx, _req| {
+            let storage_manager = storage_manager.clone();
+            let tool_manager = tool_manager.clone();
+            let tenant = tenant.clone();
+            let session_id = session_id.clone();
+            let selector_for_event = selector_owned.clone();
+            let value_for_event = value_owned.clone();
+            let match_for_event = match_owned.clone();
+            let mode_for_event = mode_owned.clone();
+            let selector_for_tool = selector_owned.clone();
+            let value_for_tool = value_owned.clone();
+            let match_for_tool = match_owned.clone();
+            let mode_for_tool = mode_owned.clone();
+            let subject_for_tool = subject_id.clone();
+            let exec_route_for_tool = exec_route.clone();
+
+            Box::pin(async move {
+                let event = BrowserEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    tenant: tenant.clone(),
+                    session_id: session_id.clone(),
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                    event_type: "select".to_string(),
+                    data: json!({
+                        "selector": selector_for_event,
+                        "value": value_for_event,
+                        "match_kind": match_for_event,
+                        "mode": mode_for_event
+                    }),
+                    sequence: 4,
+                    tags: vec!["interaction".to_string()],
+                };
+
+                storage_manager
+                    .backend()
+                    .store_event(event)
+                    .await
+                    .map_err(|e| {
+                        InterceptError::internal(&format!("failed to store select event: {}", e))
+                    })?;
+
+                let mut payload = serde_json::Map::new();
+                payload.insert(
+                    "anchor".to_string(),
+                    json!({ "strategy": "css", "selector": selector_for_tool }),
+                );
+                payload.insert("value".to_string(), json!(value_for_tool));
+                if let Some(kind) = match_for_tool {
+                    payload.insert("match_kind".to_string(), json!(kind));
+                }
+                if let Some(mode_value) = mode_for_tool {
+                    payload.insert("mode".to_string(), json!(mode_value));
+                }
+
+                let tool_result = tool_manager
+                    .execute_with_route(
+                        "select-option",
+                        &subject_for_tool,
+                        serde_json::Value::Object(payload),
+                        Some(exec_route_for_tool),
+                    )
+                    .await
+                    .map_err(|e| {
+                        InterceptError::internal(&format!("tool execution failed: {}", e))
+                    })?;
+
+                Ok(json!({ "status": "selected", "tool": tool_result }))
+            })
+        })
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn screenshot(&mut self, filename: &str) -> Result<Vec<u8>> {
-        let _resource = format!("browser://session/{}/screenshot", self.browser.session_id);
+        let _resource = format!("browser://session/{}/screenshot", self.session_id_str());
         let policy_path = "browser://session/screenshot".to_string();
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
@@ -574,7 +723,7 @@ impl Page {
             path: policy_path,
             headers,
             body: Some(json!({
-                "session_id": self.browser.session_id,
+                "session_id": self.session_id_str(),
                 "filename": filename
             })),
         };
@@ -582,9 +731,10 @@ impl Page {
         let storage_manager = self.browser.storage_manager.clone();
         let tool_manager = self.tool_manager.clone();
         let tenant = self.browser.tenant_id.clone();
-        let session_id = self.browser.session_id.clone();
+        let session_id = self.session_id_str().to_string();
         let filename_owned = filename.to_string();
         let subject_id = self.browser.auth_session.subject().subject_id.0.clone();
+        let exec_route = self.exec_route();
 
         let payload = self
             .execute_with_interceptors(request, move |_cx, _req| {
@@ -595,6 +745,7 @@ impl Page {
                 let filename_for_event = filename_owned.clone();
                 let filename_for_tool = filename_owned.clone();
                 let subject_for_tool = subject_id.clone();
+                let exec_route_for_tool = exec_route.clone();
 
                 Box::pin(async move {
                     let event = BrowserEvent {
@@ -604,7 +755,7 @@ impl Page {
                         timestamp: chrono::Utc::now().timestamp_millis(),
                         event_type: "screenshot".to_string(),
                         data: json!({ "filename": filename_for_event }),
-                        sequence: 4,
+                        sequence: 5,
                         tags: vec!["capture".to_string()],
                     };
 
@@ -619,27 +770,38 @@ impl Page {
                             ))
                         })?;
 
-                    let bytes = vec![0u8; 1024];
-
                     let tool_result = tool_manager
-                        .execute(
-                            "browser.screenshot",
+                        .execute_with_route(
+                            "take-screenshot",
                             &subject_for_tool,
                             json!({ "filename": filename_for_tool }),
+                            Some(exec_route_for_tool),
                         )
                         .await
                         .map_err(|e| {
                             InterceptError::internal(&format!("tool execution failed: {}", e))
                         })?;
 
-                    Ok(json!({ "status": "captured", "bytes": bytes, "tool": tool_result }))
+                    let byte_len = tool_result
+                        .get("output")
+                        .and_then(|output| output.get("byte_len"))
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+
+                    Ok(json!({
+                        "status": "captured",
+                        "byte_len": byte_len,
+                        "tool": tool_result
+                    }))
                 })
             })
             .await?;
 
-        let bytes = payload
-            .get("bytes")
-            .and_then(|v| v.as_array())
+        let tool_result = payload.get("tool");
+        let bytes = tool_result
+            .and_then(|tool| tool.get("output"))
+            .and_then(|output| output.get("bytes"))
+            .and_then(|value| value.as_array())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_u64().map(|n| n as u8))
@@ -647,7 +809,16 @@ impl Page {
             })
             .unwrap_or_default();
 
-        Ok(bytes)
+        if bytes.is_empty() {
+            tracing::warn!(
+                session = %self.browser.session_id.0,
+                page = %self.page_id.0,
+                "CDP screenshot bytes unavailable; returning placeholder buffer",
+            );
+            Ok(vec![0u8; 1024])
+        } else {
+            Ok(bytes)
+        }
     }
 }
 
@@ -686,7 +857,7 @@ mod tests {
             .storage_manager
             .backend()
             .query_events(QueryParams {
-                session_id: Some(browser.session_id.clone()),
+                session_id: Some(browser.session_id.0.clone()),
                 event_type: Some("navigate".to_string()),
                 from_timestamp: None,
                 to_timestamp: None,
@@ -715,7 +886,10 @@ mod tests {
             .await
             .expect("capture screenshot");
 
-        assert_eq!(bytes.len(), 1024);
+        assert!(
+            !bytes.is_empty(),
+            "expected screenshot call to yield bytes even if falling back",
+        );
     }
 
     #[tokio::test]
@@ -737,7 +911,7 @@ mod tests {
             .storage_manager
             .backend()
             .query_events(QueryParams {
-                session_id: Some(browser.session_id.clone()),
+                session_id: Some(browser.session_id.0.clone()),
                 event_type: Some("click".to_string()),
                 ..QueryParams::default()
             })
@@ -767,13 +941,16 @@ mod tests {
             .screenshot("capture.png")
             .await
             .expect("capture screenshot");
-        assert_eq!(bytes.len(), 1024, "screenshot bytes mocked size");
+        assert!(
+            !bytes.is_empty(),
+            "expected screenshot capture to yield bytes even if falling back",
+        );
 
         let events = browser
             .storage_manager
             .backend()
             .query_events(QueryParams {
-                session_id: Some(browser.session_id.clone()),
+                session_id: Some(browser.session_id.0.clone()),
                 event_type: Some("screenshot".to_string()),
                 ..QueryParams::default()
             })

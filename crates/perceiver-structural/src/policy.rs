@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use soulbrowser_policy_center::{
-    PolicyCenter, PolicySnapshot, StructuralPerceiverPolicy, StructuralResolvePolicy,
-};
 use soulbrowser_policy_center::model::{
     StructuralCachePolicy, StructuralDiffFocus, StructuralDiffGeometry, StructuralDiffPolicy,
     StructuralJudgePolicy, StructuralScoreWeights,
+};
+use soulbrowser_policy_center::{
+    PolicyCenter, PolicySnapshot, StructuralPerceiverPolicy, StructuralResolvePolicy,
 };
 
 use crate::DiffFocus;
@@ -206,7 +206,10 @@ impl DiffPolicy {
         Self {
             debounce_ms: structural.debounce_ms,
             max_changes: structural.max_changes,
-            focus: structural.focus.as_ref().map(DiffPolicyFocus::from_structural),
+            focus: structural
+                .focus
+                .as_ref()
+                .map(DiffPolicyFocus::from_structural),
         }
     }
 }
@@ -215,7 +218,10 @@ impl DiffPolicyFocus {
     fn from_structural(structural: &StructuralDiffFocus) -> Self {
         Self {
             backend_node_id: structural.backend_node_id,
-            geometry: structural.geometry.as_ref().map(DiffFocusGeometry::from_structural),
+            geometry: structural
+                .geometry
+                .as_ref()
+                .map(DiffFocusGeometry::from_structural),
         }
     }
 

@@ -1,5 +1,4 @@
 ///! Error types for semantic perceiver
-
 use thiserror::Error;
 
 /// Errors that can occur during semantic analysis

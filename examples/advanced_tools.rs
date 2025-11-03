@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     let navigate_result = ToolBuilder::new("navigate-to-url")
         .params(serde_json::json!({
             "url": "https://example.com",
-            "wait_until": "Load"
+            "wait_tier": "idle"
         }))
         .with_screenshot()
         .execute(&registry, &context)
@@ -75,10 +75,17 @@ async fn main() -> Result<()> {
     println!("\n2. Waiting for h1 element...");
     let wait_result = ToolBuilder::new("wait-for-element")
         .params(serde_json::json!({
-            "condition": {
-                "ElementPresent": "h1"
+            "target": {
+                "anchor": {
+                    "strategy": "css",
+                    "selector": "h1"
+                }
             },
-            "timeout": 5000
+            "condition": {
+                "kind": "present"
+            },
+            "continuous_ms": 150,
+            "timeout_ms": 5000
         }))
         .execute(&registry, &context)
         .await?;
@@ -87,7 +94,7 @@ async fn main() -> Result<()> {
 
     // Example 3: Take screenshot
     println!("\n3. Taking screenshot...");
-    let screenshot_result = ToolBuilder::new("screenshot")
+    let screenshot_result = ToolBuilder::new("take-screenshot")
         .params(serde_json::json!({
             "options": {
                 "full_page": false,

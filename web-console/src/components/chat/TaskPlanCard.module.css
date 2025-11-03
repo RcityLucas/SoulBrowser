@@ -1,0 +1,62 @@
+.planCard {
+  background: #1f1f1f;
+  border: 1px solid #303030;
+}
+
+.planHeader {
+  margin-bottom: 24px;
+}
+
+.planHeader h3 {
+  margin: 0 0 12px 0;
+  color: #fff;
+}
+
+.planSteps {
+  margin: 24px 0;
+  padding: 16px;
+  background: #141414;
+  border-radius: 6px;
+}
+
+.stepDetails {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.policyChecks {
+  margin: 24px 0;
+  padding: 16px;
+  background: #141414;
+  border-radius: 6px;
+}
+
+.policyChecks h4 {
+  margin: 0 0 12px 0;
+  color: #fff;
+}
+
+.policyCheck {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+}
+
+.policyCheck span {
+  color: #fff;
+}
+
+.checkMessage {
+  color: #8c8c8c;
+  font-size: 12px;
+  margin-left: 8px;
+}
+
+.planActions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}

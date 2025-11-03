@@ -179,7 +179,7 @@ mod full_stack {
         let nav_result = ToolBuilder::new("navigate-to-url")
             .params(serde_json::json!({
                 "url": "data:text/html,<h1>Tool Test</h1>",
-                "wait_until": "Load"
+                "wait_tier": "idle"
             }))
             .timeout(Duration::from_secs(5))
             .execute(&registry, &context)

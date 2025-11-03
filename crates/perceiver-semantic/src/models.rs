@@ -1,5 +1,4 @@
 ///! Data models for semantic analysis
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
