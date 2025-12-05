@@ -1,0 +1,32 @@
+{
+  "title": "SoulBrowser Agent Metrics",
+  "panels": [
+    {
+      "type": "graph",
+      "title": "Permission Prompts",
+      "targets": [
+        {"expr": "rate(soul_agent_permission_prompt_total[5m])", "legendFormat": "permission"},
+        {"expr": "rate(soul_agent_download_prompt_total[5m])", "legendFormat": "download"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Judge Rejections",
+      "targets": [{"expr": "increase(soul_agent_judge_rejection_total[1h])"}]
+    },
+    {
+      "type": "stat",
+      "title": "Parser Failures",
+      "targets": [{"expr": "increase(soul_agent_parser_failures_total[1h])"}]
+    },
+    {
+      "type": "graph",
+      "title": "Self-heal / Fallback",
+      "targets": [
+        {"expr": "rate(soul_self_heal_auto_retry_total[5m])", "legendFormat": "auto retry"},
+        {"expr": "rate(soul_agent_fallback_to_baidu_total[5m])", "legendFormat": "fallback"}
+      ]
+    }
+  ],
+  "schemaVersion": 38
+}

@@ -240,7 +240,7 @@ pub mod adapter {
         NetworkSnapshot as TapSnapshot, NetworkTapLight, PageId as TapPageId,
         TapError as NetworkTapError, TapEvent as NetworkTapEvent,
     };
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use serde_json::{json, Number, Value};
     use std::env;
     use std::sync::Arc;
@@ -252,6 +252,27 @@ pub mod adapter {
     use tokio::{select, spawn};
     use tokio_util::sync::CancellationToken;
     use tracing::{debug, info, warn};
+
+    /// Parameters accepted by `Network.setCookies`.
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct CookieParam {
+        pub name: String,
+        pub value: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub domain: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub expires: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub http_only: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub secure: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub same_site: Option<String>,
+    }
 
     /// Shared event bus type alias used by the adapter scaffold.
     pub type EventBus = broadcast::Sender<RawEvent>;
@@ -285,6 +306,11 @@ pub mod adapter {
             spec: SelectSpec,
             deadline: std::time::Duration,
         ) -> Result<(), AdapterError>;
+        async fn evaluate_script(
+            &self,
+            page: PageId,
+            expression: &str,
+        ) -> Result<Value, AdapterError>;
         async fn wait_basic(
             &self,
             page: PageId,
@@ -305,6 +331,11 @@ pub mod adapter {
             &self,
             origin: &str,
             permissions: &[String],
+        ) -> Result<(), AdapterError>;
+        async fn set_cookies(
+            &self,
+            page: PageId,
+            cookies: &[CookieParam],
         ) -> Result<(), AdapterError>;
         async fn set_user_agent(
             &self,
@@ -1578,6 +1609,40 @@ function(targetValue, matchLabel) {
             }
         }
 
+        async fn evaluate_script(
+            &self,
+            page: PageId,
+            expression: &str,
+        ) -> Result<Value, AdapterError> {
+            self.wait_for_page_ready(page).await?;
+            let response = self
+                .send_page_command(
+                    page,
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": expression,
+                        "awaitPromise": true,
+                        "returnByValue": true,
+                        "userGesture": true,
+                    }),
+                )
+                .await?;
+
+            if let Some(details) = response.get("exceptionDetails") {
+                return Err(AdapterError::new(AdapterErrorKind::Internal)
+                    .with_hint("evaluate_script raised exception")
+                    .with_data(details.clone()));
+            }
+
+            let value = response
+                .get("result")
+                .and_then(|res| res.get("value"))
+                .cloned()
+                .unwrap_or(Value::Null);
+
+            Ok(value)
+        }
+
         async fn wait_basic(
             &self,
             page: PageId,
@@ -1680,6 +1745,53 @@ function(targetValue, matchLabel) {
                 params.insert("permissions".into(), Value::Array(list));
             }
             self.send_command("Browser.resetPermissions", Value::Object(params))
+                .await?;
+            Ok(())
+        }
+
+        async fn set_cookies(
+            &self,
+            page: PageId,
+            cookies: &[CookieParam],
+        ) -> Result<(), AdapterError> {
+            if cookies.is_empty() {
+                return Ok(());
+            }
+
+            let payload: Vec<Value> = cookies
+                .iter()
+                .map(|cookie| {
+                    let mut map = serde_json::Map::new();
+                    map.insert("name".into(), Value::String(cookie.name.clone()));
+                    map.insert("value".into(), Value::String(cookie.value.clone()));
+                    if let Some(domain) = cookie.domain.as_ref() {
+                        map.insert("domain".into(), Value::String(domain.clone()));
+                    }
+                    if let Some(path) = cookie.path.as_ref() {
+                        map.insert("path".into(), Value::String(path.clone()));
+                    }
+                    if let Some(url) = cookie.url.as_ref() {
+                        map.insert("url".into(), Value::String(url.clone()));
+                    }
+                    if let Some(expires) = cookie.expires {
+                        if let Some(number) = Number::from_f64(expires) {
+                            map.insert("expires".into(), Value::Number(number));
+                        }
+                    }
+                    if let Some(flag) = cookie.http_only {
+                        map.insert("httpOnly".into(), Value::Bool(flag));
+                    }
+                    if let Some(flag) = cookie.secure {
+                        map.insert("secure".into(), Value::Bool(flag));
+                    }
+                    if let Some(site) = cookie.same_site.as_ref() {
+                        map.insert("sameSite".into(), Value::String(site.clone()));
+                    }
+                    Value::Object(map)
+                })
+                .collect();
+
+            self.send_page_command(page, "Network.setCookies", json!({ "cookies": payload }))
                 .await?;
             Ok(())
         }

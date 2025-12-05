@@ -1,0 +1,26 @@
+{
+  "name": "soulbrowser-sdk",
+  "version": "0.1.0",
+  "description": "Unofficial TypeScript SDK for the SoulBrowser console APIs.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rimraf dist"
+  },
+  "author": "SoulBrowser",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "@types/ws": "^8.5.10",
+    "rimraf": "^5.0.5",
+    "typescript": "^5.4.0"
+  }
+}

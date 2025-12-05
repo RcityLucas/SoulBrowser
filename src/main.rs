@@ -1,6 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use axum::response::IntoResponse;
 use base64::{engine::general_purpose::STANDARD as Base64, Engine as _};
 use cdp_adapter::{
     config::CdpConfig, event_bus, events::RawEvent, ids::PageId as AdapterPageId,
@@ -56,22 +55,24 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tempfile::tempdir;
 use tokio::fs;
-use tokio::net::TcpListener;
-use tokio::process::Command as TokioCommand;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{interval, sleep, timeout, Instant};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use url::Url;
 
 const DEFAULT_LARGE_THRESHOLD: u64 = 5 * 1024 * 1024;
 const CONSOLE_HTML: &str = include_str!("static/console.html");
+const RATE_LIMIT_CHAT_ENV: &str = "SOUL_RATE_LIMIT_CHAT_PER_MIN";
+const RATE_LIMIT_TASK_ENV: &str = "SOUL_RATE_LIMIT_TASK_PER_MIN";
+const RATE_LIMIT_BUCKET_TTL_ENV: &str = "SOUL_RATE_LIMIT_BUCKET_TTL_SECS";
+const RATE_LIMIT_GC_ENV: &str = "SOUL_RATE_LIMIT_GC_SECS";
 
 // Import types from our modules
 use crate::agent::executor::DispatchRecord;
@@ -84,7 +85,13 @@ use crate::app_context::{get_or_create_context, AppContext};
 use crate::automation::{AutomationConfig, AutomationEngine, AutomationResults};
 use crate::browser_impl::{BrowserConfig, L0Protocol, L1BrowserManager};
 use crate::export::{CsvExporter, Exporter, HtmlExporter, JsonExporter};
+use crate::perception_service::PerceptionService;
 use crate::replay::{ReplayConfig, SessionReplayer};
+use crate::server::{
+    build_console_router,
+    rate_limit::{RateLimitConfig, RateLimiter},
+    ServeHealth, ServeState,
+};
 use crate::storage::{BrowserEvent, BrowserSessionEntity, QueryParams, StorageManager};
 use crate::types::BrowserType;
 use agent_core::{AgentContext, AgentRequest, ConversationRole, ConversationTurn};
@@ -123,6 +130,8 @@ mod errors;
 mod interceptors;
 mod l0_bridge;
 mod metrics;
+mod perception_service;
+mod server;
 mod storage;
 mod tools;
 mod types;
@@ -2804,36 +2813,7 @@ async fn serve_console(port: u16, payload: Value) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone)]
-struct ServeState {
-    ws_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UiPerceiveRequest {
-    url: String,
-    structural: Option<bool>,
-    visual: Option<bool>,
-    semantic: Option<bool>,
-    insights: Option<bool>,
-    #[serde(default)]
-    screenshot: Option<bool>,
-    #[serde(default)]
-    timeout: Option<u64>,
-    mode: Option<String>,
-}
-
-#[derive(Serialize)]
-struct UiPerceiveResponse {
-    success: bool,
-    perception: Option<MultiModalPerception>,
-    screenshot_base64: Option<String>,
-    stdout: String,
-    stderr: String,
-    error: Option<String>,
-}
-
-struct PerceptionExecResult {
+pub(crate) struct PerceptionExecResult {
     success: bool,
     perception: Option<MultiModalPerception>,
     screenshot_base64: Option<String>,
@@ -2858,7 +2838,7 @@ struct ConsoleFixture {
     screenshot_base64: Option<String>,
 }
 
-async fn load_console_fixture() -> Result<Option<PerceptionExecResult>> {
+pub(crate) async fn load_console_fixture() -> Result<Option<PerceptionExecResult>> {
     let path = match std::env::var("SOULBROWSER_CONSOLE_FIXTURE") {
         Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
         Ok(_) | Err(std::env::VarError::NotPresent) => return Ok(None),
@@ -2924,250 +2904,153 @@ async fn load_console_fixture() -> Result<Option<PerceptionExecResult>> {
 }
 
 async fn cmd_serve(args: ServeArgs, _metrics_port: u16, _config: Config) -> Result<()> {
-    let state = ServeState {
-        ws_url: args.ws_url.clone(),
-    };
+    let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig::from_env(
+        RATE_LIMIT_CHAT_ENV,
+        RATE_LIMIT_TASK_ENV,
+        30,
+        15,
+    )));
+    spawn_rate_limit_cleanup(Arc::clone(&rate_limiter));
+    let perception_service = Arc::new(PerceptionService::new());
+    let health = Arc::new(ServeHealth::new());
+    let state = ServeState::with_health(
+        args.ws_url.clone(),
+        perception_service,
+        rate_limiter,
+        Arc::clone(&health),
+    );
 
-    let router = axum::Router::new()
-        .route(
-            "/",
-            axum::routing::get(|| async { axum::response::Html(CONSOLE_HTML) }),
-        )
-        .route(
-            "/health",
-            axum::routing::get(|| async { axum::Json(json!({ "status": "ok" })) }),
-        )
-        .route("/api/perceive", axum::routing::post(serve_perceive_handler))
-        .with_state(state);
+    state.mark_live();
+    match run_startup_readiness_checks(&state).await {
+        Ok(()) => {
+            state.mark_ready();
+            info!("Serve readiness checks passed");
+        }
+        Err(err) => {
+            state.mark_unready(err.to_string());
+            warn!(?err, "Serve readiness checks failed");
+        }
+    }
 
+    let router = build_console_router().with_state(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind testing server on {}", addr))?;
-    println!("Testing console available at http://{}", addr);
-    if let Some(ws) = args.ws_url {
-        println!("Using external DevTools endpoint: {}", ws);
+    info!("Testing console available at http://{}", addr);
+    if let Some(ws) = args.ws_url.as_deref() {
+        info!("Using external DevTools endpoint: {}", ws);
     } else {
-        println!("Using local Chrome detection (SOULBROWSER_CHROME / auto-detect)");
+        info!("Using local Chrome detection (SOULBROWSER_CHROME / auto-detect)");
     }
 
-    axum::serve(listener, router.into_make_service())
-        .await
-        .context("testing server exited unexpectedly")?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("testing server exited unexpectedly")?;
     Ok(())
 }
 
-async fn serve_perceive_handler(
-    axum::extract::State(state): axum::extract::State<ServeState>,
-    axum::Json(req): axum::Json<UiPerceiveRequest>,
-) -> impl axum::response::IntoResponse {
-    if req.url.trim().is_empty() {
-        let body = UiPerceiveResponse {
-            success: false,
-            perception: None,
-            screenshot_base64: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some("URL must not be empty".to_string()),
-        };
-        return (axum::http::StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+async fn run_startup_readiness_checks(state: &ServeState) -> Result<()> {
+    if let Some(ws_url) = state.ws_url.as_deref() {
+        probe_devtools_socket(ws_url).await
+    } else {
+        Ok(())
+    }
+}
+
+async fn probe_devtools_socket(ws_url: &str) -> Result<()> {
+    let url = Url::parse(ws_url).context("parsing DevTools websocket URL")?;
+    match url.scheme() {
+        "ws" | "wss" => {}
+        scheme => {
+            bail!("DevTools websocket URL must start with ws:// or wss:// (got {scheme})");
+        }
     }
 
-    let result = run_perception_subprocess(&req, state.ws_url.as_deref()).await;
-    match result {
-        Ok(exec) => {
-            let status = if exec.success {
-                axum::http::StatusCode::OK
-            } else {
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR
-            };
-            let body = UiPerceiveResponse {
-                success: exec.success,
-                perception: exec.perception,
-                screenshot_base64: exec.screenshot_base64,
-                stdout: exec.stdout,
-                stderr: exec.stderr,
-                error: exec.error_message,
-            };
-            (status, axum::Json(body)).into_response()
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("DevTools websocket URL missing host: {ws_url}"))?;
+    let port = url.port_or_known_default().ok_or_else(|| {
+        anyhow!("DevTools websocket URL missing port and scheme has no default: {ws_url}")
+    })?;
+
+    let target = format!("{host}:{port}");
+    timeout(Duration::from_secs(5), TcpStream::connect(target))
+        .await
+        .map_err(|_| anyhow!("timed out connecting to DevTools endpoint"))??;
+    Ok(())
+}
+
+fn spawn_rate_limit_cleanup(rate_limiter: Arc<RateLimiter>) {
+    let ttl = resolve_rate_limit_bucket_ttl();
+    if ttl.is_zero() {
+        info!("Rate limiter bucket GC disabled (ttl=0)");
+        return;
+    }
+
+    let gc_interval = resolve_rate_limit_gc_interval();
+    info!(
+        ttl_secs = ttl.as_secs(),
+        interval_secs = gc_interval.as_secs(),
+        "Rate limiter GC enabled"
+    );
+    tokio::spawn(async move {
+        let mut ticker = interval(gc_interval);
+        loop {
+            ticker.tick().await;
+            let removed = rate_limiter.prune_idle(ttl);
+            if removed > 0 {
+                debug!(removed, "pruned expired rate limit buckets");
+            }
         }
+    });
+}
+
+fn resolve_rate_limit_bucket_ttl() -> Duration {
+    match env::var(RATE_LIMIT_BUCKET_TTL_ENV) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .unwrap_or_else(|err| {
+                warn!(
+                    ?err,
+                    value = raw,
+                    "invalid rate limit bucket ttl; defaulting to 600s"
+                );
+                Duration::from_secs(600)
+            }),
+        Err(env::VarError::NotPresent) => Duration::from_secs(600),
         Err(err) => {
-            error!(?err, "perception subprocess failed");
-            let body = UiPerceiveResponse {
-                success: false,
-                perception: None,
-                screenshot_base64: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: Some(err.to_string()),
-            };
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(body),
-            )
-                .into_response()
+            warn!(?err, "failed to read rate limit bucket ttl env");
+            Duration::from_secs(600)
         }
     }
 }
 
-async fn run_perception_subprocess(
-    req: &UiPerceiveRequest,
-    ws_url: Option<&str>,
-) -> Result<PerceptionExecResult> {
-    if let Some(result) = load_console_fixture().await? {
-        debug!("console fixture mode active");
-        return Ok(result);
-    }
-
-    let temp = tempdir().context("failed to create temporary directory")?;
-    let perception_path = temp.path().join("perception.json");
-    let screenshot_path = temp.path().join("screenshot.png");
-
-    let exe = std::env::current_exe().context("failed to locate current executable")?;
-    let mut cmd = TokioCommand::new(exe);
-    cmd.arg("--metrics-port").arg("0");
-    cmd.arg("perceive");
-    cmd.arg("--url").arg(&req.url);
-
-    if let Some(timeout) = req.timeout {
-        cmd.arg("--timeout").arg(timeout.to_string());
-    }
-
-    let mode = req.mode.as_deref().unwrap_or("");
-    let structural = req.structural.unwrap_or(false);
-    let visual = req.visual.unwrap_or(false);
-    let semantic = req.semantic.unwrap_or(false);
-
-    if mode.eq_ignore_ascii_case("all") {
-        cmd.arg("--all");
-    } else if mode.eq_ignore_ascii_case("structural") {
-        cmd.arg("--structural");
-    } else if mode.eq_ignore_ascii_case("visual") {
-        cmd.arg("--visual");
-    } else if mode.eq_ignore_ascii_case("semantic") {
-        cmd.arg("--semantic");
-    } else {
-        let mut any = false;
-        if structural {
-            cmd.arg("--structural");
-            any = true;
-        }
-        if visual {
-            cmd.arg("--visual");
-            any = true;
-        }
-        if semantic {
-            cmd.arg("--semantic");
-            any = true;
-        }
-        if !any {
-            cmd.arg("--all");
-        }
-    }
-
-    if req.insights.unwrap_or(mode.eq_ignore_ascii_case("all")) {
-        cmd.arg("--insights");
-    }
-
-    cmd.arg("--output").arg(&perception_path);
-
-    let capture_screenshot = req
-        .screenshot
-        .unwrap_or_else(|| req.visual.unwrap_or(false) || mode.eq_ignore_ascii_case("all"));
-    if capture_screenshot {
-        cmd.arg("--screenshot").arg(&screenshot_path);
-    }
-
-    if let Some(ws) = ws_url {
-        cmd.env("SOULBROWSER_WS_URL", ws);
-    }
-    if std::env::var("SOULBROWSER_USE_REAL_CHROME").is_err() {
-        cmd.env("SOULBROWSER_USE_REAL_CHROME", "1");
-    }
-
-    if let Ok(val) = std::env::var("SOULBROWSER_CHROME") {
-        cmd.env("SOULBROWSER_CHROME", val);
-    }
-
-    if let Ok(val) = std::env::var("SOULBROWSER_DISABLE_SANDBOX") {
-        cmd.env("SOULBROWSER_DISABLE_SANDBOX", val);
-    } else {
-        cmd.env("SOULBROWSER_DISABLE_SANDBOX", "1");
-    }
-
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let output = cmd
-        .output()
-        .await
-        .context("failed to launch perception subprocess")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !output.status.success() {
-        return Ok(PerceptionExecResult {
-            success: false,
-            perception: None,
-            screenshot_base64: None,
-            stdout,
-            stderr,
-            error_message: Some(format!(
-                "perceive command failed with status {}",
-                output.status
-            )),
-        });
-    }
-
-    let json_bytes = match tokio::fs::read(&perception_path).await {
-        Ok(bytes) => bytes,
+fn resolve_rate_limit_gc_interval() -> Duration {
+    match env::var(RATE_LIMIT_GC_ENV) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map(|secs| Duration::from_secs(secs.max(5)))
+            .unwrap_or_else(|err| {
+                warn!(
+                    ?err,
+                    value = raw,
+                    "invalid rate limit GC interval; defaulting to 60s"
+                );
+                Duration::from_secs(60)
+            }),
+        Err(env::VarError::NotPresent) => Duration::from_secs(60),
         Err(err) => {
-            return Ok(PerceptionExecResult {
-                success: false,
-                perception: None,
-                screenshot_base64: None,
-                stdout,
-                stderr,
-                error_message: Some(format!("failed to read perception output: {err}")),
-            });
+            warn!(?err, "failed to read rate limit GC interval env");
+            Duration::from_secs(60)
         }
-    };
-
-    let perception: MultiModalPerception = match serde_json::from_slice(&json_bytes) {
-        Ok(value) => value,
-        Err(err) => {
-            return Ok(PerceptionExecResult {
-                success: false,
-                perception: None,
-                screenshot_base64: None,
-                stdout,
-                stderr,
-                error_message: Some(format!("failed to parse perception output: {err}")),
-            });
-        }
-    };
-
-    let screenshot_base64 = if capture_screenshot {
-        match tokio::fs::read(&screenshot_path).await {
-            Ok(bytes) if !bytes.is_empty() => Some(Base64.encode(bytes)),
-            Ok(_) => None,
-            Err(err) => {
-                warn!(?err, "failed to read screenshot");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    Ok(PerceptionExecResult {
-        success: true,
-        perception: Some(perception),
-        screenshot_base64,
-        stdout,
-        stderr,
-        error_message: None,
-    })
+    }
 }
 
 fn filter_artifacts(value: &Value, args: &ArtifactsArgs) -> Vec<Value> {

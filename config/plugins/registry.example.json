@@ -1,0 +1,43 @@
+{
+  "plugins": [
+    {
+      "id": "demo-webhook",
+      "status": "active",
+      "owner": "governance-team",
+      "last_reviewed_at": "2025-01-10T12:00:00Z",
+      "scopes": ["navigator", "memory"],
+      "helpers": [
+        {
+          "id": "google_consent_helper",
+          "pattern": "https?://(www\\.)?google\\.",
+          "description": "Automatically accept the Google consent dialog so planners can continue typing queries.",
+          "auto_insert": true,
+          "prompt": "Use this helper when Google shows the consent screen.",
+          "steps": [
+            {
+              "title": "Accept Google consent",
+              "detail": "Click the \"Accept all\" button when Google shows the consent banner.",
+              "wait": "dom_ready",
+              "tool": {
+                "type": "click_text",
+                "text": "Accept all",
+                "exact": false
+              }
+            }
+          ],
+          "conditions": {
+            "url_includes": [],
+            "url_excludes": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "data-exporter",
+      "status": "pending",
+      "owner": "growth-team",
+      "last_reviewed_at": null,
+      "scopes": ["download"]
+    }
+  ]
+}

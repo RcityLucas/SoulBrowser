@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use cdp_adapter::{
+    adapter::CookieParam,
     commands::{
         Anchor, AxSnapshotConfig, AxSnapshotResult, DomSnapshotConfig, DomSnapshotResult,
         QuerySpec, SelectSpec,
@@ -114,6 +115,14 @@ impl cdp_adapter::Cdp for MockCdp {
         &self,
         _origin: &str,
         _permissions: &[String],
+    ) -> Result<(), AdapterError> {
+        Ok(())
+    }
+
+    async fn set_cookies(
+        &self,
+        _page: AdapterPageId,
+        _cookies: &[CookieParam],
     ) -> Result<(), AdapterError> {
         Ok(())
     }

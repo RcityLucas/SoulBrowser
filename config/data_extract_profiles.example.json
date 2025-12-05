@@ -1,0 +1,11 @@
+[
+  {
+    "id": "example.product",
+    "label": "Example Product Page",
+    "hosts": ["example.com"],
+    "artifact_label": "product.snapshot",
+    "content_type": "application/json",
+    "script": "(() => ({ ok: true, data: { title: document.title } }))();",
+    "description": "示例：如何为特定域编写自定义 DOM 抓取脚本"
+  }
+]

@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: SoulBrowser Dashboards
+    orgId: 1
+    folder: SoulBrowser
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

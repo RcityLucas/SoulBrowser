@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Market Indices Snapshot",
+  "description": "Structured snapshot of equity indices parsed from financial portals (see market_info parser).",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "market_info_v1"
+    },
+    "source_url": {
+      "type": ["string", "null"],
+      "format": "uri",
+      "description": "URL of the observed page"
+    },
+    "captured_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Timestamp reported by the observer"
+    },
+    "items": {
+      "type": "array",
+      "description": "Per-index metrics extracted from the page",
+      "items": {
+        "type": "object",
+        "properties": {
+          "index_name": { "type": "string" },
+          "value": { "type": "number" },
+          "change": { "type": "number" },
+          "change_pct": { "type": "number" }
+        },
+        "required": ["index_name", "value", "change", "change_pct"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema", "items"],
+  "additionalProperties": false
+}

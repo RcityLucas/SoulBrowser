@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LinkedIn Profile",
+  "description": "Normalized LinkedIn profile or company page",
+  "type": "object",
+  "properties": {
+    "schema": { "type": "string", "const": "linkedin_profile_v1" },
+    "profile_url": { "type": "string", "format": "uri", "description": "Source URL captured by data.extract-site." },
+    "captured_at": { "type": "string", "format": "date-time" },
+    "screenshot_path": { "type": "string", "description": "Optional screenshot artifact path for reference." },
+    "entity_type": {
+      "type": "string",
+      "enum": ["profile", "company", "school", "unknown"],
+      "description": "Whether the page represents an individual profile, company, or school."
+    },
+    "name": { "type": "string", "description": "Display name for the LinkedIn entity." },
+    "headline": { "type": "string", "description": "Primary headline or tagline shown under the name." },
+    "industry": { "type": "string" },
+    "location": { "type": "string" },
+    "follower_count": { "type": "integer", "minimum": 0 },
+    "employee_count": { "type": "integer", "minimum": 0 },
+    "about": { "type": "string" },
+    "contact_urls": {
+      "type": "array",
+      "items": { "type": "string", "format": "uri" },
+      "description": "External or mailto links surfaced from the page's contact section.",
+      "uniqueItems": true
+    },
+    "recent_activity": {
+      "type": "array",
+      "description": "Chronological activity pulled from recent posts/updates on the profile.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "url": { "type": "string", "format": "uri" },
+          "timestamp": { "type": "string", "description": "Published timestamp as reported on LinkedIn." },
+          "description": { "type": "string" }
+        },
+        "required": ["title"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema", "entity_type", "name"],
+  "additionalProperties": false
+}

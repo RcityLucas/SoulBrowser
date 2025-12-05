@@ -1,0 +1,139 @@
+{
+  "task_id": "bcc5b7b5-efde-49aa-a376-78cb0413e0bf",
+  "title": "访问cityflysky的GitHub仓库",
+  "description": "打开cityflysky的GitHub页面，查看所有可用的仓库信息。",
+  "created_at": "2025-11-29T07:12:18.177575186Z",
+  "meta": {
+    "rationale": [
+      "用户需要查看cityflysky的GitHub仓库以获取相关信息"
+    ],
+    "risk_assessment": [],
+    "vendor_context": {}
+  },
+  "steps": [
+    {
+      "detail": "打开cityflysky的GitHub页面",
+      "id": "llm-step-1",
+      "metadata": {
+        "source": {
+          "action": "navigate",
+          "locator": "",
+          "target": ""
+        }
+      },
+      "requires_approval": false,
+      "title": "导航到GitHub",
+      "tool": {
+        "kind": {
+          "Navigate": {
+            "url": "https://github.com/cityflysky"
+          }
+        },
+        "timeout_ms": 8000,
+        "wait": "Idle"
+      },
+      "validations": []
+    },
+    {
+      "detail": "从GitHub页面提取所有仓库的信息",
+      "id": "llm-step-2",
+      "metadata": {
+        "source": {
+          "action": "data.extract-site",
+          "locator": "",
+          "target": ""
+        }
+      },
+      "requires_approval": false,
+      "title": "提取仓库信息",
+      "tool": {
+        "kind": {
+          "Custom": {
+            "name": "data.extract-site",
+            "payload": {
+              "detail": "从GitHub页面提取所有仓库的信息",
+              "locator": "",
+              "text": "",
+              "title": "提取仓库信息",
+              "url": "https://github.com/cityflysky",
+              "value": ""
+            }
+          }
+        },
+        "timeout_ms": 8000,
+        "wait": "None"
+      },
+      "validations": []
+    },
+    {
+      "detail": "解析提取到的GitHub仓库数据",
+      "id": "llm-step-3",
+      "metadata": {
+        "source": {
+          "action": "data.parse.github-repo",
+          "locator": "",
+          "target": ""
+        }
+      },
+      "requires_approval": false,
+      "title": "解析仓库数据",
+      "tool": {
+        "kind": {
+          "Custom": {
+            "name": "data.parse.github-repo",
+            "payload": {
+              "detail": "解析提取到的GitHub仓库数据",
+              "locator": "",
+              "text": "",
+              "title": "解析仓库数据",
+              "url": "",
+              "username": "cityflysky",
+              "value": ""
+            }
+          }
+        },
+        "timeout_ms": 8000,
+        "wait": "None"
+      },
+      "validations": [
+        {
+          "description": "确保解析成功",
+          "condition": {
+            "UrlMatches": "https://github.com/cityflysky"
+          }
+        }
+      ]
+    },
+    {
+      "detail": "将解析后的仓库信息以结构化格式交付",
+      "id": "llm-step-4",
+      "metadata": {
+        "source": {
+          "action": "data.deliver.structured",
+          "locator": "",
+          "target": ""
+        }
+      },
+      "requires_approval": false,
+      "title": "交付解析结果",
+      "tool": {
+        "kind": {
+          "Custom": {
+            "name": "data.deliver.structured",
+            "payload": {
+              "detail": "将解析后的仓库信息以结构化格式交付",
+              "locator": "",
+              "text": "",
+              "title": "交付解析结果",
+              "url": "",
+              "value": ""
+            }
+          }
+        },
+        "timeout_ms": 8000,
+        "wait": "None"
+      },
+      "validations": []
+    }
+  ]
+}

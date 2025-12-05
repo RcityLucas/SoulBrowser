@@ -1,0 +1,11 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default-webhook
+
+receivers:
+  - name: default-webhook
+    webhook_configs:
+      - url: "http://host.docker.internal:9300/self-heal-alerts"
+        send_resolved: true

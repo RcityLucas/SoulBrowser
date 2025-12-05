@@ -122,6 +122,7 @@ base64 = "0.22"
 prometheus = "0.13"
 lazy_static = "1.4"
 axum = { version = "0.7", features = ["tokio"] }
+tower-http = { version = "0.5", features = ["cors"] }
 openssl = { version = "0.10", features = ["vendored"] }
 l6-observe = { path = "crates/l6-observe" }
 l6-timeline = { path = "crates/l6-timeline" }

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Facebook Feed",
+  "description": "Timeline items parsed from facebook.com profile/page posts.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "facebook_feed_v1"
+    },
+    "source_url": {
+      "type": ["string", "null"],
+      "format": "uri"
+    },
+    "page_name": {
+      "type": ["string", "null"]
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string", "format": "uri" },
+          "author_name": { "type": ["string", "null"] },
+          "author_profile": { "type": ["string", "null"], "format": "uri" },
+          "content": { "type": "string" },
+          "timestamp": { "type": ["string", "null"], "format": "date-time" }
+        },
+        "required": ["url", "content"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema", "items"],
+  "additionalProperties": false
+}

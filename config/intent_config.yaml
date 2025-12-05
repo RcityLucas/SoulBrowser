@@ -1,0 +1,43 @@
+intents:
+  search_market_info:
+    triggers:
+      - "搜行情"
+      - "行情"
+      - "A股"
+      - "market index"
+      - "stock quote"
+    primary_goal: "Collect and summarize today's A-share market indices"
+    primary_sites:
+      - "https://www.google.com"
+      - "https://www.baidu.com"
+    output:
+      schema: market_info_v1.json
+      include_screenshot: true
+      description: "Array of {index_name,value,change_pct,source_url}"
+    preferred_language: zh-CN
+    blockers:
+      consent_gate: accept_google_consent
+      unusual_traffic: switch_to_baidu
+      captcha: require_manual_captcha
+      login_wall: require_manual_captcha
+      blank_page: auto_retry
+
+  summarize_news:
+    triggers:
+      - "新闻摘要"
+      - "资讯汇总"
+      - "news summary"
+      - "headlines"
+    primary_goal: "Summarize the latest tech headlines with links"
+    primary_sites:
+      - "https://news.google.com"
+      - "https://news.baidu.com"
+    output:
+      schema: news_brief_v1.json
+      include_screenshot: false
+      description: "Array of {title,summary,url,source,published_at}"
+    preferred_language: zh-CN
+    blockers:
+      consent_gate: accept_google_consent
+      captcha: require_manual_captcha
+      blank_page: auto_retry
