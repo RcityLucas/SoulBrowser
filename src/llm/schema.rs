@@ -315,11 +315,15 @@ fn to_validation(raw: &LlmJsonValidation) -> Result<AgentValidation, AgentError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::{ConversationRole, ConversationTurn};
     use soulbrowser_core_types::TaskId;
 
     fn base_request(goal: &str) -> AgentRequest {
         let mut req = AgentRequest::new(TaskId::new(), goal);
-        req.push_tagged_user_turn(goal);
+        req.push_turn(ConversationTurn::new(
+            ConversationRole::User,
+            goal.to_string(),
+        ));
         req
     }
 

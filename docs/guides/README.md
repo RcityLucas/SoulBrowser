@@ -3,7 +3,7 @@
 Use these short descriptions to pick the right how-to article before diving in.
 
 ## Core bring-up
-- `BACKEND_USAGE.md` – CLI + backend runtime setup.
+- `BACKEND_USAGE.md` – one-page quickstart plus links to the canonical troubleshooting playbook.
 - `FRONTEND_SETUP_GUIDE.md` – Web-console bring-up and dev server workflow.
 - `WEB_CONSOLE_USAGE.md` – Operator walkthrough of the console surface.
 
@@ -12,7 +12,7 @@ Use these short descriptions to pick the right how-to article before diving in.
 - `TWITTER_FEED.md` – Example run that navigates to a Twitter/X profile, parses tweets, and delivers `twitter_feed_v1` artifacts.
 
 ## Troubleshooting & demos
-- `TROUBLESHOOTING.md` – Common failure modes, logging tips, and recovery checklists.
+- `TROUBLESHOOTING.md` – Canonical failure modes, logging tips, and recovery checklists for Serve/API.
 - `VISUAL_TESTING_CONSOLE.md` – Visual validation workflow for console changes.
 - `TUTORIAL_OUTLINE.md` – High-level demo script for presenting SoulBrowser.
 

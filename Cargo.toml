@@ -33,7 +33,8 @@ members = [
     "crates/l6-privacy",
     "crates/l7-adapter",
     "crates/l7-plugin",
-    "crates/l7-wd-bridge"
+    "crates/l7-wd-bridge",
+    "crates/memory-center",
 ]
 resolver = "2"
 
@@ -58,41 +59,6 @@ path = "src/lib.rs"
 name = "soulbrowser"
 path = "src/main.rs"
 
-[[example]]
-name = "advanced_tools"
-path = "examples/advanced_tools.rs"
-required-features = ["legacy-examples"]
-
-[[example]]
-name = "basic_demo"
-path = "examples/basic_demo.rs"
-required-features = ["legacy-examples"]
-
-[[example]]
-name = "basic_navigation"
-path = "examples/basic_navigation.rs"
-required-features = ["legacy-examples"]
-
-[[example]]
-name = "form_automation"
-path = "examples/form_automation.rs"
-required-features = ["legacy-examples"]
-
-[[example]]
-name = "soul_integration_demo"
-path = "examples/soul_integration_demo.rs"
-required-features = ["legacy-examples"]
-
-[[example]]
-name = "soul_reuse_example"
-path = "examples/soul_reuse_example.rs"
-required-features = ["legacy-examples"]
-
-[[example]]
-name = "standalone_demo"
-path = "examples/standalone_demo.rs"
-required-features = ["legacy-examples"]
-
 [dependencies]
 # Async runtime
 tokio = { version = "1.39", features = ["full"] }
@@ -100,6 +66,7 @@ tokio-util = { version = "0.7" }
 async-trait = "0.1"
 async-recursion = "1.0"
 once_cell = "1.19"
+async-stream = "0.3"
 soulbrowser-core-types = { path = "crates/core-types", features = ["serde-full"] }
 soulbrowser-event-bus = { path = "crates/event-bus" }
 soulbrowser-registry = { path = "crates/registry" }
@@ -119,9 +86,11 @@ perceiver-hub = { path = "crates/perceiver-hub" }
 permissions-broker = { path = "crates/permissions-broker" }
 url = "2.5"
 base64 = "0.22"
+hex = "0.4"
 prometheus = "0.13"
 lazy_static = "1.4"
-axum = { version = "0.7", features = ["tokio"] }
+axum = { version = "0.7", features = ["tokio", "ws"] }
+futures = "0.3"
 tower-http = { version = "0.5", features = ["cors"] }
 openssl = { version = "0.10", features = ["vendored"] }
 l6-observe = { path = "crates/l6-observe" }
@@ -129,6 +98,9 @@ l6-timeline = { path = "crates/l6-timeline" }
 event-store = { path = "crates/event-store" }
 l7-adapter = { path = "crates/l7-adapter" }
 l7-wd-bridge = { path = "crates/l7-wd-bridge" }
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+memory-center = { path = "crates/memory-center" }
 
 # CLI and argument parsing
 clap = { version = "4.4", features = ["derive", "color", "suggestions"] }
@@ -158,6 +130,7 @@ tempfile = "3.8"
 # Time & Date
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
+sha2 = "0.10"
 
 # Direct soul-base components integration
 soulbase-types = { path = "../soul-base-main/soul-base-main/crates/soulbase-types" }
@@ -185,7 +158,7 @@ l7-adapter = { path = "crates/l7-adapter" }
 tower = { version = "0.4", features = ["util"] }
 serde_json = "1.0"
 assert_cmd = "2.0"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
 
 
 [build-dependencies]
@@ -193,11 +166,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [features]
 default = []
-# Soul-base integration features (currently using adapted versions due to Rust 2024 incompatibility)
-soul-adapted = []  # Use adapted versions in src/soul_integration/
-full-stack = []
-legacy-examples = []
-legacy-tests = []
 
 [profile.dev]
 opt-level = 0

@@ -53,6 +53,7 @@ if (chat.context?.screenshot_base64) {
 | `getTaskLogs(taskId, since?)` | Streams accumulated log entries once. |
 | `getTaskArtifacts(taskId)` | Lists artifacts + summary co-located with the task. |
 | `openTaskStream(taskId)` | Opens a WebSocket to `/api/tasks/:id/stream`; relies on browser `WebSocket` or the injected constructor. |
+| `streamTaskEvents(taskId, opts?)` | Consumes the `/api/tasks/:id/events` SSE feed with automatic reconnection + `Last-Event-ID` replay. |
 
 Additional endpoints (`/api/perceive`, `/api/tasks/:id/execute`, etc.) will be added
 as the orchestration plan progresses.
@@ -121,7 +122,7 @@ if (plan.flow?.execution?.overlays) {
 const artifacts = await client.getTaskArtifacts(plan.plan?.plan?.task_id!);
 ```
 
-Schema reference：`docs/agent/PLAN_SCHEMA.md`（plan/flow 字段）与 `docs/ui/console_ia.md`（UI 消费方式）。
+Schema reference：`docs/reference/PLAN_SCHEMA.md`（plan/flow 字段）与 `docs/ui/console_ia.md`（UI 消费方式）。
 
 ## Streaming
 
@@ -154,6 +155,35 @@ socket.on('message', (event) => {
 
 See `examples/sdk/typescript/live-companion.ts` for a runnable script that wires a
 prompt execution + overlay stream using Node.js/`ws`.
+
+### Server-Sent Events with resume support
+
+`streamTaskEvents(taskId, options)` attaches to the SSE endpoint (`/api/tasks/:id/events`).
+The helper automatically reconnects, tracks the latest `Last-Event-ID`, and exposes
+connection state so dashboards can recover after network blips.
+
+```ts
+const stream = client.streamTaskEvents(taskId, { cursor: 0 });
+
+const unsubscribe = stream.onEvent((event) => {
+  console.log('task event', event.event);
+});
+
+stream.onConnectionChange((connected) => {
+  console.log('sse connected?', connected, 'last id', stream.lastId);
+});
+
+stream.onError((err) => {
+  console.error('stream error', err);
+});
+
+// Later
+unsubscribe();
+stream.close();
+```
+
+Provide `lastEventId` to resume from a stored checkpoint, or adjust
+`retryDelayMs`/`maxRetryDelayMs` for noisy tunnels.
 
 ## Development
 

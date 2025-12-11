@@ -159,6 +159,18 @@ impl PluginRegistry {
         None
     }
 
+    pub fn update_plugin<F>(&self, id: &str, update: F) -> Result<PluginRecord, RegistryError>
+    where
+        F: FnOnce(&mut PluginRecord),
+    {
+        let mut guard = self.entries.write();
+        let record = guard
+            .get_mut(id)
+            .ok_or_else(|| RegistryError::PluginNotFound(id.to_string()))?;
+        update(record);
+        Ok(record.clone())
+    }
+
     pub fn save(&self) -> std::io::Result<()> {
         let Some(path) = &self.source_path else {
             return Ok(());

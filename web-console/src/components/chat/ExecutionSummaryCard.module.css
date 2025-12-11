@@ -1,0 +1,31 @@
+.summaryCard {
+  margin-top: 12px;
+}
+
+.header {
+  margin-bottom: 8px;
+}
+
+.artifact {
+  color: var(--text-color-secondary);
+  font-size: 12px;
+}
+
+.logs {
+  margin-bottom: 8px;
+}
+
+.logBlock {
+  margin-bottom: 4px;
+}
+
+.logText {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 4px 0 0 0;
+}
+
+.stepItem {
+  padding-left: 0;
+  padding-right: 0;
+}

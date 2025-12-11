@@ -16,6 +16,11 @@
   min-width: 0;
 }
 
+.statusBar {
+  margin: 0 24px;
+  margin-top: 8px;
+}
+
 .messages {
   flex: 1;
   overflow-y: auto;

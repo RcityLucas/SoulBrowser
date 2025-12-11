@@ -2,10 +2,16 @@
  * Task state management store
  */
 
+import { message } from 'antd';
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
-import type { Task, TaskUpdate, TaskFilter } from '@/types';
+import type { Task, TaskUpdate, TaskFilter, TaskStatus } from '@/types';
 import { apiClient } from '@/api/client';
+import {
+  soulbrowserAPI,
+  type TaskSummary,
+  type TaskDetailResponse,
+} from '@/api/soulbrowser';
 
 interface TaskState {
   // State
@@ -30,6 +36,8 @@ interface TaskState {
   pauseTask: (taskId: string) => Promise<void>;
   cancelTask: (taskId: string) => Promise<void>;
   retryTask: (taskId: string) => Promise<void>;
+  fetchTaskDetail: (taskId: string) => Promise<TaskDetailResponse>;
+  fetchTaskExecutions: (taskId: string) => Promise<any[]>;
 }
 
 export const useTaskStore = create<TaskState>()(
@@ -44,29 +52,30 @@ export const useTaskStore = create<TaskState>()(
     // Sync actions
     setTasks: (tasks) =>
       set((state) => {
-        state.tasks.clear();
-        tasks.forEach((task) => state.tasks.set(task.id, task));
+        state.tasks = new Map(tasks.map((task) => [task.id, task]));
       }),
 
     addTask: (task) =>
       set((state) => {
-        state.tasks.set(task.id, task);
+        state.tasks = new Map(state.tasks).set(task.id, task);
       }),
 
     updateTask: (update) =>
       set((state) => {
-        const task = state.tasks.get(update.id);
-        if (task) {
-          Object.assign(task, update);
-          state.tasks.set(update.id, task);
+        const existing = state.tasks.get(update.id);
+        if (existing) {
+          const updated = { ...existing, ...update } as Task;
+          state.tasks = new Map(state.tasks).set(update.id, updated);
         }
       }),
 
     removeTask: (taskId) =>
       set((state) => {
-        state.tasks.delete(taskId);
+        const next = new Map(state.tasks);
+        next.delete(taskId);
+        state.tasks = next;
         if (state.selectedTaskId === taskId) {
-          state.selectedTaskId = null;
+            state.selectedTaskId = null;
         }
       }),
 
@@ -88,7 +97,8 @@ export const useTaskStore = create<TaskState>()(
       });
 
       try {
-        const tasks = await apiClient.listTasks(get().filter);
+        const summaries = await soulbrowserAPI.listTasks();
+        const tasks = summaries.map(mapSummaryToTask);
         get().setTasks(tasks);
       } catch (error) {
         set((state) => {
@@ -107,39 +117,28 @@ export const useTaskStore = create<TaskState>()(
       return task;
     },
 
-    startTask: async (taskId) => {
-      await apiClient.startTask(taskId);
-      set((state) => {
-        const task = state.tasks.get(taskId);
-        if (task) {
-          task.status = 'running';
-        }
-      });
+    startTask: async () => {
+      message.info('任务控制操作尚未在测试控制台中开放');
     },
 
-    pauseTask: async (taskId) => {
-      await apiClient.pauseTask(taskId);
-      set((state) => {
-        const task = state.tasks.get(taskId);
-        if (task) {
-          task.status = 'paused';
-        }
-      });
+    pauseTask: async () => {
+      message.info('任务控制操作尚未在测试控制台中开放');
     },
 
-    cancelTask: async (taskId) => {
-      await apiClient.cancelTask(taskId);
-      set((state) => {
-        const task = state.tasks.get(taskId);
-        if (task) {
-          task.status = 'cancelled';
-        }
-      });
+    cancelTask: async () => {
+      message.info('任务控制操作尚未在测试控制台中开放');
     },
 
-    retryTask: async (taskId) => {
-      const newTask = await apiClient.retryTask(taskId);
-      get().addTask(newTask);
+    retryTask: async () => {
+      message.info('任务控制操作尚未在测试控制台中开放');
+    },
+
+    fetchTaskDetail: async (taskId) => {
+      return await soulbrowserAPI.getTask(taskId);
+    },
+
+    fetchTaskExecutions: async (taskId) => {
+      return await soulbrowserAPI.getTaskExecutions(taskId);
     },
   }))
 );
@@ -159,3 +158,24 @@ export const selectTaskCount = (state: TaskState) => state.tasks.size;
 
 export const selectRunningTasksCount = (state: TaskState) =>
   Array.from(state.tasks.values()).filter((task) => task.status === 'running').length;
+
+function mapSummaryToTask(summary: TaskSummary): Task {
+  return {
+    id: summary.task_id,
+    name: summary.prompt || summary.task_id,
+    description: summary.prompt,
+    status: 'completed',
+    progress: 100,
+    totalSteps: 0,
+    completedSteps: 0,
+    startTime: summary.created_at ? new Date(summary.created_at) : undefined,
+    endTime: summary.created_at ? new Date(summary.created_at) : undefined,
+    metadata: {
+      source: summary.source,
+      planner: summary.planner,
+      llm_provider: summary.llm_provider,
+      llm_model: summary.llm_model,
+      artifact_path: summary.path,
+    },
+  };
+}

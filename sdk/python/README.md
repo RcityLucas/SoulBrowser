@@ -51,7 +51,7 @@ for event in client.iter_task_stream(socket):
         overlay = event.get("overlay", {})
         print("overlay source", overlay.get("source"), "data", overlay.get("data"))
 
-# Future overlay/annotation events will mirror docs/agent/PLAN_SCHEMA.md
+# Future overlay/annotation events follow docs/reference/PLAN_SCHEMA.md
 
 - `examples/sdk/python/gateway_plan_demo.py` demonstrates the `/v1/tasks/run` endpoint
   and streams events via WebSocket.

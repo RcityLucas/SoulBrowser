@@ -1,32 +1,15 @@
-# L8 Agent Core Overview
+# L8 Agent Docs (Legacy)
 
-This document captures the first delivery slice for the L8 "Agent & Experience" layer.
+The detailed agent planning documents previously hosted here now live under
+`docs/plans/ARCHIVE/`. These files remain available for historical context but
+are no longer updated:
 
-## Components
+- `docs/plans/ARCHIVE/CDP_ACTION_PLAN.md`
+- `docs/plans/ARCHIVE/PLAN_PERCEPTION_FIRST.md`
+- `docs/plans/ARCHIVE/USER_NEED_EXECUTION_PLAN.md`
+- `docs/plans/ARCHIVE/L8_STAGE1_PROGRESS.md`
 
-- **`crates/agent-core`**: foundational data models (`AgentPlan`, `AgentToolKind`),
-  a rule-based planner (`RuleBasedPlanner`), and helpers to convert plans into
-  `action-flow` structures.
-- **`src/agent/mod.rs`**: CLI-facing chat runner that wraps the planner,
-  provides summaries, scroll heuristics, and exposes serialized plan/flow artifacts.
-- **`soulbrowser chat`**: new command that accepts a natural language prompt,
-  optional constraints/context, prints the planned execution steps, and (with
-  `--execute`) runs them through the scheduler/toolchain with per-step retries
-  (`--max-retries`), re-planning attempts (`--max-replans`), dispatch latency
-  metrics, and serialized run artifacts (`--save-run`) that include scheduler
-  timelines and State Center events.
-
-## MVP Flow
-
-1. User runs `soulbrowser chat --prompt "Open https://example.com and click 'Pricing'"`.
-2. `ChatRunner` builds an `AgentRequest`, bootstraps rule-based planner heuristics.
-3. Planner emits `AgentPlan` with navigation + click steps and validations.
-4. `plan_to_flow` converts the plan into `Flow` for `action-flow` execution.
-5. CLI prints human-readable steps; optional JSON/YAML export via `--output json`.
-
-## Next Steps
-
-- Expand planner heuristics (form filling, table extraction, pagination).
-- Introduce memory/profile hints once L4 `memory-center` lands.
-- Connect generated flows to scheduler for live dry-runs.
-- Add UI surface (web console) showing the same plan/flow artifacts.
+For current Serve/API and slimming workstreams, follow the active plans in
+`docs/plans/` (`serve_api_optimization.md`, `project_slimming.md`,
+`flexible_parser_expansion.md`). Planner payload details now live in
+`docs/reference/PLAN_SCHEMA.md` alongside other API references.

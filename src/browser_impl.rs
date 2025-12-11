@@ -420,6 +420,7 @@ impl Page {
                         &subject_id_for_tool,
                         json!({ "url": url_for_tool }),
                         Some(exec_route_for_tool),
+                        None,
                     )
                     .await
                     .map_err(|e| {
@@ -500,6 +501,7 @@ impl Page {
                             }
                         }),
                         Some(exec_route_for_tool),
+                        None,
                     )
                     .await
                     .map_err(|e| {
@@ -588,6 +590,7 @@ impl Page {
                             "wait_tier": "domready"
                         }),
                         Some(exec_route_for_tool),
+                        None,
                     )
                     .await
                     .map_err(|e| {
@@ -698,6 +701,7 @@ impl Page {
                         &subject_for_tool,
                         serde_json::Value::Object(payload),
                         Some(exec_route_for_tool),
+                        None,
                     )
                     .await
                     .map_err(|e| {
@@ -776,6 +780,7 @@ impl Page {
                             &subject_for_tool,
                             json!({ "filename": filename_for_tool }),
                             Some(exec_route_for_tool),
+                            None,
                         )
                         .await
                         .map_err(|e| {
@@ -831,137 +836,4 @@ fn interceptor_error(
     let mut error = anyhow!("Interceptor execution failed: {:?}", inner);
     error = error.context(format!("http_status={status}"));
     error.context(format!("payload={payload}"))
-}
-
-#[cfg(all(test, feature = "legacy-tests"))]
-mod tests {
-    use super::*;
-    use crate::storage::QueryParams;
-
-    #[tokio::test]
-    async fn navigate_runs_interceptors_and_records_event() {
-        let l0 = L0Protocol::new().await.expect("init L0Protocol");
-        let config = BrowserConfig::default();
-        let mut manager = L1BrowserManager::new(l0, config)
-            .await
-            .expect("init L1BrowserManager");
-
-        let browser = manager.launch_browser().await.expect("launch browser");
-        let mut page = browser.new_page().await.expect("new page");
-
-        page.navigate("https://example.com")
-            .await
-            .expect("navigate through interceptors");
-
-        let events = browser
-            .storage_manager
-            .backend()
-            .query_events(QueryParams {
-                session_id: Some(browser.session_id.0.clone()),
-                event_type: Some("navigate".to_string()),
-                from_timestamp: None,
-                to_timestamp: None,
-                limit: 10,
-                offset: 0,
-            })
-            .await
-            .expect("query events");
-
-        assert!(!events.is_empty(), "navigate event recorded");
-    }
-
-    #[tokio::test]
-    async fn screenshot_returns_payload() {
-        let l0 = L0Protocol::new().await.expect("init L0Protocol");
-        let config = BrowserConfig::default();
-        let mut manager = L1BrowserManager::new(l0, config)
-            .await
-            .expect("init L1BrowserManager");
-
-        let browser = manager.launch_browser().await.expect("launch browser");
-        let mut page = browser.new_page().await.expect("new page");
-
-        let bytes = page
-            .screenshot("test.png")
-            .await
-            .expect("capture screenshot");
-
-        assert!(
-            !bytes.is_empty(),
-            "expected screenshot call to yield bytes even if falling back",
-        );
-    }
-
-    #[tokio::test]
-    async fn click_records_event_and_runs_tool() {
-        let l0 = L0Protocol::new().await.expect("init L0Protocol");
-        let config = BrowserConfig::default();
-        let mut manager = L1BrowserManager::new(l0, config)
-            .await
-            .expect("init L1BrowserManager");
-
-        let browser = manager.launch_browser().await.expect("launch browser");
-        let mut page = browser.new_page().await.expect("new page");
-
-        page.click("#button")
-            .await
-            .expect("click through interceptors");
-
-        let events = browser
-            .storage_manager
-            .backend()
-            .query_events(QueryParams {
-                session_id: Some(browser.session_id.0.clone()),
-                event_type: Some("click".to_string()),
-                ..QueryParams::default()
-            })
-            .await
-            .expect("query events");
-
-        assert_eq!(events.len(), 1, "click event recorded");
-        assert_eq!(
-            events[0].data["selector"].as_str(),
-            Some("#button"),
-            "selector captured"
-        );
-    }
-
-    #[tokio::test]
-    async fn screenshot_records_event_with_bytes() {
-        let l0 = L0Protocol::new().await.expect("init L0Protocol");
-        let config = BrowserConfig::default();
-        let mut manager = L1BrowserManager::new(l0, config)
-            .await
-            .expect("init L1BrowserManager");
-
-        let browser = manager.launch_browser().await.expect("launch browser");
-        let mut page = browser.new_page().await.expect("new page");
-
-        let bytes = page
-            .screenshot("capture.png")
-            .await
-            .expect("capture screenshot");
-        assert!(
-            !bytes.is_empty(),
-            "expected screenshot capture to yield bytes even if falling back",
-        );
-
-        let events = browser
-            .storage_manager
-            .backend()
-            .query_events(QueryParams {
-                session_id: Some(browser.session_id.0.clone()),
-                event_type: Some("screenshot".to_string()),
-                ..QueryParams::default()
-            })
-            .await
-            .expect("query events");
-
-        assert_eq!(events.len(), 1, "screenshot event recorded");
-        assert_eq!(
-            events[0].data["filename"].as_str(),
-            Some("capture.png"),
-            "filename stored"
-        );
-    }
 }

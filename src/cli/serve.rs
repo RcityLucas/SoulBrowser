@@ -4,30 +4,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use axum::middleware;
+use axum::{middleware, Router};
 use chrono::Duration as ChronoDuration;
 use clap::Args;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 use url::Url;
-use uuid::Uuid;
 
 use crate::app_context::get_or_create_context;
 use crate::ensure_real_chrome_enabled;
-use crate::gateway_auth_middleware;
 use crate::normalize_tenant_id;
 use crate::perception_service::PerceptionService;
 use crate::server::{
-    build_console_router, tenant_storage_path, RateLimitConfig, RateLimiter, ServeHealth,
-    ServeState,
+    build_api_router_with_modules, console_shell_router, tenant_storage_path, RateLimitConfig,
+    RateLimiter, ServeHealth, ServeRouterModules, ServeState,
 };
-use crate::task_store::TaskPlanStore;
+use crate::task_store::{prune_execution_outputs, TaskPlanStore};
 use crate::Config;
 use crate::{
-    bind_tcp_listener, build_llm_cache_pool, resolve_llm_cache_dir, GatewayPolicy,
-    RATE_LIMIT_CHAT_ENV, RATE_LIMIT_TASK_ENV,
+    build_llm_cache_pool, resolve_llm_cache_dir, GatewayPolicy, RATE_LIMIT_CHAT_ENV,
+    RATE_LIMIT_TASK_ENV,
 };
+use crate::{gateway_auth_middleware, gateway_ip_middleware};
 
 const SERVE_WS_URL_ENV: &str = "SOUL_SERVE_WS_URL";
 const DISABLE_POOL_ENV: &str = "SOULBROWSER_DISABLE_PERCEPTION_POOL";
@@ -68,34 +67,23 @@ pub struct ServeArgs {
 }
 
 pub async fn cmd_serve(args: ServeArgs, _metrics_port: u16, config: Config) -> Result<()> {
-    let shared_session_override = args
-        .shared_session
-        .or_else(|| config.serve_profile().shared_session_override());
+    let shared_session_override = args.shared_session;
     apply_shared_session_override(shared_session_override);
-    let ws_url = resolve_ws_url(args.ws_url.clone(), config.serve_profile().ws_url());
-    let llm_cache_dir = args
-        .llm_cache_dir
-        .clone()
-        .or_else(|| config.serve_profile().llm_cache_dir().cloned());
+    let ws_url = resolve_ws_url(args.ws_url.clone(), None);
+    let llm_cache_dir = args.llm_cache_dir.clone();
     let llm_cache = build_llm_cache_pool(resolve_llm_cache_dir(llm_cache_dir))?;
-    let mut rate_limit_config =
+    let rate_limit_config =
         RateLimitConfig::from_env(RATE_LIMIT_CHAT_ENV, RATE_LIMIT_TASK_ENV, 30, 15);
-    if let Some(overrides) = config.serve_profile().rate_limit() {
-        if let Some(chat) = overrides.chat_override() {
-            rate_limit_config.chat_per_min = chat;
-        }
-        if let Some(task) = overrides.task_override() {
-            rate_limit_config.task_per_min = task;
-        }
-    }
     let rate_limiter = Arc::new(RateLimiter::new(rate_limit_config));
     spawn_rate_limit_cleanup(Arc::clone(&rate_limiter));
     let config = Arc::new(config);
     let auth_policy = build_serve_auth_policy(&args)?;
     let chat_context_limit = resolve_chat_context_limit();
+    let chat_context_wait = resolve_chat_context_wait_timeout();
     let chat_context_semaphore = Arc::new(tokio::sync::Semaphore::new(chat_context_limit));
     info!(
         limit = chat_context_limit,
+        wait_ms = chat_context_wait.map(|dur| dur.as_millis() as u64),
         "Chat context snapshot concurrency limit active"
     );
 
@@ -127,6 +115,22 @@ pub async fn cmd_serve(args: ServeArgs, _metrics_port: u16, config: Config) -> R
         }
     }
 
+    if let Some(ttl) = resolve_output_ttl_duration() {
+        match prune_execution_outputs(&config.output_dir, ttl).await {
+            Ok(removed) => {
+                if removed > 0 {
+                    info!(
+                        removed,
+                        ttl_days = ttl.num_days(),
+                        root = %config.output_dir.display(),
+                        "pruned expired execution bundles"
+                    );
+                }
+            }
+            Err(err) => warn!(?err, "failed to prune expired execution bundles"),
+        }
+    }
+
     let app_context = get_or_create_context(
         tenant_id.clone(),
         Some(tenant_storage_root.clone()),
@@ -134,19 +138,22 @@ pub async fn cmd_serve(args: ServeArgs, _metrics_port: u16, config: Config) -> R
     )
     .await?;
     let app_context = Arc::new(tokio::sync::RwLock::new(app_context));
-    let state = ServeState {
-        ws_url: ws_url.clone(),
-        config: Arc::clone(&config),
-        perception_service: Arc::new(PerceptionService::new()),
+    let perception_service = Arc::new(PerceptionService::new());
+    let health = Arc::new(ServeHealth::new());
+    let state = ServeState::new(
+        ws_url.clone(),
+        Arc::clone(&config),
+        perception_service,
         llm_cache,
         rate_limiter,
         app_context,
-        health: Arc::new(ServeHealth::new()),
+        Arc::clone(&health),
         chat_context_limit,
-        chat_context_semaphore,
+        chat_context_wait,
+        Arc::clone(&chat_context_semaphore),
         tenant_id,
         tenant_storage_root,
-    };
+    );
 
     if auth_policy.is_some() && env::var("SOUL_STRICT_AUTHZ").is_err() {
         env::set_var("SOUL_STRICT_AUTHZ", "true");
@@ -162,34 +169,45 @@ pub async fn cmd_serve(args: ServeArgs, _metrics_port: u16, config: Config) -> R
         warn!("Serve auth disabled; do not expose this port publicly");
     }
 
-    state.health.mark_live();
+    state.mark_live();
     match run_startup_readiness_checks(&state).await {
         Ok(()) => {
-            state.health.mark_ready();
+            state.mark_ready();
             info!("Serve readiness checks passed");
         }
         Err(err) => {
-            state.health.mark_unready(err.to_string());
+            state.mark_unready(err.to_string());
             error!(?err, "Serve readiness checks failed");
         }
     }
 
-    let mut router = build_console_router().with_state(state);
-    if let Some(policy) = auth_policy {
-        router = router.layer(middleware::from_fn_with_state(
+    let shell_router = console_shell_router().with_state(state.clone());
+    let api_router = build_api_router_with_modules(ServeRouterModules::all()).with_state(state);
+
+    let mut router = if let Some(policy) = auth_policy.clone() {
+        let shell = shell_router.layer(middleware::from_fn_with_state(
+            Arc::clone(&policy),
+            gateway_ip_middleware,
+        ));
+        let api = api_router.layer(middleware::from_fn_with_state(
             policy,
             gateway_auth_middleware,
         ));
-    }
+        Router::new().merge(shell).merge(api)
+    } else {
+        Router::new().merge(shell_router).merge(api_router)
+    };
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
-    let listener = bind_tcp_listener(addr, "testing server")?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind testing server on {}", addr))?;
     info!(
         "Testing console available at http://127.0.0.1:{}",
         args.port
     );
     info!("Access from Windows: http://localhost:{}", args.port);
-    if let Some(ws) = ws_url {
+    if let Some(ws) = ws_url.as_deref() {
         info!("Using external DevTools endpoint: {}", ws);
     } else {
         info!("Using local Chrome detection (SOULBROWSER_CHROME / auto-detect)");
@@ -211,6 +229,18 @@ fn resolve_chat_context_limit() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|limit| *limit > 0)
         .unwrap_or(2)
+}
+
+fn resolve_chat_context_wait_timeout() -> Option<std::time::Duration> {
+    match env::var("SOUL_CHAT_CONTEXT_WAIT_MS") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_millis)
+            .filter(|dur| !dur.is_zero()),
+        Err(_) => Some(std::time::Duration::from_millis(750)),
+    }
 }
 
 fn resolve_ws_url(cli_value: Option<String>, config_value: Option<&str>) -> Option<String> {
@@ -254,6 +284,24 @@ fn resolve_plan_ttl_duration() -> Option<ChronoDuration> {
         Err(env::VarError::NotPresent) => Some(ChronoDuration::days(30)),
         Err(err) => {
             warn!(?err, "failed to read SOUL_PLAN_TTL_DAYS env");
+            None
+        }
+    }
+}
+
+fn resolve_output_ttl_duration() -> Option<ChronoDuration> {
+    match env::var("SOUL_OUTPUT_TTL_DAYS") {
+        Ok(raw) => match raw.trim().parse::<i64>() {
+            Ok(days) if days > 0 => Some(ChronoDuration::days(days)),
+            Ok(_) => None,
+            Err(err) => {
+                warn!(?err, value = raw, "invalid SOUL_OUTPUT_TTL_DAYS value");
+                None
+            }
+        },
+        Err(env::VarError::NotPresent) => Some(ChronoDuration::days(30)),
+        Err(err) => {
+            warn!(?err, "failed to read SOUL_OUTPUT_TTL_DAYS env");
             None
         }
     }
@@ -340,16 +388,12 @@ fn build_serve_auth_policy(args: &ServeArgs) -> Result<Option<Arc<GatewayPolicy>
         }
     }
     if tokens.is_empty() {
-        let generated = Uuid::new_v4().to_string();
-        info!(
-            token = %generated,
-            "Generated serve auth token; pass it via 'x-soulbrowser-token' or 'Authorization: Bearer'"
-        );
-        tokens.push(generated);
+        warn!("Serve auth disabled; no auth tokens provided");
+        return Ok(None);
     }
 
     let ip_strings = if args.allow_ip.is_empty() {
-        vec!["127.0.0.1".to_string(), "::1".to_string()]
+        default_allow_ips()
     } else {
         args.allow_ip.clone()
     };
@@ -364,16 +408,42 @@ fn build_serve_auth_policy(args: &ServeArgs) -> Result<Option<Arc<GatewayPolicy>
             .with_context(|| format!("invalid --allow-ip value '{trimmed}'"))?;
         ip_allowlist.push(ip);
     }
-    if ip_allowlist.is_empty() {
-        bail!(
-            "Serve auth requires at least one allowed IP; specify --allow-ip or disable auth explicitly"
-        );
-    }
-
     Ok(Some(Arc::new(GatewayPolicy::from_tokens_and_ips(
         tokens,
         ip_allowlist,
     ))))
+}
+
+fn default_allow_ips() -> Vec<String> {
+    let mut ips = vec!["127.0.0.1".to_string(), "::1".to_string()];
+    if let Some(host_ip) = detect_windows_host_ip() {
+        ips.push(host_ip.to_string());
+    }
+    ips
+}
+
+fn detect_windows_host_ip() -> Option<IpAddr> {
+    if std::env::var("WSL_DISTRO_NAME").is_err() && std::env::var("WSL_INTEROP").is_err() {
+        return None;
+    }
+
+    let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("nameserver") {
+            let candidate = rest.trim();
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Ok(ip) = candidate.parse::<IpAddr>() {
+                if !ip.is_loopback() {
+                    info!(%ip, "Detected Windows host IP for Serve allowlist");
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn run_startup_readiness_checks(state: &ServeState) -> Result<()> {

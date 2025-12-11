@@ -305,6 +305,13 @@ export default function LiveCompanion({
                             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                               尝试 {entry.attempts}
                             </Typography.Text>
+                            {entry.tool_kind && <Tag color="geekblue">{entry.tool_kind}</Tag>}
+                            {(typeof entry.wait_ms === 'number' || typeof entry.run_ms === 'number') && (
+                              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                等待 {Number(entry.wait_ms ?? 0).toLocaleString()}ms · 执行{' '}
+                                {Number(entry.run_ms ?? 0).toLocaleString()}ms
+                              </Typography.Text>
+                            )}
                             <Button
                               type="link"
                               size="small"

@@ -79,6 +79,27 @@
       font-weight: 500;
       gap: 0.35rem;
     }
+    .token-form {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.5rem;
+    }
+    .token-form input[type="text"] {
+      flex: 1 1 260px;
+    }
+    .token-form button {
+      padding: 0.65rem 1rem;
+      border-radius: 10px;
+      border: none;
+      background: #0f172a;
+      color: white;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .token-form button.secondary {
+      background: #475569;
+    }
     button[type="submit"] {
       grid-column: 1 / -1;
       padding: 0.9rem 1.2rem;
@@ -172,6 +193,17 @@
       <p class="subtitle">Run structural, visual, and semantic perception against a live Chrome instance. Configure the URL, perception modes, and inspect raw outputs without leaving the browser.</p>
     </header>
 
+    <section class="card" id="auth-card">
+      <h2>API Token</h2>
+      <p class="subtitle">Serve 模式默认开启鉴权。粘贴启动日志里的 token（或 `--auth-token` 指定的值），本页会将其保存在浏览器本地存储并自动附加在 API 请求中。</p>
+      <div class="token-form">
+        <input type="text" id="api-token" placeholder="soulserve_xxx" />
+        <button type="button" id="save-token">保存</button>
+        <button type="button" class="secondary" id="clear-token">清除</button>
+      </div>
+      <div id="token-status" class="status">尚未配置 token</div>
+    </section>
+
     <form id="perception-form">
       <div>
         <label for="url">Target URL</label>
@@ -235,6 +267,7 @@
   </main>
 
   <script>
+    const TOKEN_STORAGE_KEY = 'soulbrowser-auth-token';
     const form = document.getElementById('perception-form');
     const statusEl = document.getElementById('status');
     const jsonEl = document.getElementById('json');
@@ -242,11 +275,63 @@
     const stderrEl = document.getElementById('stderr');
     const screenshotWrapper = document.getElementById('screenshot-wrapper');
     const screenshotImg = document.getElementById('screenshot');
+    const tokenInput = document.getElementById('api-token');
+    const tokenStatus = document.getElementById('token-status');
+    const saveTokenBtn = document.getElementById('save-token');
+    const clearTokenBtn = document.getElementById('clear-token');
 
     function setStatus(text, state) {
       statusEl.textContent = text;
       statusEl.className = 'status ' + (state || '');
     }
+
+    function loadToken() {
+      return (
+        localStorage.getItem(TOKEN_STORAGE_KEY) ||
+        localStorage.getItem('auth_token') ||
+        localStorage.getItem('serve_token') ||
+        ''
+      );
+    }
+
+    function updateTokenStatus(token) {
+      if (token && token.trim() !== '') {
+        tokenStatus.textContent = 'Token 已保存，所有 API 请求会自动附带凭证。';
+        tokenStatus.className = 'status success';
+      } else {
+        tokenStatus.textContent = '尚未配置 token，API 请求将被拒绝。';
+        tokenStatus.className = 'status error';
+      }
+    }
+
+    const initialToken = loadToken();
+    if (initialToken) {
+      tokenInput.value = initialToken;
+    }
+    updateTokenStatus(initialToken);
+
+    saveTokenBtn.addEventListener('click', () => {
+      const token = tokenInput.value.trim();
+      if (!token) {
+        updateTokenStatus('');
+        setStatus('请输入正确的 token', 'error');
+        return;
+      }
+      localStorage.setItem(TOKEN_STORAGE_KEY, token);
+      localStorage.setItem('auth_token', token);
+      localStorage.setItem('serve_token', token);
+      updateTokenStatus(token);
+      setStatus('Token 已保存，可以执行感知任务。', 'success');
+    });
+
+    clearTokenBtn.addEventListener('click', () => {
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+      localStorage.removeItem('auth_token');
+      localStorage.removeItem('serve_token');
+      tokenInput.value = '';
+      updateTokenStatus('');
+      setStatus('Token 已清除。重新执行前请先保存新的 token。', 'error');
+    });
 
     function setPre(element, content) {
       if (content && content.trim() !== '') {
@@ -280,6 +365,13 @@
       setPre(stderrEl, '');
       screenshotWrapper.style.display = 'none';
 
+      const token = loadToken().trim();
+      if (!token) {
+        setStatus('尚未保存 API token，无法调用 /api/perceive。', 'error');
+        updateTokenStatus('');
+        return;
+      }
+
       const payload = {
         url,
         timeout,
@@ -296,9 +388,10 @@
       }
 
       try {
+        const headers = { 'Content-Type': 'application/json', 'x-soulbrowser-token': token };
         const response = await fetch('/api/perceive', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify(payload),
         });
 

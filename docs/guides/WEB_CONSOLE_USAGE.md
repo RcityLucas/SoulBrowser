@@ -20,7 +20,7 @@ cargo run --bin soulbrowser -- --metrics-port 0 serve --port 8787
 
 服务器将在 `http://localhost:8787` 启动，并默认启用鉴权（Serve/API 优化计划要求）。
 
-- **访问令牌**：启动日志里会打印 `Generated serve auth token: <TOKEN>`（或使用 `--auth-token/--allow-ip` 显式设置）。前端和脚本调用时需要通过 `x-soulbrowser-token` 头或 `Authorization: Bearer <TOKEN>` 传入。
+- **访问令牌**：启动日志里会打印 `Generated serve auth token: <TOKEN>`（或使用 `--auth-token/--allow-ip` 显式设置）。控制台首页新增 “API Token” 表单，粘贴一次即可保存在浏览器并自动附加到请求；脚本/SDK 也可以通过 `x-soulbrowser-token` 或 `Authorization: Bearer <TOKEN>` 传入。
 - **允许的 IP**：默认只允许 `127.0.0.1/::1`，如需在局域网调试可以追加 `--allow-ip 192.168.1.10` 等参数。
 - **取消鉴权（仅限本机调试）**：必须显式传入 `--disable-auth`，否则 Serve 会拒绝未授权的访问。
 
@@ -301,8 +301,10 @@ server: {
 
 ### 存储保洁与并发控制
 
-- `SOUL_PLAN_TTL_DAYS`（默认 30）：Serve 启动时会扫描 `soulbrowser-output/tasks/*.json` 并清理早于该 TTL 的计划文件；设置为 `0` 可禁用自动清理。
+- `SOUL_PLAN_TTL_DAYS`（默认 30）：Serve 启动时会扫描 `soulbrowser-output/tenants/<tenant>/tasks/*.json` 并清理早于该 TTL 的计划文件；设置为 `0` 可禁用自动清理。
+- `SOUL_OUTPUT_TTL_DAYS`（默认 30）：Serve 还会清理 `soulbrowser-output/tasks/<task_id>/` 下的执行记录（`plans.json`、`executions.json` 等）；对 demo/本地环境保留更长历史时可提高该值，设置 `0` 可关闭自动删除。
 - `SOUL_CHAT_CONTEXT_LIMIT`（默认 2）：限制 `/api/chat` 触发的感知上下文抓取同时运行数量，防止感知任务拖垮整个 Web Console。
+- `SOUL_CHAT_CONTEXT_WAIT_MS`（默认 750）：`capture_chat_context_snapshot` 等待 semaphore 的最长毫秒数，超时会跳过感知并返回异常，避免请求无限阻塞。
 
 ### 生产部署
 

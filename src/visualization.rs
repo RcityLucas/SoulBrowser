@@ -61,22 +61,6 @@ pub fn build_execution_overlays(steps: &[StepExecutionReport]) -> Value {
                             "filename": artifact.filename,
                             "data_base64": artifact.data_base64,
                         });
-                        if let Some(meta) = &artifact.metadata {
-                            if let Some(obj) = meta.as_object() {
-                                if let Some(bbox) = obj.get("bbox") {
-                                    value
-                                        .as_object_mut()
-                                        .expect("overlay payload is object")
-                                        .insert("bbox".to_string(), bbox.clone());
-                                }
-                                if let Some(path) = obj.get("screenshot_path") {
-                                    value
-                                        .as_object_mut()
-                                        .expect("overlay payload is object")
-                                        .insert("screenshot_path".to_string(), path.clone());
-                                }
-                            }
-                        }
                         value
                             .as_object_mut()
                             .expect("overlay payload is object")
@@ -141,29 +125,6 @@ pub fn artifact_event_value(
         "filename": artifact.filename,
         "data_base64": artifact.data_base64,
     });
-
-    if let Some(meta) = &artifact.metadata {
-        if let Some(obj) = meta.as_object() {
-            if let Some(bbox) = obj.get("bbox") {
-                value
-                    .as_object_mut()
-                    .expect("artifact payload is object")
-                    .insert("bbox".to_string(), bbox.clone());
-            }
-            if let Some(path) = obj.get("screenshot_path") {
-                value
-                    .as_object_mut()
-                    .expect("artifact payload is object")
-                    .insert("screenshot_path".to_string(), path.clone());
-            }
-            if let Some(obstruction) = obj.get("obstruction_type") {
-                value
-                    .as_object_mut()
-                    .expect("artifact payload is object")
-                    .insert("obstruction_type".to_string(), obstruction.clone());
-            }
-        }
-    }
 
     value
         .as_object_mut()

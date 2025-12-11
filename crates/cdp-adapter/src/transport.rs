@@ -462,6 +462,11 @@ impl RuntimeState {
             "--password-store=basic",
             "--remote-allow-origins=*",
             "--use-mock-keychain",
+            "--ignore-certificate-errors",
+            "--disable-http2",
+            "--disable-web-security",
+            "--disable-gpu",
+            "--disable-features=VizDisplayCompositor",
         ];
         if cfg.headless {
             args.push("--headless=new");

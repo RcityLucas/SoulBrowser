@@ -4,6 +4,7 @@ use crate::plan::{AgentPlan, AgentPlanStep, AgentToolKind};
 
 const OBSERVATION_TOOLS: &[&str] = &["data.extract-site", "page.observe"];
 const PARSE_TOOLS: &[&str] = &[
+    "data.parse.generic",
     "data.parse.market_info",
     "data.parse.news_brief",
     "data.parse.twitter-feed",
@@ -13,6 +14,7 @@ const PARSE_TOOLS: &[&str] = &[
     "data.parse.github-repo",
 ];
 const PARSE_TOOL_ALIASES: &[&str] = &[
+    "parse",
     "github.extract-repo",
     "data.parse.github.extract-repo",
     "data.parse.twitter_feed",
@@ -27,7 +29,7 @@ const PARSE_TOOL_ALIASES: &[&str] = &[
 const DELIVER_TOOLS: &[&str] = &["data.deliver.structured"];
 const NOTE_TOOLS: &[&str] = &["agent.note"];
 const ALLOWED_CUSTOM_TOOL_HINT: &str =
-    "data.extract-site, data.parse.market_info, data.parse.news_brief, data.parse.twitter-feed, data.parse.facebook-feed, data.parse.hackernews-feed, data.parse.linkedin-profile, data.parse.github-repo, data.deliver.structured, agent.note, plugin.*, mock.llm.plan";
+    "data.extract-site, data.parse.generic, data.parse.market_info, data.parse.news_brief, data.parse.twitter-feed, data.parse.facebook-feed, data.parse.hackernews-feed, data.parse.linkedin-profile, data.parse.github-repo, data.deliver.structured, agent.note, plugin.*, mock.llm.plan";
 
 #[derive(Debug, Default, Clone)]
 pub struct PlanValidator;

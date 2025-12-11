@@ -15,10 +15,13 @@ impl MockFlowExecutor {
                 steps: vec![StepExecutionReport {
                     step_id: "mock-step".into(),
                     title: "Mock action".into(),
+                    tool_kind: "mock".into(),
                     status: StepExecutionStatus::Failed,
                     attempts: 1,
                     error: Some("synthetic failure".into()),
                     dispatches: Vec::<DispatchRecord>::new(),
+                    total_wait_ms: 0,
+                    total_run_ms: 0,
                 }],
             }
         } else {
@@ -27,10 +30,13 @@ impl MockFlowExecutor {
                 steps: vec![StepExecutionReport {
                     step_id: "mock-step".into(),
                     title: "Mock action".into(),
+                    tool_kind: "mock".into(),
                     status: StepExecutionStatus::Success,
                     attempts: 1,
                     error: None,
                     dispatches: Vec::<DispatchRecord>::new(),
+                    total_wait_ms: 0,
+                    total_run_ms: 0,
                 }],
             }
         }

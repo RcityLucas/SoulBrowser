@@ -9,7 +9,7 @@ pub(crate) enum RateLimitKind {
     Task,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct RateLimitConfig {
     pub(crate) chat_per_min: u32,
     pub(crate) task_per_min: u32,

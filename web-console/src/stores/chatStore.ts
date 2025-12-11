@@ -5,6 +5,24 @@
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
 import type { TaskPlan } from '@/types';
+import type { ExecutionResultEntry } from '@/utils/executionSummary';
+
+export interface ExecutionSummaryStep {
+  stepId: string;
+  title: string;
+  status: string;
+  attempts: number;
+  durationMs: number;
+  error?: string | null;
+}
+
+export interface ExecutionSummary {
+  success: boolean;
+  stdout?: string;
+  stderr?: string;
+  artifactPath?: string;
+  steps: ExecutionSummaryStep[];
+}
 
 export interface ChatMessage {
   id: string;
@@ -13,6 +31,8 @@ export interface ChatMessage {
   timestamp: Date;
   taskPlan?: TaskPlan;
   suggestions?: string[];
+  executionSummary?: ExecutionSummary;
+  executionResults?: ExecutionResultEntry[];
 }
 
 interface ChatState {

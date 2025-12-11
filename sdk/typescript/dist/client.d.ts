@@ -1,4 +1,5 @@
 import type { ChatRequest, ChatResponse, CreateTaskRequest, CreateTaskResponse, ExecuteTaskRequest, ExecuteTaskResponse, PerceiveRequest, PerceiveResponse, TaskArtifactsResponse, TaskDetailResponse, TaskLogEntry, TaskObservationsResponse, TaskStatusSnapshot, TaskSummary, TaskAnnotationsResponse, CreateTaskAnnotationRequest, TaskAnnotation, RecordingsListResponse, RecordingDetailResponse } from './types.js';
+import { TaskEventStream } from './task_event_stream.js';
 export interface ClientOptions {
     baseUrl?: string;
     fetchFn?: typeof fetch;
@@ -7,6 +8,13 @@ export interface ClientOptions {
 export interface TaskStreamOptions {
     viaGateway?: boolean;
     customPath?: string;
+}
+export interface TaskEventStreamOptions extends TaskStreamOptions {
+    cursor?: number;
+    lastEventId?: string;
+    headers?: Record<string, string>;
+    retryDelayMs?: number;
+    maxRetryDelayMs?: number;
 }
 export declare class SoulBrowserClient {
     private baseUrl;
@@ -36,6 +44,7 @@ export declare class SoulBrowserClient {
         success: boolean;
     }>;
     openTaskStream(taskId: string, options?: TaskStreamOptions): WebSocket;
+    streamTaskEvents(taskId: string, options?: TaskEventStreamOptions): TaskEventStream;
     private get;
     private post;
     private handleResponse;

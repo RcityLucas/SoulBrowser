@@ -18,13 +18,12 @@ use l7_adapter::{AdapterBootstrap, AdapterPolicyHandle, AdapterPolicyView, Tenan
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::spawn;
+use tokio::{net::TcpListener, spawn};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 use crate::agent::{execute_plan, FlowExecutionOptions};
 use crate::app_context::{get_or_create_context, AppContext};
-use crate::bind_tcp_listener;
 use crate::gateway_auth_middleware;
 use crate::run_gateway_demo_plan;
 use crate::task_status::TaskStatusRegistry;
@@ -158,7 +157,9 @@ pub async fn cmd_gateway(args: GatewayArgs, config: &Config) -> Result<()> {
         ))
         .with_state(gateway_state);
 
-    let listener = bind_tcp_listener(args.http, "gateway http")?;
+    let listener = TcpListener::bind(args.http)
+        .await
+        .with_context(|| format!("failed to bind gateway http on {}", args.http))?;
     info!("Gateway HTTP ready at http://{}", args.http);
 
     if let Some(plan_path) = args.demo_plan.clone() {

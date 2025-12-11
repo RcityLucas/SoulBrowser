@@ -32,7 +32,7 @@ L0: Runtime & Adapters [In-flight]
 - **Legacy layers (L1+)**: existing soul-base wiring remains in place for the CLI; fresh L1 work (dispatcher/scheduler/state) begins next.
 - **Scheduler telemetry**: the CLI embeds the unified kernel scheduler; `soulbrowser info` and `soulbrowser scheduler` surface recent dispatch attempts, timestamps, basic Registry lifecycle events, and support cancelling pending actions.
 - **Policy center**: `soulbrowser policy show`/`override` exposes current limits and allows runtime overrides (with TTL) that feed into the scheduler/registry.
-- **Feature flags**: legacy examples/tests are gated behind `legacy-examples` / `legacy-tests` to keep the default build green.
+- **Legacy assets archived**: historical demos/tests now live under `docs/examples/legacy_examples.md`; the default build focuses on the Serve/API stack.
 
 See `docs/PRODUCT_COMPLETION_PLAN.md` for the consolidated roadmap, `docs/L0_ACTUAL_PROGRESS.md` for runtime status details, and `docs/AI_BROWSER_EXPERIENCE_PLAN.md` for the upcoming AI browser experience work.
 ```
@@ -51,9 +51,6 @@ cargo build
 
 # Run tests
 cargo test
-
-# Run legacy examples (feature-gated)
-cargo run --features legacy-examples --example basic_demo
 
 # Run the real-browser demo (requires Chrome/Chromium)
 SOULBROWSER_USE_REAL_CHROME=1 \
@@ -171,10 +168,10 @@ SoulBrowser/
 │   ├── scheduler/              # Task scheduling and dispatch
 │   ├── state-center/           # State management with telemetry
 │   └── policy-center/          # Policy and quota management
-├── docs/                       # Architecture plans & progress notes
-├── examples/                   # Legacy demos (enable with `legacy-examples` feature)
+├── docs/                       # Architecture plans & progress notes (plus legacy example catalog)
+├── examples/                   # Active automation + SDK samples (legacy demos archived in docs/examples)
 ├── src/                        # CLI entrypoint and orchestration
-├── tests/                      # Integration tests (includes L2 perception tests)
+├── tests/                      # Current integration tests (legacy full-stack suites were archived)
 └── target/                     # Cargo build artifacts
 ```
 

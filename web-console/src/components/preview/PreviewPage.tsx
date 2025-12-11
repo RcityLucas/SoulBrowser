@@ -1,46 +1,18 @@
 import { useEffect, useRef } from 'react';
 import { useParams } from 'react-router-dom';
-import { Card, Timeline, Slider } from 'antd';
+import { Card, Timeline } from 'antd';
 import { useScreenshotStore } from '@/stores/screenshotStore';
-import { useWebSocket } from '@/hooks/useWebSocket';
 import { formatTime } from '@/utils/format';
-import type { ScreenshotFrame, ElementOverlay } from '@/types';
+import type { ElementOverlay } from '@/types';
 import styles from './PreviewPage.module.css';
 
 export default function PreviewPage() {
   const { taskId } = useParams<{ taskId: string }>();
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const { send, on } = useWebSocket();
-  const { currentFrame, frames, subscribe, unsubscribe, addFrame } = useScreenshotStore();
+  const { currentFrame, frames } = useScreenshotStore();
 
   const frame = taskId ? currentFrame.get(taskId) : undefined;
   const frameHistory = taskId ? frames.get(taskId) || [] : [];
-
-  useEffect(() => {
-    if (!taskId) return;
-
-    // Subscribe to screenshot stream
-    send({
-      type: 'subscribe_screenshot',
-      payload: { taskId, fps: 2 },
-    });
-    subscribe(taskId);
-
-    const unsubscribeWs = on('screenshot', (newFrame: ScreenshotFrame) => {
-      if (newFrame.taskId === taskId) {
-        addFrame(taskId, newFrame);
-      }
-    });
-
-    return () => {
-      send({
-        type: 'unsubscribe_screenshot',
-        payload: { taskId },
-      });
-      unsubscribe(taskId);
-      unsubscribeWs();
-    };
-  }, [taskId, send, on, subscribe, unsubscribe, addFrame]);
 
   useEffect(() => {
     if (!frame || !canvasRef.current) return;

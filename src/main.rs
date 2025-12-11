@@ -53,7 +53,8 @@ use soulbrowser_state_center::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::net::SocketAddr;
+use std::fs as stdfs;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -73,6 +74,7 @@ const RATE_LIMIT_CHAT_ENV: &str = "SOUL_RATE_LIMIT_CHAT_PER_MIN";
 const RATE_LIMIT_TASK_ENV: &str = "SOUL_RATE_LIMIT_TASK_PER_MIN";
 const RATE_LIMIT_BUCKET_TTL_ENV: &str = "SOUL_RATE_LIMIT_BUCKET_TTL_SECS";
 const RATE_LIMIT_GC_ENV: &str = "SOUL_RATE_LIMIT_GC_SECS";
+const LLM_CACHE_DIR_ENV: &str = "SOULBROWSER_LLM_CACHE_DIR";
 
 // Import types from our modules
 use crate::agent::executor::DispatchRecord;
@@ -84,17 +86,18 @@ use crate::analytics::{SessionAnalytics, SessionAnalyzer};
 use crate::app_context::{get_or_create_context, AppContext};
 use crate::automation::{AutomationConfig, AutomationEngine, AutomationResults};
 use crate::browser_impl::{BrowserConfig, L0Protocol, L1BrowserManager};
+use crate::cli::{
+    cmd_artifacts, cmd_console, cmd_serve, ArtifactsArgs, ConsoleArgs, RecordArgs, ServeArgs,
+};
 use crate::export::{CsvExporter, Exporter, HtmlExporter, JsonExporter};
+use crate::llm::LlmCachePool;
 use crate::perception_service::PerceptionService;
 use crate::replay::{ReplayConfig, SessionReplayer};
-use crate::server::{
-    build_console_router,
-    rate_limit::{RateLimitConfig, RateLimiter},
-    ServeHealth, ServeState,
-};
-use crate::storage::{BrowserEvent, BrowserSessionEntity, QueryParams, StorageManager};
+use crate::server::{build_console_router, RateLimitConfig, RateLimiter, ServeHealth, ServeState};
+use crate::storage::{BrowserEvent, QueryParams, StorageManager};
 use crate::types::BrowserType;
 use agent_core::{AgentContext, AgentRequest, ConversationRole, ConversationTurn};
+use axum::middleware;
 use humantime::format_rfc3339;
 use serde_json::{json, Map as JsonMap, Number as JsonNumber, Value};
 use soulbase_types::tenant::TenantId;
@@ -125,16 +128,36 @@ use uuid::Uuid;
 // Soul-base integrated modules
 mod agent;
 mod auth;
+mod chat_support;
+mod cli;
 mod config;
+mod console_fixture;
 mod errors;
+mod gateway_policy;
+mod intent;
 mod interceptors;
+mod judge;
 mod l0_bridge;
+mod llm;
 mod metrics;
+mod observation;
+mod parsers;
 mod perception_service;
+mod plugin_registry;
+mod replan;
+mod self_heal;
 mod server;
 mod storage;
+mod structured_output;
+mod task_status;
+mod task_store;
 mod tools;
 mod types;
+mod visualization;
+mod watchdogs;
+
+pub(crate) use console_fixture::{load_console_fixture, PerceptionExecResult};
+pub(crate) use gateway_policy::{gateway_auth_middleware, gateway_ip_middleware, GatewayPolicy};
 
 // Browser implementation using soul-base
 mod browser_impl;
@@ -482,51 +505,6 @@ struct PerceiveArgs {
     timeout: u64,
 }
 
-#[derive(Args, Clone)]
-struct ServeArgs {
-    /// Port for the testing server
-    #[arg(long, default_value_t = 8787)]
-    port: u16,
-
-    /// Attach to an existing Chrome DevTools websocket (optional)
-    #[arg(long)]
-    ws_url: Option<String>,
-}
-
-#[derive(Args)]
-struct RecordArgs {
-    /// Session name
-    name: String,
-
-    /// Browser type to use
-    #[arg(short, long, default_value = "chromium")]
-    browser: BrowserType,
-
-    /// Start URL
-    #[arg(short, long)]
-    url: Option<String>,
-
-    /// Recording output directory
-    #[arg(short, long)]
-    output_dir: Option<PathBuf>,
-
-    /// Enable screenshot recording
-    #[arg(long)]
-    screenshots: bool,
-
-    /// Enable video recording
-    #[arg(long)]
-    video: bool,
-
-    /// Record network activity
-    #[arg(long)]
-    network: bool,
-
-    /// Record performance metrics
-    #[arg(long)]
-    performance: bool,
-}
-
 #[derive(Args)]
 struct ReplayArgs {
     /// Recording file or session name
@@ -681,71 +659,6 @@ struct ChatArgs {
     /// Write the artifact manifest to a JSON file
     #[arg(long, value_name = "PATH")]
     artifacts_path: Option<PathBuf>,
-}
-
-#[derive(Args)]
-struct ArtifactsArgs {
-    /// Path to a saved run bundle (JSON produced by --save-run)
-    #[arg(long, value_name = "FILE")]
-    input: PathBuf,
-
-    /// Output format for printing the manifest
-    #[arg(long, value_enum, default_value = "json")]
-    format: ArtifactFormat,
-
-    /// Filter by step identifier
-    #[arg(long)]
-    step_id: Option<String>,
-
-    /// Filter by dispatch label (e.g. "action" or validation name)
-    #[arg(long)]
-    dispatch: Option<String>,
-
-    /// Filter by artifact label
-    #[arg(long)]
-    label: Option<String>,
-
-    /// Directory to extract matching artifacts as files (base64 decoded)
-    #[arg(long, value_name = "DIR")]
-    extract: Option<PathBuf>,
-
-    /// Path to write a summary (JSON) of matching artifacts
-    #[arg(long, value_name = "FILE")]
-    summary_path: Option<PathBuf>,
-
-    /// Threshold in bytes for highlighting large artifacts
-    #[arg(long, value_name = "BYTES", default_value_t = 5 * 1024 * 1024)]
-    large_threshold: u64,
-}
-
-#[derive(Args)]
-struct ConsoleArgs {
-    /// Path to the saved run bundle produced by --save-run
-    #[arg(long, value_name = "FILE")]
-    input: PathBuf,
-
-    /// Output file for the console payload (prints to stdout if omitted)
-    #[arg(long, value_name = "FILE")]
-    output: Option<PathBuf>,
-
-    /// Produce pretty-printed JSON when writing to stdout
-    #[arg(long)]
-    pretty: bool,
-
-    /// Serve a lightweight Web Console preview instead of printing JSON
-    #[arg(long)]
-    serve: bool,
-
-    /// Port to bind when running with --serve
-    #[arg(long, default_value_t = 8710)]
-    port: u16,
-}
-
-#[derive(Clone, clap::ValueEnum)]
-enum ArtifactFormat {
-    Json,
-    Yaml,
-    Human,
 }
 
 #[derive(Args)]
@@ -1075,6 +988,7 @@ impl Default for Config {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_local_env_overrides();
     let cli = Cli::parse();
 
     // Initialize tracing
@@ -1091,7 +1005,7 @@ async fn main() -> Result<()> {
     let result = match cli.command {
         Commands::Start(args) => cmd_start(args, &config).await,
         Commands::Run(args) => cmd_run(args, &config).await,
-        Commands::Record(args) => cmd_record(args, &config).await,
+        Commands::Record(args) => crate::cli::cmd_record(args, &config).await,
         Commands::Replay(args) => cmd_replay(args, &config).await,
         Commands::Export(args) => cmd_export(args, &config).await,
         Commands::Analyze(args) => cmd_analyze(args, &config).await,
@@ -1119,6 +1033,51 @@ async fn main() -> Result<()> {
             error!("Command failed: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+fn load_local_env_overrides() {
+    let path = Path::new("config/local.env");
+    if !path.exists() {
+        return;
+    }
+
+    match stdfs::read_to_string(path) {
+        Ok(contents) => {
+            for (idx, raw_line) in contents.lines().enumerate() {
+                let line = raw_line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let Some((key, value)) = line.split_once('=') else {
+                    warn!(line = idx + 1, "invalid local.env entry; skipping");
+                    continue;
+                };
+                let key = key.trim();
+                if key.is_empty() || env::var(key).is_ok() {
+                    continue;
+                }
+                let normalized = unescape_value(value.trim());
+                env::set_var(key, normalized);
+            }
+            info!(path = %path.display(), "Loaded environment overrides from local.env");
+        }
+        Err(err) => {
+            warn!(path = %path.display(), ?err, "failed to read local.env overrides");
+        }
+    }
+}
+
+fn unescape_value(value: &str) -> String {
+    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        let inner = &value[1..value.len() - 1];
+        inner
+            .replace("\\\"", "\"")
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+    } else {
+        value.to_string()
     }
 }
 
@@ -1197,70 +1156,7 @@ fn compute_timeline_ms(timeline: &DispatchTimeline) -> (u64, u64) {
 }
 
 async fn cmd_start(args: StartArgs, config: &Config) -> Result<()> {
-    info!("Starting browser session");
-
-    let context = get_or_create_context(
-        "cli".to_string(),
-        Some(config.output_dir.clone()),
-        config.policy_paths.clone(),
-    )
-    .await
-    .map_err(|e| anyhow!(e.to_string()))?;
-
-    // Initialize L0 (Protocol Layer)
-    let l0 = L0Protocol::new().await?;
-
-    // Initialize L1 (Browser Management)
-    let browser_config = BrowserConfig {
-        browser_type: args.browser.clone(),
-        headless: args.headless,
-        window_size: parse_window_size(args.window_size.as_deref())?,
-        devtools: args.devtools,
-        ..Default::default()
-    };
-
-    let mut l1 = L1BrowserManager::new(l0, browser_config).await?;
-
-    // Launch browser
-    let browser = l1.launch_browser().await?;
-    info!("Browser launched successfully");
-
-    // Create new page using soul-base
-    let mut page = browser
-        .new_page()
-        .await
-        .context("Failed to create new page")?;
-
-    // Navigate to URL if provided
-    if let Some(url) = args.url.clone() {
-        if args.unified_kernel {
-            if let Err(err) = unified_kernel_navigate(context.clone(), url.clone()).await {
-                warn!("Unified kernel navigation request failed: {}", err);
-            }
-            info!("Unified kernel request dispatched; continuing with direct navigation for compatibility");
-        }
-        info!("Navigating to: {}", url);
-        page.navigate(&url)
-            .await
-            .context("Failed to navigate to URL")?;
-    }
-
-    // Initialize L3 (DOM Intelligence) if soul is enabled
-    if args.soul {
-        info!(
-            "Enabling Soul (AI) assistance with model: {}",
-            args.soul_model
-        );
-        // Initialize soul with specified model
-        // This would integrate with your AI service
-    }
-
-    // Keep session alive
-    info!("Browser session started. Press Ctrl+C to exit.");
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down browser session");
-
-    Ok(())
+    cli::cmd_start(args, config).await
 }
 
 async fn unified_kernel_navigate(context: Arc<AppContext>, url: String) -> Result<()> {
@@ -2001,141 +1897,6 @@ async fn cmd_run(args: RunArgs, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_record(args: RecordArgs, config: &Config) -> Result<()> {
-    info!("Starting recording session: {}", args.name);
-
-    let storage_path = args
-        .output_dir
-        .clone()
-        .or_else(|| Some(config.output_dir.clone()));
-
-    let context =
-        get_or_create_context("cli".to_string(), storage_path, config.policy_paths.clone()).await?;
-
-    let start_url = args.url.clone();
-
-    let storage = context.storage();
-    let tenant_id = TenantId("cli".to_string());
-    let session_id = format!("record-{}-{}", args.name, uuid::Uuid::new_v4());
-    info!("Recording session ID: {}", session_id);
-
-    let created_at = chrono::Utc::now().timestamp_millis();
-    let session_entity = BrowserSessionEntity {
-        id: session_id.clone(),
-        tenant: tenant_id.clone(),
-        subject_id: "recorder".to_string(),
-        created_at,
-        updated_at: created_at,
-        state: "recording".to_string(),
-        metadata: serde_json::json!({
-            "name": args.name,
-            "url": start_url.clone(),
-            "options": {
-                "screenshots": args.screenshots,
-                "video": args.video,
-                "network": args.network,
-                "performance": args.performance
-            }
-        }),
-    };
-
-    storage
-        .backend()
-        .store_session(session_entity)
-        .await
-        .context("Failed to persist session metadata")?;
-
-    let mut sequence: u64 = 1;
-
-    persist_event(
-        &storage,
-        &tenant_id,
-        &session_id,
-        sequence,
-        "recording_started",
-        serde_json::json!({
-            "name": args.name,
-            "url": start_url.clone(),
-            "options": {
-                "screenshots": args.screenshots,
-                "video": args.video,
-                "network": args.network,
-                "performance": args.performance
-            }
-        }),
-    )
-    .await?;
-    sequence += 1;
-
-    // Initialize browser for recording
-    let l0 = L0Protocol::new().await?;
-    let browser_config = BrowserConfig {
-        browser_type: args.browser,
-        headless: false,
-        window_size: Some((1280, 720)),
-        devtools: true,
-    };
-
-    let mut browser_manager = L1BrowserManager::new(l0, browser_config).await?;
-    let browser = browser_manager.launch_browser().await?;
-    let mut page = browser.new_page().await?;
-
-    // Navigate to start URL if provided
-    if let Some(url) = start_url.as_deref() {
-        page.navigate(url).await?;
-    }
-
-    info!("Recording started. Interact with the browser. Press Ctrl+C to stop.");
-
-    // Wait for stop signal
-    tokio::signal::ctrl_c().await?;
-
-    persist_event(
-        &storage,
-        &tenant_id,
-        &session_id,
-        sequence,
-        "recording_stopped",
-        serde_json::json!({
-            "reason": "user_exit"
-        }),
-    )
-    .await?;
-
-    let updated_at = chrono::Utc::now().timestamp_millis();
-    let completed_session = BrowserSessionEntity {
-        id: session_id.clone(),
-        tenant: tenant_id.clone(),
-        subject_id: "recorder".to_string(),
-        created_at,
-        updated_at,
-        state: "completed".to_string(),
-        metadata: serde_json::json!({
-            "name": args.name,
-            "url": start_url,
-            "options": {
-                "screenshots": args.screenshots,
-                "video": args.video,
-                "network": args.network,
-                "performance": args.performance
-            }
-        }),
-    };
-
-    storage
-        .backend()
-        .update_session(completed_session)
-        .await
-        .context("Failed to update session state")?;
-
-    info!(
-        "Recording session {} complete. Replay with: cargo run -- replay {}",
-        session_id, session_id
-    );
-
-    Ok(())
-}
-
 async fn cmd_replay(args: ReplayArgs, config: &Config) -> Result<()> {
     info!("Replaying session: {}", args.recording);
 
@@ -2517,7 +2278,7 @@ async fn cmd_chat(args: ChatArgs, config: &Config, output: OutputFormat) -> Resu
         args.constraints.clone(),
     );
 
-    let mut current_session = runner.plan(exec_request.clone())?;
+    let mut current_session = runner.plan(exec_request.clone()).await?;
 
     let mut plan_payloads = Vec::new();
     let mut execution_reports = Vec::new();
@@ -2594,7 +2355,7 @@ async fn cmd_chat(args: ChatArgs, config: &Config, output: OutputFormat) -> Resu
             exec_request = updated;
         }
 
-        current_session = runner.plan(exec_request.clone())?;
+        current_session = runner.plan(exec_request.clone()).await?;
         attempt += 1;
     }
 
@@ -2631,711 +2392,6 @@ async fn cmd_chat(args: ChatArgs, config: &Config, output: OutputFormat) -> Resu
     }
 
     Ok(())
-}
-
-async fn cmd_artifacts(args: ArtifactsArgs) -> Result<()> {
-    let bundle = load_run_bundle(&args.input).await?;
-
-    let artifacts_value = bundle
-        .get("artifacts")
-        .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
-
-    let filtered = filter_artifacts(&artifacts_value, &args);
-    let artifacts_array = Value::Array(filtered.clone());
-
-    if let Some(dir) = &args.extract {
-        extract_artifacts(dir, &filtered).await?;
-    }
-
-    let summary = build_artifact_summary(&filtered, args.large_threshold);
-
-    if let Some(path) = &args.summary_path {
-        save_summary(path, &summary).await?;
-    }
-
-    match args.format {
-        ArtifactFormat::Json => {
-            let payload = json!({
-                "summary": summary,
-                "artifacts": artifacts_array,
-            });
-            println!("{}", serde_json::to_string_pretty(&payload)?);
-        }
-        ArtifactFormat::Yaml => {
-            let payload = json!({
-                "summary": summary,
-                "artifacts": artifacts_array,
-            });
-            println!("{}", serde_yaml::to_string(&payload)?);
-        }
-        ArtifactFormat::Human => {
-            print_summary_human(&summary);
-            if filtered.is_empty() {
-                println!("[no artifacts]");
-            } else {
-                for item in &filtered {
-                    let attempt = item.get("attempt").and_then(Value::as_u64).unwrap_or(0);
-                    let step = item.get("step_index").and_then(Value::as_u64).unwrap_or(0);
-                    let step_id = item
-                        .get("step_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    let dispatch = item
-                        .get("dispatch_label")
-                        .and_then(Value::as_str)
-                        .unwrap_or("action");
-                    let label = item
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .unwrap_or("artifact");
-                    let content_type = item
-                        .get("content_type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("application/octet-stream");
-                    let bytes = item.get("byte_len").and_then(Value::as_u64).unwrap_or(0);
-                    let filename = item.get("filename").and_then(Value::as_str);
-                    println!(
-                        "attempt={} step={} ({}) dispatch={} artifact={} bytes={} type={}{}",
-                        attempt,
-                        step,
-                        step_id,
-                        dispatch,
-                        label,
-                        bytes,
-                        content_type,
-                        filename
-                            .map(|name| format!(" filename={}", name))
-                            .unwrap_or_default()
-                    );
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn cmd_console(args: ConsoleArgs) -> Result<()> {
-    let bundle = load_run_bundle(&args.input).await?;
-
-    let execution = bundle
-        .get("execution")
-        .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
-    let plans = bundle
-        .get("plans")
-        .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
-    let state_events = bundle
-        .get("state_events")
-        .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
-    let artifacts_value = bundle
-        .get("artifacts")
-        .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
-
-    let artifacts_array = artifacts_value.clone();
-    let items = artifacts_value.as_array().cloned().unwrap_or_else(Vec::new);
-    let summary = build_artifact_summary(&items, DEFAULT_LARGE_THRESHOLD);
-    let overlays = build_overlays(&items);
-
-    let payload = json!({
-        "plans": plans,
-        "execution": execution,
-        "state_events": state_events,
-        "artifacts": {
-            "summary": summary,
-            "items": artifacts_array,
-        },
-        "overlays": overlays,
-    });
-
-    if args.serve {
-        serve_console(args.port, payload).await?;
-        return Ok(());
-    }
-
-    if let Some(path) = &args.output {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("failed to create output directory {}", parent.display())
-            })?;
-        }
-        tokio::fs::write(path, serde_json::to_vec_pretty(&payload)?)
-            .await
-            .with_context(|| format!("failed to write console payload to {}", path.display()))?;
-        println!("Console bundle written to {}", path.display());
-    } else if args.pretty {
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        println!("{}", serde_json::to_string(&payload)?);
-    }
-
-    Ok(())
-}
-
-async fn load_run_bundle(path: &PathBuf) -> Result<Value> {
-    let content = fs::read_to_string(path)
-        .await
-        .with_context(|| format!("failed to read run bundle {}", path.display()))?;
-    let bundle: Value = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse run bundle {}", path.display()))?;
-    Ok(bundle)
-}
-
-async fn serve_console(port: u16, payload: Value) -> Result<()> {
-    let shared = Arc::new(payload);
-    let data = shared.clone();
-
-    let router = axum::Router::new()
-        .route(
-            "/",
-            axum::routing::get(|| async { axum::response::Html(CONSOLE_HTML) }),
-        )
-        .route(
-            "/data",
-            axum::routing::get(move || {
-                let clone = data.clone();
-                async move { axum::Json(clone.as_ref().clone()) }
-            }),
-        );
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind console server on {}", addr))?;
-    println!("Console preview available at http://{}", addr);
-    axum::serve(listener, router.into_make_service())
-        .await
-        .context("console server exited unexpectedly")?;
-    Ok(())
-}
-
-pub(crate) struct PerceptionExecResult {
-    success: bool,
-    perception: Option<MultiModalPerception>,
-    screenshot_base64: Option<String>,
-    stdout: String,
-    stderr: String,
-    error_message: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConsoleFixture {
-    #[serde(default)]
-    success: Option<bool>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    stdout: Option<String>,
-    #[serde(default)]
-    stderr: Option<String>,
-    #[serde(default)]
-    perception: Option<MultiModalPerception>,
-    #[serde(default)]
-    screenshot_base64: Option<String>,
-}
-
-pub(crate) async fn load_console_fixture() -> Result<Option<PerceptionExecResult>> {
-    let path = match std::env::var("SOULBROWSER_CONSOLE_FIXTURE") {
-        Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
-        Ok(_) | Err(std::env::VarError::NotPresent) => return Ok(None),
-        Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to read SOULBROWSER_CONSOLE_FIXTURE env var: {}",
-                err
-            ));
-        }
-    };
-
-    let data = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("failed to read console fixture {}", path.display()))?;
-
-    let fixture: ConsoleFixture = serde_json::from_slice(&data)
-        .with_context(|| format!("failed to parse console fixture {}", path.display()))?;
-
-    let success = fixture.success.unwrap_or(true);
-    let perception = if success {
-        Some(
-            fixture
-                .perception
-                .ok_or_else(|| anyhow::anyhow!("console fixture missing 'perception' payload"))?,
-        )
-    } else {
-        fixture.perception
-    };
-
-    let screenshot_base64 = match std::env::var("SOULBROWSER_CONSOLE_FIXTURE_SCREENSHOT") {
-        Ok(extra_path) if !extra_path.trim().is_empty() => {
-            let img_path = PathBuf::from(extra_path);
-            let bytes = tokio::fs::read(&img_path).await.with_context(|| {
-                format!(
-                    "failed to read console fixture screenshot {}",
-                    img_path.display()
-                )
-            })?;
-            Some(Base64.encode(bytes))
-        }
-        Ok(_) | Err(std::env::VarError::NotPresent) => fixture.screenshot_base64,
-        Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to read SOULBROWSER_CONSOLE_FIXTURE_SCREENSHOT env var: {}",
-                err
-            ));
-        }
-    };
-
-    let stdout = fixture
-        .stdout
-        .unwrap_or_else(|| "console fixture: perception executed".to_string());
-    let stderr = fixture.stderr.unwrap_or_default();
-
-    Ok(Some(PerceptionExecResult {
-        success,
-        perception,
-        screenshot_base64,
-        stdout,
-        stderr,
-        error_message: fixture.error,
-    }))
-}
-
-async fn cmd_serve(args: ServeArgs, _metrics_port: u16, _config: Config) -> Result<()> {
-    let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig::from_env(
-        RATE_LIMIT_CHAT_ENV,
-        RATE_LIMIT_TASK_ENV,
-        30,
-        15,
-    )));
-    spawn_rate_limit_cleanup(Arc::clone(&rate_limiter));
-    let perception_service = Arc::new(PerceptionService::new());
-    let health = Arc::new(ServeHealth::new());
-    let state = ServeState::with_health(
-        args.ws_url.clone(),
-        perception_service,
-        rate_limiter,
-        Arc::clone(&health),
-    );
-
-    state.mark_live();
-    match run_startup_readiness_checks(&state).await {
-        Ok(()) => {
-            state.mark_ready();
-            info!("Serve readiness checks passed");
-        }
-        Err(err) => {
-            state.mark_unready(err.to_string());
-            warn!(?err, "Serve readiness checks failed");
-        }
-    }
-
-    let router = build_console_router().with_state(state);
-    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind testing server on {}", addr))?;
-    info!("Testing console available at http://{}", addr);
-    if let Some(ws) = args.ws_url.as_deref() {
-        info!("Using external DevTools endpoint: {}", ws);
-    } else {
-        info!("Using local Chrome detection (SOULBROWSER_CHROME / auto-detect)");
-    }
-
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .context("testing server exited unexpectedly")?;
-    Ok(())
-}
-
-async fn run_startup_readiness_checks(state: &ServeState) -> Result<()> {
-    if let Some(ws_url) = state.ws_url.as_deref() {
-        probe_devtools_socket(ws_url).await
-    } else {
-        Ok(())
-    }
-}
-
-async fn probe_devtools_socket(ws_url: &str) -> Result<()> {
-    let url = Url::parse(ws_url).context("parsing DevTools websocket URL")?;
-    match url.scheme() {
-        "ws" | "wss" => {}
-        scheme => {
-            bail!("DevTools websocket URL must start with ws:// or wss:// (got {scheme})");
-        }
-    }
-
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow!("DevTools websocket URL missing host: {ws_url}"))?;
-    let port = url.port_or_known_default().ok_or_else(|| {
-        anyhow!("DevTools websocket URL missing port and scheme has no default: {ws_url}")
-    })?;
-
-    let target = format!("{host}:{port}");
-    timeout(Duration::from_secs(5), TcpStream::connect(target))
-        .await
-        .map_err(|_| anyhow!("timed out connecting to DevTools endpoint"))??;
-    Ok(())
-}
-
-fn spawn_rate_limit_cleanup(rate_limiter: Arc<RateLimiter>) {
-    let ttl = resolve_rate_limit_bucket_ttl();
-    if ttl.is_zero() {
-        info!("Rate limiter bucket GC disabled (ttl=0)");
-        return;
-    }
-
-    let gc_interval = resolve_rate_limit_gc_interval();
-    info!(
-        ttl_secs = ttl.as_secs(),
-        interval_secs = gc_interval.as_secs(),
-        "Rate limiter GC enabled"
-    );
-    tokio::spawn(async move {
-        let mut ticker = interval(gc_interval);
-        loop {
-            ticker.tick().await;
-            let removed = rate_limiter.prune_idle(ttl);
-            if removed > 0 {
-                debug!(removed, "pruned expired rate limit buckets");
-            }
-        }
-    });
-}
-
-fn resolve_rate_limit_bucket_ttl() -> Duration {
-    match env::var(RATE_LIMIT_BUCKET_TTL_ENV) {
-        Ok(raw) => raw
-            .trim()
-            .parse::<u64>()
-            .map(Duration::from_secs)
-            .unwrap_or_else(|err| {
-                warn!(
-                    ?err,
-                    value = raw,
-                    "invalid rate limit bucket ttl; defaulting to 600s"
-                );
-                Duration::from_secs(600)
-            }),
-        Err(env::VarError::NotPresent) => Duration::from_secs(600),
-        Err(err) => {
-            warn!(?err, "failed to read rate limit bucket ttl env");
-            Duration::from_secs(600)
-        }
-    }
-}
-
-fn resolve_rate_limit_gc_interval() -> Duration {
-    match env::var(RATE_LIMIT_GC_ENV) {
-        Ok(raw) => raw
-            .trim()
-            .parse::<u64>()
-            .map(|secs| Duration::from_secs(secs.max(5)))
-            .unwrap_or_else(|err| {
-                warn!(
-                    ?err,
-                    value = raw,
-                    "invalid rate limit GC interval; defaulting to 60s"
-                );
-                Duration::from_secs(60)
-            }),
-        Err(env::VarError::NotPresent) => Duration::from_secs(60),
-        Err(err) => {
-            warn!(?err, "failed to read rate limit GC interval env");
-            Duration::from_secs(60)
-        }
-    }
-}
-
-fn filter_artifacts(value: &Value, args: &ArtifactsArgs) -> Vec<Value> {
-    let Some(items) = value.as_array() else {
-        return Vec::new();
-    };
-
-    items
-        .iter()
-        .filter(|item| {
-            if let Some(step_id) = &args.step_id {
-                if item
-                    .get("step_id")
-                    .and_then(Value::as_str)
-                    .map(|s| s != step_id)
-                    .unwrap_or(true)
-                {
-                    return false;
-                }
-            }
-
-            if let Some(dispatch) = &args.dispatch {
-                if item
-                    .get("dispatch_label")
-                    .and_then(Value::as_str)
-                    .map(|s| s != dispatch)
-                    .unwrap_or(true)
-                {
-                    return false;
-                }
-            }
-
-            if let Some(label) = &args.label {
-                if item
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .map(|s| s != label)
-                    .unwrap_or(true)
-                {
-                    return false;
-                }
-            }
-
-            true
-        })
-        .cloned()
-        .collect()
-}
-
-async fn extract_artifacts(dir: &PathBuf, artifacts: &[Value]) -> Result<()> {
-    fs::create_dir_all(dir)
-        .await
-        .with_context(|| format!("failed to create extract directory {}", dir.display()))?;
-
-    for item in artifacts {
-        let label = item
-            .get("label")
-            .and_then(Value::as_str)
-            .unwrap_or("artifact");
-        let attempt = item.get("attempt").and_then(Value::as_u64).unwrap_or(0);
-        let step = item.get("step_index").and_then(Value::as_u64).unwrap_or(0);
-        let dispatch = item
-            .get("dispatch_label")
-            .and_then(Value::as_str)
-            .unwrap_or("action");
-        let filename_hint = item.get("filename").and_then(Value::as_str);
-        let data_base64 = item
-            .get("data_base64")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-
-        if data_base64.is_empty() {
-            continue;
-        }
-
-        let bytes = match Base64.decode(data_base64) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!("failed to decode artifact {}: {}", label, err);
-                continue;
-            }
-        };
-
-        let file_name = filename_hint
-            .map(|name| name.to_string())
-            .unwrap_or_else(|| {
-                format!("attempt{}_step{}_{}_{}.bin", attempt, step, dispatch, label)
-            });
-
-        let path = dir.join(file_name);
-        fs::write(&path, bytes)
-            .await
-            .with_context(|| format!("failed to write artifact {}", path.display()))?;
-    }
-
-    Ok(())
-}
-
-fn build_artifact_summary(items: &[Value], large_threshold: u64) -> Value {
-    let total = items.len() as u64;
-    let total_bytes: u64 = items
-        .iter()
-        .filter_map(|item| item.get("byte_len").and_then(Value::as_u64))
-        .sum();
-    let mut steps = HashSet::new();
-    let mut dispatches = HashSet::new();
-    let mut types: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-    let mut large = Vec::new();
-
-    for item in items {
-        if let Some(step) = item.get("step_id").and_then(Value::as_str) {
-            steps.insert(step.to_string());
-        }
-        if let Some(dispatch) = item.get("dispatch_label").and_then(Value::as_str) {
-            dispatches.insert(dispatch.to_string());
-        }
-        let ctype = item
-            .get("content_type")
-            .and_then(Value::as_str)
-            .unwrap_or("application/octet-stream");
-        let bytes = item.get("byte_len").and_then(Value::as_u64).unwrap_or(0);
-        let entry = types.entry(ctype.to_string()).or_insert((0, 0));
-        entry.0 += 1;
-        entry.1 += bytes;
-
-        if bytes >= large_threshold {
-            large.push(json!({
-                "step_id": item.get("step_id"),
-                "dispatch_label": item.get("dispatch_label"),
-                "label": item.get("label"),
-                "byte_len": bytes,
-                "content_type": ctype,
-                "attempt": item.get("attempt"),
-                "filename": item.get("filename"),
-            }));
-        }
-    }
-
-    let average_bytes = if total > 0 { total_bytes / total } else { 0 };
-
-    let mut steps_vec: Vec<String> = steps.into_iter().collect();
-    steps_vec.sort();
-    let mut dispatch_vec: Vec<String> = dispatches.into_iter().collect();
-    dispatch_vec.sort();
-
-    let content_types: Vec<Value> = types
-        .into_iter()
-        .map(|(ctype, (count, bytes))| {
-            json!({
-                "content_type": ctype,
-                "count": count,
-                "total_bytes": bytes,
-                "average_bytes": if count > 0 { bytes / count } else { 0 },
-            })
-        })
-        .collect();
-
-    json!({
-        "count": total,
-        "total_bytes": total_bytes,
-        "average_bytes": average_bytes,
-        "steps": steps_vec,
-        "dispatches": dispatch_vec,
-        "content_types": content_types,
-        "large_artifacts": large,
-    })
-}
-
-fn print_summary_human(summary: &Value) {
-    let count = summary.get("count").and_then(Value::as_u64).unwrap_or(0);
-    let total_bytes = summary
-        .get("total_bytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let average = summary
-        .get("average_bytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-
-    println!(
-        "Artifacts: {} ({} bytes total, avg {} bytes)",
-        count, total_bytes, average
-    );
-
-    if let Some(steps) = summary.get("steps").and_then(Value::as_array) {
-        if !steps.is_empty() {
-            let list: Vec<&str> = steps.iter().filter_map(|v| v.as_str()).collect();
-            println!("Steps: {}", list.join(", "));
-        }
-    }
-
-    if let Some(dispatches) = summary.get("dispatches").and_then(Value::as_array) {
-        if !dispatches.is_empty() {
-            let list: Vec<&str> = dispatches.iter().filter_map(|v| v.as_str()).collect();
-            println!("Dispatch labels: {}", list.join(", "));
-        }
-    }
-
-    if let Some(types) = summary.get("content_types").and_then(Value::as_array) {
-        if !types.is_empty() {
-            println!("Content types:");
-            for entry in types {
-                let ctype = entry
-                    .get("content_type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let count = entry.get("count").and_then(Value::as_u64).unwrap_or(0);
-                let bytes = entry
-                    .get("total_bytes")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let avg = entry
-                    .get("average_bytes")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                println!(
-                    "  - {}: {} artifacts ({} bytes total, avg {} bytes)",
-                    ctype, count, bytes, avg
-                );
-            }
-        }
-    }
-
-    if let Some(large) = summary.get("large_artifacts").and_then(Value::as_array) {
-        if !large.is_empty() {
-            println!("Large artifacts:");
-            for entry in large {
-                let step = entry
-                    .get("step_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let dispatch = entry
-                    .get("dispatch_label")
-                    .and_then(Value::as_str)
-                    .unwrap_or("action");
-                let label = entry
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .unwrap_or("artifact");
-                let bytes = entry.get("byte_len").and_then(Value::as_u64).unwrap_or(0);
-                println!(
-                    "  - step={} dispatch={} artifact={} ({} bytes)",
-                    step, dispatch, label, bytes
-                );
-            }
-        }
-    }
-}
-
-async fn save_summary(path: &PathBuf, summary: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create summary directory {}", parent.display()))?;
-    }
-
-    fs::write(path, serde_json::to_vec_pretty(summary)?)
-        .await
-        .with_context(|| format!("failed to write summary to {}", path.display()))?;
-    Ok(())
-}
-
-fn build_overlays(items: &[Value]) -> Value {
-    let overlays: Vec<Value> = items
-        .iter()
-        .filter(|item| {
-            item.get("content_type")
-                .and_then(Value::as_str)
-                .map(|ctype| ctype.starts_with("image/"))
-                .unwrap_or(false)
-        })
-        .map(|item| {
-            json!({
-                "step_id": item.get("step_id"),
-                "dispatch_label": item.get("dispatch_label"),
-                "label": item.get("label"),
-                "byte_len": item.get("byte_len"),
-                "content_type": item.get("content_type"),
-                "data_base64": item.get("data_base64"),
-                "filename": item.get("filename"),
-            })
-        })
-        .collect();
-
-    Value::Array(overlays)
 }
 
 async fn cmd_config(args: ConfigArgs, config: &Config) -> Result<()> {
@@ -7384,6 +6440,70 @@ async fn check_available_browsers() -> Result<Vec<String>> {
     available.push("Firefox".to_string());
 
     Ok(available)
+}
+
+pub(crate) fn resolve_llm_cache_dir(cli_override: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = cli_override {
+        return Some(path);
+    }
+
+    if let Ok(env_path) = std::env::var(LLM_CACHE_DIR_ENV) {
+        let trimmed = env_path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    dirs::cache_dir()
+        .or_else(|| dirs::home_dir())
+        .map(|dir| dir.join("soulbrowser").join("llm-cache"))
+}
+
+pub(crate) fn build_llm_cache_pool(root: Option<PathBuf>) -> Result<Option<Arc<LlmCachePool>>> {
+    let Some(path) = root else {
+        return Ok(None);
+    };
+
+    info!(path = %path.display(), "LLM cache directory prepared");
+    let pool = LlmCachePool::new(path)?;
+    Ok(Some(Arc::new(pool)))
+}
+
+pub(crate) fn normalize_tenant_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut normalized = String::with_capacity(trimmed.len());
+    let mut previous_dash = false;
+    for ch in trimmed.chars() {
+        let mapped = match ch {
+            'a'..='z' | '0'..='9' => ch,
+            'A'..='Z' => ch.to_ascii_lowercase(),
+            '-' | '_' => '-',
+            _ => '-',
+        };
+
+        let lower = mapped.to_ascii_lowercase();
+        if lower == '-' {
+            if previous_dash {
+                continue;
+            }
+            previous_dash = true;
+            normalized.push('-');
+        } else {
+            previous_dash = false;
+            normalized.push(lower);
+        }
+    }
+
+    let normalized = normalized.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 // All implementations have been moved to their respective modules:

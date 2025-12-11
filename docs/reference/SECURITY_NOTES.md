@@ -44,4 +44,18 @@ Practical guidance for running SoulBrowser securely in dev and demo environments
   permissions in shared servers (`chmod 700` on Linux, NTFS ACLs on Windows).
 - Use log rotation or `RUST_LOG` filtering to avoid dumping sensitive data in CLI output when running in CI.
 
+## 7. Serve authorization & fault injection
+- Serve enables token/IP-based auth by default. When you run `cargo run -- serve`, the CLI prints a
+  generated token (set via `--auth-token`, `SOUL_CONSOLE_TOKEN`, or `SOUL_SERVE_TOKEN`). Only requests that
+  present `x-soulbrowser-token` or `Authorization: Bearer` with a valid token and originate from the
+  whitelist (`127.0.0.1` / `::1` unless overridden by `--allow-ip`) are accepted. Set `SOUL_STRICT_AUTHZ=1`
+  (automatically set when any auth token is configured) to force the policy adapter into locked-down mode.
+- Avoid `--disable-auth` except on an isolated loopback interface. If you must expose the Serve API through
+  a tunnel/proxy, terminate TLS and revalidate tokens there.
+- Testing the self-heal pipeline no longer requires custom scripts: call
+  `POST /api/self-heal/strategies/:id/inject` (with Serve auth headers) to record a synthetic
+  `SelfHealEvent`. This triggers the webhook (`SOULBROWSER_SELF_HEAL_WEBHOOK`) and writes to the Task Stream
+  so you can verify alerting pipelines. Only expose this endpoint to trusted operators; it can flood alerts
+  if misused.
+
 Keeping these guardrails in place helps the Phase 5 “Polish & Security” checklist stay green.

@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use bitflags::bitflags;
 use perceiver_structural::AnchorDescriptor;
+use serde::{Deserialize, Serialize};
 use soulbrowser_core_types::{ActionId, ExecRoute, SoulError};
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +32,7 @@ impl ExecCtx {
 }
 
 /// Mouse button selection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MouseBtn {
     Left,
     Middle,
@@ -45,6 +46,7 @@ impl Default for MouseBtn {
 }
 
 bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub struct KeyMod: u8 {
         const CTRL = 0b0001;
         const SHIFT = 0b0010;
@@ -70,7 +72,7 @@ pub struct ClickParams {
 }
 
 /// Wait strategy after dispatching the click.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WaitTier {
     Auto,
     DomReady,

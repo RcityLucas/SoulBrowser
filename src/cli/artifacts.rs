@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tokio::fs;
 use tracing::warn;
 
-use crate::load_run_bundle;
+use super::run_bundle::load_run_bundle;
 use crate::DEFAULT_LARGE_THRESHOLD;
 
 #[derive(Args)]

@@ -4,7 +4,10 @@ use soulbrowser_core_types::TaskId;
 
 fn build_request(goal: &str) -> AgentRequest {
     let mut request = AgentRequest::new(TaskId::new(), goal.to_string());
-    request.push_tagged_user_turn(goal);
+    request.push_turn(agent_core::ConversationTurn::new(
+        agent_core::ConversationRole::User,
+        goal.to_string(),
+    ));
     request
 }
 

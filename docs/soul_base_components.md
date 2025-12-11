@@ -66,8 +66,7 @@ By default `BrowserAuthManager` will fall back to allowing a request if the rout
 
 ## Building & Testing
 
-- `cargo test auth::tests::test_browser_auth` exercises the policy and quota paths without the optional full-stack feature set.
-- `cargo test --features full-stack` (once the external dependencies are vendored) will enable the higher-level E2E suites that reference the soul-base L3/L4 crates.
+- `cargo test auth::tests::test_browser_auth` still covers the policy/quota paths. The historical `full-stack` test suite now lives under `docs/examples/legacy_code/tests/` if you need the old coverage.
 
 ## Future Enhancements
 

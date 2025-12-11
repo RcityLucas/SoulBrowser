@@ -12,6 +12,11 @@
   color: #fff;
 }
 
+.description {
+  color: #bfbfbf;
+  margin-bottom: 12px;
+}
+
 .planSteps {
   margin: 24px 0;
   padding: 16px;
@@ -26,37 +31,22 @@
   gap: 8px;
 }
 
-.policyChecks {
+.planMeta {
   margin: 24px 0;
   padding: 16px;
   background: #141414;
   border-radius: 6px;
-}
-
-.policyChecks h4 {
-  margin: 0 0 12px 0;
-  color: #fff;
-}
-
-.policyCheck {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 0;
-}
-
-.policyCheck span {
-  color: #fff;
-}
-
-.checkMessage {
-  color: #8c8c8c;
-  font-size: 12px;
-  margin-left: 8px;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .planActions {
   display: flex;
-  gap: 12px;
   justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.riskBlock :global(.ant-list-item) {
+  align-items: center;
 }

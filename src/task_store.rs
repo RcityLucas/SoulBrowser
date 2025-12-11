@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tracing::warn;
@@ -261,5 +261,84 @@ impl TaskPlanStore {
                 Ok(None)
             }
         }
+    }
+}
+
+/// Remove execution output bundles under `soulbrowser-output/tasks/<task_id>` that
+/// are older than the configured TTL.
+pub async fn prune_execution_outputs(base_dir: &Path, max_age: ChronoDuration) -> Result<usize> {
+    if max_age <= ChronoDuration::zero() {
+        return Ok(0);
+    }
+    let dir = base_dir.join("tasks");
+    if fs::metadata(&dir).await.is_err() {
+        return Ok(0);
+    }
+
+    let cutoff = Utc::now() - max_age;
+    let mut removed = 0usize;
+    let mut entries = fs::read_dir(&dir)
+        .await
+        .with_context(|| format!("reading execution output directory {}", dir.display()))?;
+
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let metadata = match entry.metadata().await {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(?err, path = %path.display(), "failed to read metadata for output directory");
+                continue;
+            }
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let modified = match metadata.modified().ok().map(DateTime::<Utc>::from) {
+            Some(value) => value,
+            None => continue,
+        };
+        if modified >= cutoff {
+            continue;
+        }
+        match fs::remove_dir_all(&path).await {
+            Ok(_) => removed += 1,
+            Err(err) => warn!(
+                ?err,
+                path = %path.display(),
+                "failed to remove expired execution output directory"
+            ),
+        }
+    }
+
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn prunes_old_execution_outputs() {
+        let tmp = tempdir().expect("temp dir");
+        let base = tmp.path();
+        let tasks_dir = base.join("tasks");
+
+        fs::create_dir_all(tasks_dir.join("old"))
+            .await
+            .expect("create old dir");
+        // Ensure the second directory has a newer modified timestamp
+        sleep(Duration::from_millis(1100)).await;
+        fs::create_dir_all(tasks_dir.join("recent"))
+            .await
+            .expect("create recent dir");
+
+        let removed = prune_execution_outputs(base, ChronoDuration::seconds(1))
+            .await
+            .expect("prune outputs");
+        assert_eq!(removed, 1);
+        assert!(!tasks_dir.join("old").exists());
+        assert!(tasks_dir.join("recent").exists());
     }
 }

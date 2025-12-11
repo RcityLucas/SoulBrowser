@@ -9,17 +9,17 @@ import DashboardPage from './components/dashboard/DashboardPage';
 
 function App() {
   return (
-    <ConfigProvider
-      locale={zhCN}
-      theme={{
-        algorithm: theme.darkAlgorithm,
-        token: {
-          colorPrimary: '#1890ff',
-          borderRadius: 6,
-        },
-      }}
-    >
-      <BrowserRouter>
+    <BrowserRouter>
+      <ConfigProvider
+        locale={zhCN}
+        theme={{
+          algorithm: theme.darkAlgorithm,
+          token: {
+            colorPrimary: '#1890ff',
+            borderRadius: 6,
+          },
+        }}
+      >
         <Routes>
           <Route path="/" element={<MainLayout />}>
             <Route index element={<Navigate to="/chat" replace />} />
@@ -29,8 +29,8 @@ function App() {
             <Route path="dashboard" element={<DashboardPage />} />
           </Route>
         </Routes>
-      </BrowserRouter>
-    </ConfigProvider>
+      </ConfigProvider>
+    </BrowserRouter>
   );
 }
 

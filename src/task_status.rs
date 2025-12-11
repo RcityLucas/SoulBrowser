@@ -96,6 +96,12 @@ pub struct AgentHistoryEntry {
     pub obstruction: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -432,21 +438,28 @@ impl TaskStatusRegistry {
     }
 
     fn emit_log(&self, task_id: &str, entry: TaskLogEntry) {
-        self.push_stream_event(task_id, TaskStreamEvent::log(entry));
+        self.push_stream_events(task_id, vec![TaskStreamEvent::log(entry)]);
     }
 
     fn emit_agent_history(&self, task_id: &str, entry: AgentHistoryEntry) {
-        self.push_stream_event(task_id, TaskStreamEvent::agent_history(entry));
+        self.push_stream_events(task_id, vec![TaskStreamEvent::agent_history(entry)]);
     }
 
     fn emit_context(&self, task_id: &str, snapshot: Value) {
-        self.push_stream_event(task_id, TaskStreamEvent::context(snapshot));
+        self.push_stream_events(task_id, vec![TaskStreamEvent::context(snapshot)]);
     }
 
-    fn emit_observation(&self, task_id: &str, artifact: Value) {
-        let payload = observation_payload_from_artifact(task_id, artifact);
-        self.run_watchdogs(task_id, &payload);
-        self.push_stream_event(task_id, TaskStreamEvent::observation(payload));
+    fn emit_observations(&self, task_id: &str, artifacts: &[Value]) {
+        if artifacts.is_empty() {
+            return;
+        }
+        let mut events = Vec::with_capacity(artifacts.len());
+        for artifact in artifacts {
+            let payload = observation_payload_from_artifact(task_id, artifact.clone());
+            self.run_watchdogs(task_id, &payload);
+            events.push(TaskStreamEvent::observation(payload));
+        }
+        self.push_stream_events(task_id, events);
     }
 
     fn run_watchdogs(&self, task_id: &str, payload: &ObservationPayload) {
@@ -491,6 +504,7 @@ impl TaskStatusRegistry {
         if items.is_empty() {
             return;
         }
+        let mut events = Vec::with_capacity(items.len());
         for item in items {
             let payload = OverlayPayload {
                 task_id: task_id.to_string(),
@@ -498,12 +512,13 @@ impl TaskStatusRegistry {
                 recorded_at: extract_recorded_at(item),
                 data: item.clone(),
             };
-            self.push_stream_event(task_id, TaskStreamEvent::overlay(payload));
+            events.push(TaskStreamEvent::overlay(payload));
         }
+        self.push_stream_events(task_id, events);
     }
 
     fn emit_annotation(&self, task_id: &str, annotation: TaskAnnotation) {
-        self.push_stream_event(task_id, TaskStreamEvent::annotation(annotation));
+        self.push_stream_events(task_id, vec![TaskStreamEvent::annotation(annotation)]);
     }
 
     fn add_alert(&self, task_id: &str, alert: TaskAlert) {
@@ -529,28 +544,41 @@ impl TaskStatusRegistry {
     }
 
     fn emit_watchdog_event(&self, task_id: &str, event: WatchdogEvent) {
-        self.push_stream_event(task_id, TaskStreamEvent::watchdog(event));
+        self.push_stream_events(task_id, vec![TaskStreamEvent::watchdog(event)]);
     }
 
     fn emit_judge_event(&self, task_id: &str, verdict: TaskJudgeVerdict) {
-        self.push_stream_event(task_id, TaskStreamEvent::judge(verdict));
+        self.push_stream_events(task_id, vec![TaskStreamEvent::judge(verdict)]);
     }
 
     fn emit_self_heal_event(&self, task_id: &str, event: SelfHealEvent) {
-        self.push_stream_event(task_id, TaskStreamEvent::self_heal(event));
+        self.push_stream_events(task_id, vec![TaskStreamEvent::self_heal(event)]);
     }
 
     fn emit_alert(&self, task_id: &str, alert: TaskAlert) {
-        self.push_stream_event(task_id, TaskStreamEvent::alert(alert.clone()));
+        self.push_stream_events(task_id, vec![TaskStreamEvent::alert(alert.clone())]);
         send_alert_webhook(task_id, &alert);
     }
 
     fn push_stream_event(&self, task_id: &str, event: TaskStreamEvent) {
-        if let Some(channel) = self.stream_channel(task_id) {
-            let envelope = {
-                let mut history = channel.history.lock();
-                history.record(event)
-            };
+        self.push_stream_events(task_id, vec![event]);
+    }
+
+    fn push_stream_events(&self, task_id: &str, events: Vec<TaskStreamEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let Some(channel) = self.stream_channel(task_id) else {
+            return;
+        };
+        let envelopes = {
+            let mut history = channel.history.lock();
+            events
+                .into_iter()
+                .map(|event| history.record(event))
+                .collect::<Vec<_>>()
+        };
+        for envelope in envelopes {
             let _ = channel.sender.send(envelope);
         }
     }
@@ -664,10 +692,7 @@ impl TaskStatusHandle {
             record.touch();
         }) {
             self.registry.emit_status(&self.task_id.0);
-            for artifact in artifacts {
-                self.registry
-                    .emit_observation(&self.task_id.0, artifact.clone());
-            }
+            self.registry.emit_observations(&self.task_id.0, artifacts);
         }
     }
 

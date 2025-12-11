@@ -17,11 +17,6 @@
 .env
 .env.*
 *.local
-config/local.env
-config/local.env.*
-config/*.env
-config/*.env.*
-config/*.secrets.*
 
 # Logs and temp files
 *.log
@@ -34,10 +29,30 @@ config/*.secrets.*
 # Rust formatter backup files
 **/*.rs.bk
 
-# JavaScript dependencies
-node_modules/
-**/node_modules/
-
 # OS-specific files
 .DS_Store
 Thumbs.db
+
+# Frontend / Node dependencies and artifacts
+node_modules/
+**/node_modules/
+**/dist/
+**/.turbo/
+**/.vite/
+**/.cache/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python virtual environments and caches
+.venv/
+venv/
+**/.venv/
+**/venv/
+__pycache__/
+*.py[cod]
+
+# Local configuration overrides
+config/*.env
+config/config.yaml

@@ -2,10 +2,15 @@ import { useState, useRef, useEffect } from 'react';
 import { Input, Button, Card, Space, Tag, Spin } from 'antd';
 import { SendOutlined, RobotOutlined, UserOutlined } from '@ant-design/icons';
 import { useChatStore } from '@/stores/chatStore';
-import { useWebSocket } from '@/hooks/useWebSocket';
 import TaskPlanCard from './TaskPlanCard';
+import ExecutionSummaryCard from './ExecutionSummaryCard';
+import ExecutionResultCard from './ExecutionResultCard';
+import BackendStatusBar from '@/components/common/BackendStatusBar';
+import { buildExecutionSummary, extractExecutionResults } from '@/utils/executionSummary';
 import TemplateSelector from './TemplateSelector';
 import styles from './ChatPage.module.css';
+import { soulbrowserAPI } from '@/api/soulbrowser';
+import type { ChatResponse } from '@/api/soulbrowser';
 
 const { TextArea } = Input;
 
@@ -14,7 +19,6 @@ export default function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { messages, isTyping, currentPlan, addMessage, setTyping, setCurrentPlan } =
     useChatStore();
-  const { send, on } = useWebSocket();
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -24,45 +28,106 @@ export default function ChatPage() {
     scrollToBottom();
   }, [messages]);
 
-  useEffect(() => {
-    const unsubscribe = on('chat_response', (response: any) => {
-      setTyping(false);
-      addMessage({
-        role: 'assistant',
-        content: response.content,
-        taskPlan: response.taskPlan,
-        suggestions: response.suggestions,
-      });
+  const deliverAssistantMessage = (response: ChatResponse) => {
+    const content =
+      response.stdout?.trim() ||
+      (response.plan ? '已生成任务计划，请查看详情。' : '任务已提交，稍后查看结果。');
 
-      if (response.taskPlan) {
-        setCurrentPlan(response.taskPlan);
-      }
+    const suggestions = Array.isArray((response.flow as any)?.suggestions)
+      ? (response.flow as any).suggestions
+      : undefined;
+
+    const executionSummary = buildExecutionSummary(
+      response.flow,
+      response.success,
+      response.stdout ?? undefined,
+      response.stderr ?? undefined
+    );
+    const executionResults = extractExecutionResults((response.flow as any)?.execution);
+
+    addMessage({
+      role: 'assistant',
+      content,
+      taskPlan: response.plan ?? undefined,
+      suggestions,
+      executionSummary,
+      executionResults,
     });
 
-    return unsubscribe;
-  }, [on, addMessage, setTyping, setCurrentPlan]);
+    if (response.plan) {
+      setCurrentPlan(response.plan);
+    }
+  };
 
-  const handleSend = () => {
-    if (!input.trim()) return;
+  const handleSend = async () => {
+    const prompt = input.trim();
+    if (!prompt) return;
 
     addMessage({
       role: 'user',
-      content: input,
-    });
-
-    send({
-      type: 'chat_message',
-      payload: { content: input },
+      content: prompt,
     });
 
     setTyping(true);
     setInput('');
+
+    try {
+      const defaultPlanner = import.meta.env.VITE_DEFAULT_PLANNER ?? 'llm';
+      const plannerPayload: Record<string, unknown> = {
+        planner: defaultPlanner,
+      };
+
+      if (defaultPlanner === 'llm') {
+        plannerPayload.llm_provider =
+          import.meta.env.VITE_DEFAULT_LLM_PROVIDER ?? 'openai';
+
+        if (import.meta.env.VITE_DEFAULT_LLM_MODEL) {
+          plannerPayload.llm_model = import.meta.env.VITE_DEFAULT_LLM_MODEL;
+        }
+        if (import.meta.env.VITE_LLM_API_BASE) {
+          plannerPayload.llm_api_base = import.meta.env.VITE_LLM_API_BASE;
+        }
+        if (import.meta.env.VITE_LLM_TEMPERATURE) {
+          const value = Number(import.meta.env.VITE_LLM_TEMPERATURE);
+          if (!Number.isNaN(value)) {
+            plannerPayload.llm_temperature = value;
+          }
+        }
+        if (import.meta.env.VITE_LLM_MAX_OUTPUT_TOKENS) {
+          const value = Number(import.meta.env.VITE_LLM_MAX_OUTPUT_TOKENS);
+          if (!Number.isNaN(value)) {
+            plannerPayload.llm_max_output_tokens = value;
+          }
+        }
+      }
+
+      const response = await soulbrowserAPI.chat({
+        prompt,
+        execute: true,
+        ...plannerPayload,
+      });
+
+      if (!response.success) {
+        throw new Error(response.stderr || '执行失败');
+      }
+
+      deliverAssistantMessage(response);
+    } catch (err) {
+      const messageText = err instanceof Error ? err.message : '请求失败';
+      addMessage({
+        role: 'assistant',
+        content: `⚠️ ${messageText}`,
+      });
+      console.error(err);
+    } finally {
+      setTyping(false);
+    }
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      void handleSend();
     }
   };
 
@@ -77,6 +142,7 @@ export default function ChatPage() {
       </div>
 
       <div className={styles.chatContainer}>
+        <BackendStatusBar className={styles.statusBar} />
         <div className={styles.messages}>
           {messages.length === 0 && (
             <div className={styles.welcome}>
@@ -101,6 +167,14 @@ export default function ChatPage() {
 
                 {message.taskPlan && (
                   <TaskPlanCard plan={message.taskPlan} className={styles.taskPlanCard} />
+                )}
+
+                {message.executionSummary && (
+                  <ExecutionSummaryCard summary={message.executionSummary} />
+                )}
+
+                {message.executionResults && message.executionResults.length > 0 && (
+                  <ExecutionResultCard results={message.executionResults} />
                 )}
 
                 {message.suggestions && message.suggestions.length > 0 && (
@@ -148,7 +222,7 @@ export default function ChatPage() {
               <Button
                 type="primary"
                 icon={<SendOutlined />}
-                onClick={handleSend}
+                onClick={() => void handleSend()}
                 disabled={!input.trim() || isTyping}
                 size="large"
               >

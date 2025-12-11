@@ -11,9 +11,9 @@ This document provides a guided tour of the SoulBrowser repository and explains 
 | `build.rs` | Build script hook (currently minimal/no-op). |
 | `config/` | Runtime configuration artifacts (see below). |
 | `docs/` | Project documentation: e.g., `soul_base_components.md` (integration overview), `project_structure.md` (this file), `l0_development_plan.md` (runtime & adapters roadmap). |
-| `examples/` | Placeholder for future examples (currently empty after removing legacy demos). |
+| `examples/` | Active automation + SDK samples (legacy Rust demos now live under `docs/examples/legacy_code/`). |
 | `src/` | Active CLI/library source code (detailed in the next section). |
-| `tests/` | Integration and smoke tests (feature-gated `full-stack` suites). |
+| `tests/` | Minimal integration tests; the former `full-stack` suites were archived under `docs/examples/legacy_code/tests/`. |
 | `target/` | Cargo build artifacts (ignored by git). |
 
 ### `config/`
@@ -47,8 +47,7 @@ This document provides a guided tour of the SoulBrowser repository and explains 
 
 ## `tests/`
 
-- `soul_base_integration_test.rs` exercises the minimal soul-base wiring (policy + start command).
-- `integration_test.rs`, `e2e_test.rs`, `stress_test.rs` are feature-gated (`--features full-stack`). They reference higher-level crates and will pass once those dependencies are reintroduced or mocked.
+Integration tests focus on the current Serve/AppContext stack. The historical `integration_test.rs`, `e2e_test.rs`, `stress_test.rs`, and `soul_base_integration_test.rs` were archived under `docs/examples/legacy_code/tests/` for reference.
 
 ## Helpful References
 

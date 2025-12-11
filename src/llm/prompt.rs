@@ -1,6 +1,8 @@
 use agent_core::{AgentPlan, AgentRequest};
 use serde_json::Value;
 
+const CAPABILITY_OVERVIEW: &str = "- Browser automation core: navigate, click, type_text (with submit), select, scroll, wait (visible/hidden/network idle).\n- Observation -> Parse -> Deliver pipeline is enforced automatically; structured outputs always flow through `data.extract-site` -> `data.parse.*` -> `data.deliver.structured`.\n- Deterministic parsers available: generic observation, market info, news brief, GitHub repositories, Twitter feed, Facebook feed, LinkedIn profile, Hacker News feed.\n- GitHub repo parsing can auto-fill the username based on recent navigation/current URL if planner forgets.\n- Planner may insert `agent.note` for inline reporting when needed.\n- The executor automatically normalizes tool aliases (e.g., browser.*) and enforces sensible waits/timeouts.\n";
+
 pub struct PromptBuilder;
 
 impl PromptBuilder {
@@ -19,6 +21,7 @@ impl PromptBuilder {
         failure_summary: Option<&str>,
     ) -> String {
         let mut sections = Vec::new();
+        sections.push(format!("System capabilities:\n{}", CAPABILITY_OVERVIEW));
         sections.push(format!("Goal: {}", request.goal.trim()));
         if let Some(primary_goal) = request.intent.primary_goal.as_ref() {
             if primary_goal.trim() != request.goal.trim() {

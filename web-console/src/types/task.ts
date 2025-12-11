@@ -31,30 +31,36 @@ export interface TaskError {
 }
 
 export interface TaskPlan {
-  id: string;
-  taskId: string;
-  steps: TaskStep[];
-  estimatedDuration: number; // in seconds
-  successProbability: number; // 0-1
-  riskLevel: 'low' | 'medium' | 'high';
-  policyChecks: PolicyCheck[];
-  createdAt: Date;
+  id?: string;
+  task_id?: string;
+  title: string;
+  description?: string;
+  created_at?: string;
+  meta?: TaskPlanMeta;
+  overlays?: any[];
+  steps: TaskPlanStep[];
 }
 
-export interface TaskStep {
+export interface TaskPlanMeta {
+  rationale?: string[];
+  risk_assessment?: string[];
+  vendor_context?: Record<string, unknown>;
+}
+
+export interface TaskPlanStep {
   id: string;
-  order: number;
-  name: string;
-  description: string;
-  tool: string;
-  parameters: Record<string, any>;
-  locator?: ElementLocator;
-  validation?: StepValidation;
-  retryStrategy?: RetryStrategy;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
-  startTime?: Date;
-  endTime?: Date;
-  error?: TaskError;
+  title: string;
+  detail?: string;
+  metadata?: Record<string, unknown>;
+  requires_approval?: boolean;
+  validations?: Record<string, unknown>[];
+  tool: TaskPlanTool;
+}
+
+export interface TaskPlanTool {
+  kind: Record<string, unknown>;
+  timeout_ms?: number | null;
+  wait?: string | null;
 }
 
 export interface ElementLocator {

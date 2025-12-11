@@ -4,24 +4,24 @@ use agent_core::AgentContext;
 use axum::{extract::ConnectInfo, response::IntoResponse, routing::post, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::agent::{execute_plan, FlowExecutionOptions, FlowExecutionReport};
-use crate::app_context::get_or_create_context;
+use crate::chat_support::{
+    apply_perception_metadata, build_chat_runner, build_telemetry_payload,
+    capture_chat_context_snapshot, flow_execution_report_payload, llm_cache_for_request,
+    perception_snapshot_value, persist_execution_outputs, propagate_browser_state_metadata,
+    sync_agent_execution_history, ChatRunnerBuild, LlmProviderConfig, LlmProviderSelection,
+    PlannerSelection,
+};
 use crate::intent::enrich_request_with_intent;
-use crate::replan::augment_request_for_replan;
+use crate::plan_payload;
 use crate::server::{rate_limit::RateLimitKind, ServeState};
 use crate::task_store::{PersistedPlanRecord, PlanOriginMetadata, PlanSource, TaskPlanStore};
 use crate::visualization::{
     build_execution_overlays, build_plan_overlays, execution_artifacts_from_report,
 };
-use crate::{
-    agent_history_prompt, apply_blocker_hints, apply_perception_metadata, build_chat_runner,
-    build_telemetry_payload, capture_chat_context_snapshot, flow_execution_report_payload,
-    latest_observation_summary, latest_obstruction_kind, llm_cache_for_request,
-    perception_snapshot_value, persist_execution_outputs, plan_payload,
-    propagate_browser_state_metadata, LlmProviderConfig, LlmProviderSelection, PlannerSelection,
-};
+use soulbrowser_scheduler::model::Priority;
 
 pub(crate) fn router() -> Router<ServeState> {
     Router::new().route("/api/chat", post(serve_chat_handler))
@@ -76,6 +76,11 @@ struct ChatResponse {
     stderr: String,
 }
 
+#[instrument(
+    name = "soul.chat.request",
+    skip(state, req),
+    fields(client_ip = %client_addr)
+)]
 async fn serve_chat_handler(
     axum::extract::State(state): axum::extract::State<ServeState>,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
@@ -108,7 +113,7 @@ async fn serve_chat_handler(
         llm_temperature,
         llm_api_key,
         llm_max_output_tokens,
-        max_replans,
+        max_replans: _max_replans,
         capture_context,
         context_timeout_secs,
         context_screenshot,
@@ -179,35 +184,8 @@ async fn serve_chat_handler(
 
     info!("chat request received");
 
-    let (storage_path, policy_paths) = {
-        let cfg = &*state.config;
-        (Some(cfg.output_dir.clone()), cfg.policy_paths.clone())
-    };
-    let app_context = match get_or_create_context(
-        state.tenant_id.clone(),
-        storage_path.clone(),
-        policy_paths.clone(),
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(err) => {
-            error!(?err, "failed to obtain app context for chat");
-            let body = ChatResponse {
-                success: false,
-                plan: None,
-                flow: None,
-                artifacts: None,
-                context: None,
-                stdout: String::new(),
-                stderr: format!("context error: {err}"),
-            };
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(body),
-            )
-                .into_response();
-        }
+    let app_context = match state.app_context().await {
+        ctx => ctx,
     };
     let plugin_registry = app_context.plugin_registry();
 
@@ -276,14 +254,14 @@ async fn serve_chat_handler(
         max_output_tokens: llm_max_output_tokens,
     };
 
-    let runner = match build_chat_runner(
+    let runner_build = match build_chat_runner(
         planner_choice,
         llm_choice,
         llm_config,
         cache_for_request,
         Some(plugin_registry.clone()),
     ) {
-        Ok(runner) => runner,
+        Ok(build) => build,
         Err(err) => {
             error!(?err, "failed to configure chat runner");
             let body = ChatResponse {
@@ -302,6 +280,14 @@ async fn serve_chat_handler(
                 .into_response();
         }
     };
+    let ChatRunnerBuild {
+        runner,
+        planner_used: actual_planner,
+        provider_used: actual_llm_provider,
+        fallback_reason,
+    } = runner_build;
+    let fallback_warning = fallback_reason.clone();
+
     let constraint_list = constraints.unwrap_or_default();
     if constraint_list.len() > 10 {
         let body = ChatResponse {
@@ -336,6 +322,11 @@ async fn serve_chat_handler(
         },
         constraint_list,
     );
+    if let Some(note) = fallback_warning.as_ref() {
+        agent_request
+            .metadata
+            .insert("planner_warning".to_string(), Value::String(note.clone()));
+    }
     propagate_browser_state_metadata(&mut agent_request, context_snapshot.as_ref());
     enrich_request_with_intent(&mut agent_request, trimmed_prompt);
 
@@ -365,10 +356,9 @@ async fn serve_chat_handler(
     let mut plan_history = vec![plan_payload(&current_session)];
 
     let plan_origin = PlanOriginMetadata {
-        planner: planner_choice.label().to_string(),
-        llm_provider: matches!(planner_choice, PlannerSelection::Llm)
-            .then(|| llm_choice.unwrap_or_default().label().to_string()),
-        llm_model: llm_model_for_origin.clone(),
+        planner: actual_planner.label().to_string(),
+        llm_provider: actual_llm_provider.map(|p| p.label().to_string()),
+        llm_model: actual_llm_provider.and_then(|_| llm_model_for_origin.clone()),
     };
 
     match PersistedPlanRecord::from_session(
@@ -397,6 +387,9 @@ async fn serve_chat_handler(
         current_session.plan.steps.len()
     )];
     let mut stderr_lines: Vec<String> = Vec::new();
+    if let Some(note) = fallback_warning {
+        stderr_lines.push(note);
+    }
     let mut success = true;
     let mut last_execution_report: Option<FlowExecutionReport> = None;
     let mut execution_reports: Vec<FlowExecutionReport> = Vec::new();
@@ -413,118 +406,43 @@ async fn serve_chat_handler(
         if context_snapshot.is_some() {
             handle.set_context_snapshot(context_snapshot.clone());
         }
-        let max_replans = max_replans.unwrap_or(0) as u32;
-        let mut attempt = 0u32;
+        handle.mark_running();
+
         let heal_registry = app_context.self_heal_registry();
-        let base_exec_options = FlowExecutionOptions {
+        let exec_options = FlowExecutionOptions {
             max_retries: 1u8.saturating_add(heal_registry.auto_retry_extra_attempts()),
-            progress: Some(handle.clone()),
-            self_heal: Some(heal_registry),
-            plugin_registry: Some(plugin_registry.clone()),
-            ..FlowExecutionOptions::default()
+            priority: Priority::Standard,
         };
 
-        loop {
-            match execute_plan(
-                app_context.clone(),
-                &exec_request,
-                &current_session.plan,
-                base_exec_options.clone(),
-            )
-            .await
-            {
-                Ok(report) => {
-                    execution_reports.push(report.clone());
-                    let overlays = build_execution_overlays(&report.steps);
-                    handle.push_execution_overlays(overlays);
-                    stdout_lines.push(format!(
-                        "Execution attempt {} {}",
-                        attempt + 1,
-                        if report.success {
-                            "succeeded"
-                        } else {
-                            "failed"
-                        }
-                    ));
-                    last_execution_report = Some(report.clone());
+        match execute_plan(
+            app_context.clone(),
+            &exec_request,
+            &current_session.plan,
+            exec_options,
+        )
+        .await
+        {
+            Ok(report) => {
+                execution_reports.push(report.clone());
+                sync_agent_execution_history(&handle, &report);
+                let overlays = build_execution_overlays(&report.steps);
+                handle.push_execution_overlays(overlays);
+                stdout_lines.push(format!(
+                    "Execution {}",
                     if report.success {
-                        success = true;
-                        break;
+                        "succeeded"
                     } else {
-                        success = false;
+                        "failed"
                     }
-
-                    if attempt >= max_replans {
-                        stderr_lines.push("Plan execution failed".to_string());
-                        break;
-                    }
-
-                    let observation_summary =
-                        latest_observation_summary(&task_status_registry, &exec_request.task_id);
-                    let obstruction_kind =
-                        latest_obstruction_kind(&task_status_registry, &exec_request.task_id);
-                    let agent_history_section =
-                        agent_history_prompt(&task_status_registry, &exec_request.task_id, 6);
-                    let Some((updated_request, mut failure_summary)) = augment_request_for_replan(
-                        &exec_request,
-                        &report,
-                        attempt,
-                        observation_summary.as_deref(),
-                        obstruction_kind.as_deref(),
-                        agent_history_section.as_deref(),
-                    ) else {
-                        stderr_lines.push("Plan execution failed".to_string());
-                        break;
-                    };
-                    if let Some(kind) = obstruction_kind.as_deref() {
-                        failure_summary.push_str(&format!(" Blocker classification: {kind}."));
-                    }
-
-                    stdout_lines.push(format!(
-                        "Replanning after attempt {}: {}",
-                        attempt + 1,
-                        failure_summary
-                    ));
-
-                    exec_request = updated_request;
-                    apply_blocker_hints(&mut exec_request, obstruction_kind.as_deref());
-                    match runner
-                        .replan(
-                            exec_request.clone(),
-                            &current_session.plan,
-                            &failure_summary,
-                        )
-                        .await
-                    {
-                        Ok(next_session) => {
-                            current_session = next_session;
-                            plan_history.push(plan_payload(&current_session));
-                            handle.update_plan(
-                                current_session.plan.title.clone(),
-                                current_session.plan.steps.len(),
-                            );
-                            handle.set_plan_overlays(build_plan_overlays(&current_session.plan));
-                            stdout_lines.push(format!(
-                                "Generated revised plan with {} step(s)",
-                                current_session.plan.steps.len()
-                            ));
-                        }
-                        Err(err) => {
-                            success = false;
-                            error!(?err, "replanning failed");
-                            stderr_lines.push(format!("replan error: {err}"));
-                            break;
-                        }
-                    }
-
-                    attempt += 1;
-                }
-                Err(err) => {
-                    success = false;
-                    error!(?err, "plan execution failed");
-                    stderr_lines.push(format!("execution error: {err}"));
-                    break;
-                }
+                ));
+                last_execution_report = Some(report.clone());
+                success = report.success;
+            }
+            Err(err) => {
+                success = false;
+                error!(?err, "plan execution failed");
+                handle.mark_failure(Some(err.to_string()));
+                stderr_lines.push(format!("execution error: {err}"));
             }
         }
 

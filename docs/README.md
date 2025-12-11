@@ -29,8 +29,8 @@ Use this index to jump to the right part of the knowledge base and avoid hunting
   - `reference/schemas/*.json` – JSON Schema definitions consumed by `data.deliver.structured`.
 
 ## Examples & Tooling
-- `examples/` – Minimal CLI demos (disable/enable via `legacy-examples` feature flag).
-- `scripts/` – Local maintenance helpers (cleanup, profile reset, dev checks); see script headers for supported platforms.
+- `examples/` – Active automation + SDK samples; see `examples/README.md` for the curated list and `docs/examples/legacy_examples.md` for the archived demos.
+- `scripts/` – Local maintenance helpers (cleanup, profile reset, dev checks); headers call out support status. Legacy helpers are cataloged alongside the demos in `docs/examples/legacy_examples.md`.
 
 ## Archive
 - `ARCHIVE/` – Legacy docs that remain for historical reference.

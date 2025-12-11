@@ -41,3 +41,20 @@ intents:
       consent_gate: accept_google_consent
       captcha: require_manual_captcha
       blank_page: auto_retry
+
+  collect_example_products:
+    triggers:
+      - "example.com"
+      - "产品列表"
+      - "采集产品"
+    primary_goal: "从 example.com 采集产品列表，包括产品名称、价格、图片链接"
+    primary_sites:
+      - "https://example.com"
+    output:
+      schema: marketplace_products_v1.json
+      include_screenshot: false
+      description: "Array of {name,price,image_url,product_url}"
+    preferred_language: zh-CN
+    blockers:
+      captcha: require_manual_captcha
+      blank_page: auto_retry

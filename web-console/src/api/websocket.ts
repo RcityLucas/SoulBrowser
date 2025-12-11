@@ -2,7 +2,7 @@
  * WebSocket Client for real-time communication
  */
 
-import type { WebSocketMessage, ClientMessage, ServerMessage, MessageType } from '@/types';
+import type { WebSocketMessage, ClientMessage } from '@/types';
 
 type EventListener<T = any> = (data: T) => void;
 
@@ -13,7 +13,7 @@ export class WebSocketClient {
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number = 10;
   private heartbeatInterval: number = 30000;
-  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private listeners: Map<string, Set<EventListener>> = new Map();
   private isManualClose: boolean = false;
 

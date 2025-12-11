@@ -4,6 +4,11 @@
 //! Provides browser automation tools using soulbase-tools
 
 use crate::errors::SoulBrowserError;
+use crate::parsers::{
+    parse_facebook_feed, parse_github_repos, parse_hackernews_feed, parse_linkedin_profile,
+    parse_market_info, parse_news_brief, parse_twitter_feed,
+};
+use crate::structured_output::validate_structured_output;
 use action_primitives::{
     ActionPrimitives, AnchorDescriptor, DefaultActionPrimitives, DefaultWaitStrategy, ExecCtx,
     ScrollBehavior, ScrollTarget, SelectMethod, WaitCondition, WaitTier,
@@ -11,8 +16,10 @@ use action_primitives::{
 use cdp_adapter::{event_bus, Cdp, CdpAdapter, CdpConfig};
 use dashmap::DashMap;
 use l6_observe::{guard::LabelMap as ObsLabelMap, metrics as obs_metrics, tracing as obs_tracing};
+use once_cell::sync::Lazy;
 use schemars::schema::{RootSchema, SchemaObject};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use soulbase_tools::{
     manifest::{
         CapabilityDecl, ConcurrencyKind, ConsentPolicy, IdempoKind, Limits, SafetyClass,
@@ -24,15 +31,37 @@ use soulbase_tools::{
 use soulbase_types::tenant::TenantId;
 use soulbrowser_core_types::{ExecRoute, FrameId, PageId, SessionId};
 use soulbrowser_policy_center::{default_snapshot, PolicyView};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::fs;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const METRIC_TOOL_INVOCATIONS: &str = "soul.l5.tool.invocations";
 const METRIC_TOOL_LATENCY: &str = "soul.l5.tool.latency_ms";
+const DEFAULT_TOOL_TIMEOUT_MS: u64 = 30_000;
+const PAGE_OBSERVE_SCRIPT: &str = include_str!("scripts/page_observe.js");
+const DATA_PARSE_TOOLS: &[(&str, &str)] = &[
+    ("data.parse.generic", "Parse generic observation snapshot"),
+    ("data.parse.market_info", "Parse market index snapshot"),
+    ("data.parse.news_brief", "Parse news brief"),
+    ("data.parse.twitter-feed", "Parse Twitter/X feed"),
+    ("data.parse.facebook-feed", "Parse Facebook feed"),
+    ("data.parse.hackernews-feed", "Parse Hacker News feed"),
+    ("data.parse.linkedin-profile", "Parse LinkedIn profile"),
+    ("data.parse.github-repo", "Parse GitHub repositories"),
+];
+
+static OBSERVATION_CACHE: Lazy<DashMap<String, ObservationEntry>> = Lazy::new(|| DashMap::new());
+
+#[derive(Clone, Debug)]
+struct ObservationEntry {
+    data: Value,
+    parsed: HashMap<String, Value>,
+}
 
 /// Browser tool manager using soulbase-tools
 pub struct BrowserToolManager {
@@ -220,6 +249,49 @@ impl BrowserToolManager {
         Ok(())
     }
 
+    /// Register observation tool
+    pub async fn register_observation_tool(&self) -> Result<(), SoulBrowserError> {
+        let manifest = create_observation_tool("data.extract-site");
+
+        self.registry
+            .upsert(&self.tenant, manifest)
+            .await
+            .map_err(|e| {
+                SoulBrowserError::internal(&format!("Failed to register observation tool: {}", e))
+            })?;
+
+        Ok(())
+    }
+
+    /// Register structured parse tools
+    pub async fn register_data_parse_tools(&self) -> Result<(), SoulBrowserError> {
+        for (id, _) in DATA_PARSE_TOOLS {
+            let manifest = create_parse_tool(id);
+            self.registry
+                .upsert(&self.tenant, manifest)
+                .await
+                .map_err(|e| {
+                    SoulBrowserError::internal(&format!(
+                        "Failed to register parse tool {}: {}",
+                        id, e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Register structured delivery tool
+    pub async fn register_deliver_tool(&self) -> Result<(), SoulBrowserError> {
+        let manifest = create_deliver_tool("data.deliver.structured");
+        self.registry
+            .upsert(&self.tenant, manifest)
+            .await
+            .map_err(|e| {
+                SoulBrowserError::internal(&format!("Failed to register deliver tool: {}", e))
+            })?;
+        Ok(())
+    }
+
     /// Register legacy tool aliases for backward compatibility
     pub async fn register_legacy_aliases(&self) -> Result<(), SoulBrowserError> {
         let legacy_ids = [
@@ -279,6 +351,9 @@ impl BrowserToolManager {
         self.register_take_screenshot_tool().await?;
         self.register_complete_task_tool().await?;
         self.register_report_insight_tool().await?;
+        self.register_observation_tool().await?;
+        self.register_data_parse_tools().await?;
+        self.register_deliver_tool().await?;
         self.register_legacy_aliases().await?;
 
         Ok(())
@@ -317,7 +392,7 @@ impl BrowserToolManager {
         subject_id: &str,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, SoulBrowserError> {
-        self.execute_with_route(tool_id, subject_id, input, None)
+        self.execute_with_route(tool_id, subject_id, input, None, None)
             .await
     }
 
@@ -328,6 +403,7 @@ impl BrowserToolManager {
         subject_id: &str,
         input: serde_json::Value,
         route: Option<ExecRoute>,
+        timeout_ms: Option<u64>,
     ) -> Result<serde_json::Value, SoulBrowserError> {
         // Check if tool exists
         let id = ToolId(tool_id.to_string());
@@ -345,12 +421,13 @@ impl BrowserToolManager {
         }
 
         // Create execution context
+        let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT_MS);
         let context = ToolExecutionContext {
             tool_id: tool_id.to_string(),
             tenant_id: self.tenant.0.clone(),
             subject_id: subject_id.to_string(),
             input,
-            timeout_ms: 30000,
+            timeout_ms: effective_timeout,
             trace_id: uuid::Uuid::new_v4().to_string(),
             route,
         };
@@ -792,6 +869,117 @@ fn create_take_screenshot_tool(id: &str) -> ToolManifest {
     }
 }
 
+fn create_observation_tool(id: &str) -> ToolManifest {
+    ToolManifest {
+        id: ToolId(id.to_string()),
+        version: "1.0.0".to_string(),
+        display_name: "Capture Page Observation".to_string(),
+        description: "Capture DOM/text snapshot for downstream parsing".to_string(),
+        tags: vec!["data".to_string(), "observe".to_string()],
+        input_schema: create_simple_schema(),
+        output_schema: create_simple_schema(),
+        scopes: vec!["browser:read".to_string()],
+        capabilities: vec![CapabilityDecl {
+            domain: "browser".to_string(),
+            action: "observe".to_string(),
+            resource: "*".to_string(),
+            attrs: Value::Null,
+        }],
+        side_effect: SideEffect::Read,
+        safety_class: SafetyClass::Low,
+        consent: ConsentPolicy {
+            required: false,
+            max_ttl_ms: None,
+        },
+        limits: Limits {
+            timeout_ms: 30_000,
+            max_bytes_in: 4 * 1024,
+            max_bytes_out: 2 * 1024 * 1024,
+            max_files: 0,
+            max_depth: 0,
+            max_concurrency: 1,
+        },
+        idempotency: IdempoKind::Keyed,
+        concurrency: ConcurrencyKind::Queue,
+    }
+}
+
+fn create_parse_tool(id: &str) -> ToolManifest {
+    let description = DATA_PARSE_TOOLS
+        .iter()
+        .find(|(tool_id, _)| *tool_id == id)
+        .map(|(_, desc)| *desc)
+        .unwrap_or("Parse structured observation data");
+
+    ToolManifest {
+        id: ToolId(id.to_string()),
+        version: "1.0.0".to_string(),
+        display_name: format!("{}", id.replace("data.parse.", "Parse ")),
+        description: description.to_string(),
+        tags: vec!["data".to_string(), "parse".to_string()],
+        input_schema: create_simple_schema(),
+        output_schema: create_simple_schema(),
+        scopes: vec!["data:read".to_string()],
+        capabilities: vec![CapabilityDecl {
+            domain: "data".to_string(),
+            action: "parse".to_string(),
+            resource: id.to_string(),
+            attrs: Value::Null,
+        }],
+        side_effect: SideEffect::Read,
+        safety_class: SafetyClass::Low,
+        consent: ConsentPolicy {
+            required: false,
+            max_ttl_ms: None,
+        },
+        limits: Limits {
+            timeout_ms: 15_000,
+            max_bytes_in: 2 * 1024 * 1024,
+            max_bytes_out: 512 * 1024,
+            max_files: 0,
+            max_depth: 0,
+            max_concurrency: 2,
+        },
+        idempotency: IdempoKind::Keyed,
+        concurrency: ConcurrencyKind::Parallel,
+    }
+}
+
+fn create_deliver_tool(id: &str) -> ToolManifest {
+    ToolManifest {
+        id: ToolId(id.to_string()),
+        version: "1.0.0".to_string(),
+        display_name: "Deliver Structured Artifact".to_string(),
+        description: "Persist structured data to the artifacts directory".to_string(),
+        tags: vec!["data".to_string(), "deliver".to_string()],
+        input_schema: create_simple_schema(),
+        output_schema: create_simple_schema(),
+        scopes: vec!["data:write".to_string()],
+        capabilities: vec![CapabilityDecl {
+            domain: "data".to_string(),
+            action: "deliver".to_string(),
+            resource: "structured".to_string(),
+            attrs: Value::Null,
+        }],
+        side_effect: SideEffect::Write,
+        safety_class: SafetyClass::Low,
+        consent: ConsentPolicy {
+            required: false,
+            max_ttl_ms: None,
+        },
+        limits: Limits {
+            timeout_ms: 20_000,
+            max_bytes_in: 2 * 1024 * 1024,
+            max_bytes_out: 64 * 1024,
+            max_files: 2,
+            max_depth: 0,
+            max_concurrency: 1,
+        },
+        idempotency: IdempoKind::Keyed,
+        concurrency: ConcurrencyKind::Queue,
+    }
+}
+
 /// Create a simple schema for tool manifests
 fn create_simple_schema() -> RootSchema {
     let mut schema = RootSchema::default();
@@ -1053,6 +1241,262 @@ impl BrowserToolExecutor {
                     other
                 ),
             )),
+        }
+    }
+
+    async fn execute_observation_tool(
+        &self,
+        context: &ToolExecutionContext,
+        start: Instant,
+        span: &tracing::Span,
+        exec_ctx: ExecCtx,
+    ) -> Result<ToolExecutionResult, SoulBrowserError> {
+        self.ensure_adapter_started().await?;
+        let page_id = self.resolve_page_for_route(&exec_ctx.route).await?;
+        let raw = self
+            .adapter
+            .evaluate_script(page_id, PAGE_OBSERVE_SCRIPT)
+            .await
+            .map_err(|err| {
+                self.record_error(context, start, span);
+                SoulBrowserError::internal(&format!("Observation script failed: {}", err))
+            })?;
+
+        let ok = raw.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ok {
+            let reason = raw
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            self.record_error(context, start, span);
+            return Err(SoulBrowserError::internal(&format!(
+                "Observation script reported failure: {}",
+                reason
+            )));
+        }
+
+        let data_value = raw.get("data").cloned().unwrap_or(Value::Null);
+        OBSERVATION_CACHE.insert(
+            context.subject_id.clone(),
+            ObservationEntry {
+                data: data_value.clone(),
+                parsed: HashMap::new(),
+            },
+        );
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("subject_id".to_string(), json!(context.subject_id.clone()));
+        let output = ToolExecutionResult {
+            success: true,
+            output: Some(json!({
+                "status": "captured",
+                "observation": data_value,
+                "preview": raw.get("preview").cloned(),
+            })),
+            error: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+            metadata,
+        };
+        Ok(self.finish_tool(context, start, span, output))
+    }
+
+    async fn execute_parse_tool(
+        &self,
+        context: &ToolExecutionContext,
+        start: Instant,
+        span: &tracing::Span,
+        tool_id: &str,
+    ) -> Result<ToolExecutionResult, SoulBrowserError> {
+        let mut entry = OBSERVATION_CACHE
+            .get_mut(&context.subject_id)
+            .ok_or_else(|| {
+                SoulBrowserError::internal(
+                    "No observation available for this route; run data.extract-site first",
+                )
+            })?;
+
+        let (schema, parsed) = self
+            .run_data_parser(tool_id, &entry.data, &context.input)
+            .map_err(|err| {
+                self.record_error(context, start, span);
+                err
+            })?;
+        entry.parsed.insert(schema.clone(), parsed.clone());
+        drop(entry);
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("schema".into(), json!(schema.clone()));
+        let result = ToolExecutionResult {
+            success: true,
+            output: Some(json!({
+                "status": "parsed",
+                "schema": schema,
+                "result": parsed,
+            })),
+            error: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+            metadata,
+        };
+        Ok(self.finish_tool(context, start, span, result))
+    }
+
+    async fn execute_deliver_tool(
+        &self,
+        context: &ToolExecutionContext,
+        start: Instant,
+        span: &tracing::Span,
+    ) -> Result<ToolExecutionResult, SoulBrowserError> {
+        let schema = context
+            .input
+            .get("schema")
+            .and_then(|v| v.as_str())
+            .unwrap_or("generic_observation_v1");
+        let mut entry = OBSERVATION_CACHE
+            .get_mut(&context.subject_id)
+            .ok_or_else(|| {
+                SoulBrowserError::internal(
+                    "No parsed observation available; parse before delivering",
+                )
+            })?;
+        let parsed_value = entry
+            .parsed
+            .get(schema)
+            .or_else(|| entry.parsed.values().next())
+            .cloned()
+            .ok_or_else(|| {
+                SoulBrowserError::internal(
+                    "Missing parsed data for requested schema; ensure data.parse.* ran",
+                )
+            })?;
+        drop(entry);
+
+        validate_structured_output(schema, &parsed_value).map_err(|err| {
+            self.record_error(context, start, span);
+            SoulBrowserError::validation_error("Invalid structured output", &err.to_string())
+        })?;
+
+        let task_id = context
+            .input
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("anonymous");
+        let artifact_label = context
+            .input
+            .get("artifact_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("structured");
+        let filename = context
+            .input
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("{}_{}.json", artifact_label, schema)));
+
+        let root = PathBuf::from("soulbrowser-output")
+            .join("artifacts")
+            .join(task_id);
+        fs::create_dir_all(&root).await.map_err(|err| {
+            SoulBrowserError::internal(&format!("Failed to prepare artifact dir: {}", err))
+        })?;
+        let artifact_path = root.join(&filename);
+        let payload = serde_json::to_vec_pretty(&parsed_value).map_err(|err| {
+            SoulBrowserError::internal(&format!("Failed to serialize structured output: {}", err))
+        })?;
+        fs::write(&artifact_path, payload).await.map_err(|err| {
+            SoulBrowserError::internal(&format!("Failed to write structured artifact: {}", err))
+        })?;
+        OBSERVATION_CACHE.remove(&context.subject_id);
+
+        let artifact_path_str = artifact_path.to_string_lossy().to_string();
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("schema".into(), json!(schema));
+        metadata.insert("artifact_path".into(), json!(artifact_path_str.clone()));
+
+        let result = ToolExecutionResult {
+            success: true,
+            output: Some(json!({
+                "status": "delivered",
+                "schema": schema,
+                "artifact_path": artifact_path_str,
+            })),
+            error: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+            metadata,
+        };
+        Ok(self.finish_tool(context, start, span, result))
+    }
+
+    fn run_data_parser(
+        &self,
+        tool_id: &str,
+        observation: &Value,
+        payload: &Value,
+    ) -> Result<(String, Value), SoulBrowserError> {
+        match tool_id {
+            "data.parse.generic" => {
+                let schema = payload
+                    .get("schema")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("generic_observation_v1");
+                Ok((
+                    schema.to_string(),
+                    parse_generic_observation(observation, schema),
+                ))
+            }
+            "data.parse.market_info" => parse_market_info(observation)
+                .map(|value| ("market_info_v1".to_string(), value))
+                .map_err(|err| {
+                    SoulBrowserError::internal(&format!("Parse market info failed: {}", err))
+                }),
+            "data.parse.news_brief" => parse_news_brief(observation)
+                .map(|value| ("news_brief_v1".to_string(), value))
+                .map_err(|err| {
+                    SoulBrowserError::internal(&format!("Parse news brief failed: {}", err))
+                }),
+            "data.parse.twitter-feed" => parse_twitter_feed(observation)
+                .map(|value| ("twitter_feed_v1".to_string(), value))
+                .map_err(|err| {
+                    SoulBrowserError::internal(&format!("Parse twitter feed failed: {}", err))
+                }),
+            "data.parse.facebook-feed" => parse_facebook_feed(observation)
+                .map(|value| ("facebook_feed_v1".to_string(), value))
+                .map_err(|err| {
+                    SoulBrowserError::internal(&format!("Parse facebook feed failed: {}", err))
+                }),
+            "data.parse.hackernews-feed" => parse_hackernews_feed(observation)
+                .map(|value| ("hackernews_feed_v1".to_string(), value))
+                .map_err(|err| {
+                    SoulBrowserError::internal(&format!("Parse hackernews feed failed: {}", err))
+                }),
+            "data.parse.linkedin-profile" => parse_linkedin_profile(observation)
+                .map(|value| ("linkedin_profile_v1".to_string(), value))
+                .map_err(|err| {
+                    SoulBrowserError::internal(&format!("Parse linkedin profile failed: {}", err))
+                }),
+            "data.parse.github-repo" => {
+                let username = payload
+                    .get("username")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if username.trim().is_empty() {
+                    return Err(SoulBrowserError::validation_error(
+                        "Missing field",
+                        "'username' is required for data.parse.github-repo",
+                    ));
+                }
+                parse_github_repos(observation, username)
+                    .map(|value| ("github_repos_v1".to_string(), value))
+                    .map_err(|err| {
+                        SoulBrowserError::internal(&format!(
+                            "Parse github repositories failed: {}",
+                            err
+                        ))
+                    })
+            }
+            other => Err(SoulBrowserError::internal(&format!(
+                "Unknown parse tool '{}'; supported tools must be registered",
+                other
+            ))),
         }
     }
 
@@ -1801,6 +2245,17 @@ impl ToolExecutor for BrowserToolExecutor {
                 let result = self.finish_tool(&context, start, &span, result);
                 Ok(result)
             }
+            "data.extract-site" => {
+                return self
+                    .execute_observation_tool(&context, start, &span, exec_ctx)
+                    .await;
+            }
+            tool if tool.starts_with("data.parse.") => {
+                return self.execute_parse_tool(&context, start, &span, tool).await;
+            }
+            "data.deliver.structured" => {
+                return self.execute_deliver_tool(&context, start, &span).await;
+            }
             other => {
                 let result = ToolExecutionResult {
                     success: false,
@@ -1818,6 +2273,26 @@ impl ToolExecutor for BrowserToolExecutor {
     fn cdp_adapter(&self) -> Option<Arc<CdpAdapter>> {
         Some(self.adapter.clone())
     }
+}
+
+fn parse_generic_observation(observation: &Value, schema: &str) -> Value {
+    let data = observation.get("data").unwrap_or(observation);
+    let url = data.get("url").and_then(|v| v.as_str());
+    let title = data.get("title").and_then(|v| v.as_str());
+    let text_sample = data
+        .get("text_sample")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let summary: String = text_sample.chars().take(480).collect();
+
+    json!({
+        "schema": schema,
+        "source_url": url,
+        "captured_at": data.get("fetched_at").and_then(|v| v.as_str()),
+        "title": title,
+        "summary": summary,
+        "text_sample": text_sample,
+    })
 }
 
 #[cfg(test)]

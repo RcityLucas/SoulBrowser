@@ -77,7 +77,7 @@ pub struct SelfHealRegistry {
     config_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SelfHealRegistryStats {
     pub total_strategies: usize,
     pub enabled_strategies: usize,
@@ -141,6 +141,19 @@ impl SelfHealRegistry {
             strategy_id: id.to_string(),
             action: if enabled { "enabled" } else { "disabled" }.to_string(),
             note: None,
+        });
+        Ok(())
+    }
+
+    pub fn inject_event(&self, id: &str, note: Option<String>) -> Result<(), SelfHealError> {
+        if self.strategy(id).is_none() {
+            return Err(SelfHealError::UnknownStrategy(id.to_string()));
+        }
+        record_event(SelfHealEvent {
+            timestamp: Utc::now().timestamp_millis(),
+            strategy_id: id.to_string(),
+            action: "injected".to_string(),
+            note,
         });
         Ok(())
     }
@@ -217,6 +230,28 @@ fn trigger_webhook(url: String, event: SelfHealEvent) {
 impl Default for SelfHealRegistry {
     fn default() -> Self {
         Self::new(None, default_strategies())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_event_validates_strategy() {
+        let registry = SelfHealRegistry::default();
+        assert!(registry.inject_event("missing", None).is_err());
+        assert!(registry
+            .inject_event("auto_retry", Some("fault injection".into()))
+            .is_ok());
+    }
+
+    #[test]
+    fn config_file_parses() {
+        let registry =
+            SelfHealRegistry::load_from_path(Some(PathBuf::from("config/self_heal.yaml")))
+                .expect("self-heal config should parse");
+        assert!(!registry.strategies().is_empty());
     }
 }
 

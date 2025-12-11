@@ -4,14 +4,12 @@ strategies:
     enabled: true
     tags: [stability, retry]
     telemetry_label: auto_retry
-    action:
-      type: auto_retry
+    action: !AutoRetry
       extra_attempts: 1
   - id: human_confirmation
     description: Escalate terminal failures for human confirmation.
     enabled: false
     tags: [escalation, approval]
     telemetry_label: human_confirm
-    action:
-      type: human_approval
+    action: !HumanApproval
       severity: warn

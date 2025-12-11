@@ -137,7 +137,7 @@
 - `docs/PRODUCT_COMPLETION_PLAN.md`：基础能力交付计划（现已发布）。
 - `docs/AI_BROWSER_EXPERIENCE_PLAN.md`：本文件，覆盖 AI 浏览体验。
 - 后续需新增：
-  - `docs/agent/` —— Prompt 模板、计划 Schema、模型适配、Browser Use 差距追踪。
+  - `docs/plans/ARCHIVE/` —— Legacy Prompt 模板、计划 Schema、模型适配、Browser Use 差距追踪文档（仅供参考）。
   - `docs/ui/` —— 控制台 IA、视觉高亮、组件规范、Browser Use UI 模式对齐。
   - `docs/plugins/` —— Manifest 规范、审核流程、REST/SDK 文档、生态差距追踪。
   - `L8 Agent 与体验（Agent & Experience）` —— 分阶段技术实现与逻辑规约文档。

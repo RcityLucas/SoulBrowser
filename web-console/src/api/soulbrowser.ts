@@ -93,19 +93,31 @@ export interface ChatResponse {
 
 export interface TaskSummary {
   task_id: string;
-  total_dispatches: number;
-  success_count: number;
-  failure_count: number;
-  last_status?: string | null;
-  last_tool?: string | null;
-  last_error?: string | null;
-  last_recorded_at?: string | null;
-  prompt?: string | null;
-  created_at?: string | null;
-  source?: string | null;
+  prompt: string;
+  created_at: string;
+  source: string;
+  path: string;
   planner?: string | null;
   llm_provider?: string | null;
   llm_model?: string | null;
+}
+
+export interface PersistedPlanRecord {
+  version: number;
+  task_id: string;
+  prompt: string;
+  created_at: string;
+  source: string;
+  plan: any;
+  flow: Record<string, unknown>;
+  explanations: string[];
+  summary: string[];
+  constraints: string[];
+  current_url?: string | null;
+  planner: string;
+  llm_provider?: string | null;
+  llm_model?: string | null;
+  context_snapshot?: ContextSnapshot | null;
 }
 
 export interface TaskStatusSnapshot {
@@ -148,6 +160,9 @@ export interface AgentHistoryEntry {
   observation_summary?: string | null;
   obstruction?: string | null;
   structured_summary?: string | null;
+  tool_kind?: string | null;
+  wait_ms?: number | null;
+  run_ms?: number | null;
 }
 
 export interface WatchdogEvent {
@@ -219,10 +234,12 @@ export interface PersistedPlanRecord {
 
 export interface TaskDetailResponse {
   success: boolean;
-  summary: TaskSummary;
-  dispatches: TaskDispatchSummary[];
-  plan?: PersistedPlanRecord | null;
-  annotations?: TaskAnnotation[];
+  task: any;
+}
+
+export interface TaskExecutionsResponse {
+  success: boolean;
+  executions: any[];
 }
 
 export interface ArtifactListItem {
@@ -590,7 +607,29 @@ export interface SelfHealEvent {
 }
 
 const envBase = import.meta.env.VITE_API_BASE_URL?.trim();
-const DEFAULT_BASE_URL = envBase && envBase.length > 0 ? envBase : 'http://127.0.0.1:8801';
+const runtimeOrigin =
+  typeof window !== 'undefined' && window.location?.origin ? window.location.origin : undefined;
+const DEFAULT_BASE_URL =
+  envBase && envBase.length > 0
+    ? envBase
+    : runtimeOrigin && runtimeOrigin.length > 0
+    ? runtimeOrigin
+    : 'http://127.0.0.1:8804';
+const DEFAULT_SERVE_TOKEN = 'soulbrowser-dev-token';
+
+export function resolveServeToken(): string | null {
+  if (typeof window !== 'undefined' && typeof localStorage !== 'undefined') {
+    const stored = localStorage.getItem('auth_token') || localStorage.getItem('serve_token');
+    if (stored && stored.trim()) {
+      return stored.trim();
+    }
+  }
+  const envToken = import.meta.env.VITE_SERVE_TOKEN;
+  if (envToken && envToken.trim()) {
+    return envToken.trim();
+  }
+  return DEFAULT_SERVE_TOKEN;
+}
 
 const normalizeSelfHealAction = (action: RawSelfHealAction): SelfHealAction => {
   if ('type' in action) {
@@ -651,6 +690,19 @@ class SoulBrowserAPI {
         'Content-Type': 'application/json',
       },
     });
+
+    this.client.interceptors.request.use(
+      (config) => {
+        const token = resolveServeToken();
+        if (token) {
+          config.headers = config.headers ?? {};
+          config.headers['x-soulbrowser-token'] = token;
+          config.headers.Authorization = `Bearer ${token}`;
+        }
+        return config;
+      },
+      (error) => Promise.reject(error)
+    );
   }
 
   setBaseUrl(baseURL: string) {
@@ -702,6 +754,13 @@ class SoulBrowserAPI {
   async getTaskStatus(taskId: string): Promise<TaskStatusSnapshot> {
     const response = await this.client.get<TaskStatusResponse>(`/api/tasks/${taskId}/status`);
     return response.data.status;
+  }
+
+  async getTaskExecutions(taskId: string): Promise<any[]> {
+    const response = await this.client.get<TaskExecutionsResponse>(
+      `/api/tasks/${taskId}/executions`
+    );
+    return response.data.executions;
   }
 
   async getTaskLogs(taskId: string, since?: string): Promise<TaskLogEntry[]> {

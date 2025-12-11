@@ -21,6 +21,7 @@ import type {
   RecordingsListResponse,
   RecordingDetailResponse,
 } from './types.js';
+import { TaskEventStream } from './task_event_stream.js';
 
 export interface ClientOptions {
   baseUrl?: string;
@@ -31,6 +32,14 @@ export interface ClientOptions {
 export interface TaskStreamOptions {
   viaGateway?: boolean;
   customPath?: string;
+}
+
+export interface TaskEventStreamOptions extends TaskStreamOptions {
+  cursor?: number;
+  lastEventId?: string;
+  headers?: Record<string, string>;
+  retryDelayMs?: number;
+  maxRetryDelayMs?: number;
 }
 
 export class SoulBrowserClient {
@@ -153,6 +162,28 @@ export class SoulBrowserClient {
     base.search = '';
     base.hash = '';
     return new this.WebSocketCtor(base.toString());
+  }
+
+  streamTaskEvents(taskId: string, options?: TaskEventStreamOptions): TaskEventStream {
+    const base = new URL(this.baseUrl);
+    const defaultPath = options?.viaGateway
+      ? `/v1/tasks/${taskId}/events`
+      : `/api/tasks/${taskId}/events`;
+    const customPath = options?.customPath;
+    base.pathname = customPath ? customPath.replace(':task_id', taskId) : defaultPath;
+    base.hash = '';
+    if (typeof options?.cursor === 'number') {
+      base.searchParams.set('cursor', String(options.cursor));
+    }
+    const headers = options?.headers ? { ...options.headers } : {};
+    return new TaskEventStream({
+      url: base,
+      fetchFn: this.fetchFn,
+      headers,
+      lastEventId: options?.lastEventId,
+      retryDelayMs: options?.retryDelayMs,
+      maxRetryDelayMs: options?.maxRetryDelayMs,
+    });
   }
 
   private async get<T>(path: string): Promise<T> {

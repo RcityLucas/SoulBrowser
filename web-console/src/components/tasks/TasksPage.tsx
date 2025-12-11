@@ -1,5 +1,5 @@
-import { useEffect } from 'react';
-import { Card, Table, Tag, Progress, Space, Button, Input, Select } from 'antd';
+import { useState } from 'react';
+import { Card, Table, Tag, Progress, Space, Button, Input, Select, Drawer, Spin } from 'antd';
 import {
   PlayCircleOutlined,
   PauseCircleOutlined,
@@ -11,11 +11,66 @@ import { useTasks } from '@/hooks/useTasks';
 import { formatTime, formatDuration } from '@/utils/format';
 import type { Task, TaskStatus } from '@/types';
 import styles from './TasksPage.module.css';
+import TaskPlanCard from '@/components/chat/TaskPlanCard';
+import ExecutionSummaryCard from '@/components/chat/ExecutionSummaryCard';
+import ExecutionResultCard from '@/components/chat/ExecutionResultCard';
+import BackendStatusBar from '@/components/common/BackendStatusBar';
+import type { ExecutionSummary } from '@/stores/chatStore';
+import { buildExecutionSummary, extractExecutionResults } from '@/utils/executionSummary';
+import type { TaskDetailResponse, PersistedPlanRecord } from '@/api/soulbrowser';
+import type { TaskPlan } from '@/types';
 
 const { Search } = Input;
 
 export default function TasksPage() {
-  const { tasks, loading, startTask, pauseTask, cancelTask, retryTask, setFilter } = useTasks();
+  const {
+    tasks,
+    loading,
+    startTask,
+    pauseTask,
+    cancelTask,
+    retryTask,
+    setFilter,
+    fetchTaskDetail,
+    fetchTaskExecutions,
+  } = useTasks();
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailRecord, setDetailRecord] = useState<TaskDetailResponse | null>(null);
+  const [detailPlan, setDetailPlan] = useState<TaskPlan | null>(null);
+  const [detailSummary, setDetailSummary] = useState<ExecutionSummary | undefined>();
+  const [detailResults, setDetailResults] = useState<ReturnType<typeof extractExecutionResults>>([]);
+
+  const handleViewDetail = async (taskId: string) => {
+    setDetailOpen(true);
+    setDetailLoading(true);
+    try {
+      const detail = await fetchTaskDetail(taskId);
+      setDetailRecord(detail);
+      setDetailPlan(normalizePlan(detail.task));
+
+      try {
+        const executions = await fetchTaskExecutions(taskId);
+        const latestExecution = executions[executions.length - 1];
+        const summary = buildExecutionSummary(
+          { execution: latestExecution },
+          latestExecution?.success ?? true,
+          undefined,
+          undefined
+        );
+        setDetailSummary(summary);
+        setDetailResults(extractExecutionResults(latestExecution));
+      } catch (executionErr) {
+        console.warn('No execution data for task', taskId, executionErr);
+        setDetailSummary(undefined);
+        setDetailResults([]);
+      }
+    } catch (error) {
+      console.error('Failed to load task detail', error);
+    } finally {
+      setDetailLoading(false);
+    }
+  };
 
   const getStatusColor = (status: TaskStatus) => {
     switch (status) {
@@ -49,7 +104,15 @@ export default function TasksPage() {
       title: '任务名称',
       dataIndex: 'name',
       key: 'name',
-      width: 200,
+      width: 220,
+      ellipsis: true,
+    },
+    {
+      title: '创建时间',
+      dataIndex: 'startTime',
+      key: 'startTime',
+      width: 160,
+      render: (time?: Date) => (time ? formatTime(time) : '-'),
     },
     {
       title: '状态',
@@ -75,13 +138,6 @@ export default function TasksPage() {
       ),
     },
     {
-      title: '开始时间',
-      dataIndex: 'startTime',
-      key: 'startTime',
-      width: 120,
-      render: (time?: Date) => (time ? formatTime(time) : '-'),
-    },
-    {
       title: '耗时',
       dataIndex: 'duration',
       key: 'duration',
@@ -91,7 +147,7 @@ export default function TasksPage() {
     {
       title: '操作',
       key: 'actions',
-      width: 200,
+      width: 260,
       render: (_: any, record: Task) => (
         <Space>
           {record.status === 'pending' || record.status === 'paused' ? (
@@ -135,6 +191,9 @@ export default function TasksPage() {
               重试
             </Button>
           ) : null}
+          <Button type="link" size="small" onClick={() => handleViewDetail(record.id)}>
+            查看详情
+          </Button>
         </Space>
       ),
     },
@@ -142,6 +201,7 @@ export default function TasksPage() {
 
   return (
     <div className={styles.tasksPage}>
+      <BackendStatusBar className={styles.statusBar} />
       <Card
         title="任务列表"
         className={styles.card}
@@ -173,6 +233,39 @@ export default function TasksPage() {
           pagination={{ pageSize: 10 }}
         />
       </Card>
+
+      <Drawer
+        open={detailOpen}
+        onClose={() => setDetailOpen(false)}
+        title="任务详情"
+        width={720}
+      >
+        {detailLoading ? (
+          <Spin />
+        ) : detailRecord ? (
+          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+            {detailPlan && <TaskPlanCard plan={detailPlan} />}
+            {detailSummary && <ExecutionSummaryCard summary={detailSummary} />}
+            {detailResults.length > 0 && <ExecutionResultCard results={detailResults} />}
+          </Space>
+        ) : (
+          <span>无详情数据</span>
+        )}
+      </Drawer>
     </div>
   );
+}
+
+function normalizePlan(record: PersistedPlanRecord): TaskPlan {
+  const rawPlan = (record.plan as TaskPlan) || {};
+  return {
+    id: rawPlan.id || record.task_id,
+    task_id: record.task_id,
+    title: (rawPlan as any).title || record.prompt,
+    description: (rawPlan as any).description,
+    created_at: (rawPlan as any).created_at || record.created_at,
+    meta: (rawPlan as any).meta,
+    overlays: (rawPlan as any).overlays,
+    steps: (rawPlan as any).steps || [],
+  };
 }

@@ -16,7 +16,10 @@ use crate::{
     auth::{BrowserAuthManager, SessionManager},
     config::BrowserConfiguration,
     errors::SoulBrowserError,
+    plugin_registry::PluginRegistry,
+    self_heal::SelfHealRegistry,
     storage::StorageManager,
+    task_status::TaskStatusRegistry,
     tools::BrowserToolManager,
 };
 use cdp_adapter::CdpAdapter;
@@ -24,6 +27,7 @@ use l6_observe::{
     exporter as obs_exporter, guard::LabelMap as ObsLabelMap, metrics as obs_metrics,
     tracing as obs_tracing,
 };
+use memory_center::MemoryCenter;
 use soulbrowser_core_types::{ExecRoute, SoulError};
 use soulbrowser_event_bus::InMemoryBus;
 use soulbrowser_policy_center::{
@@ -67,6 +71,10 @@ pub struct AppContext {
     l0_bridge: L0Bridge,
     #[allow(dead_code)]
     l0_handles: L0Handles,
+    plugin_registry: Arc<PluginRegistry>,
+    task_status_registry: Arc<TaskStatusRegistry>,
+    memory_center: Arc<MemoryCenter>,
+    self_heal_registry: Arc<SelfHealRegistry>,
 }
 
 impl AppContext {
@@ -77,7 +85,7 @@ impl AppContext {
         policy_paths: &[PathBuf],
     ) -> Result<Self, SoulBrowserError> {
         // Initialize storage
-        let storage = Arc::new(if let Some(path) = storage_path {
+        let storage = Arc::new(if let Some(path) = storage_path.clone() {
             StorageManager::file_based(path)
         } else {
             StorageManager::in_memory()
@@ -261,6 +269,31 @@ impl AppContext {
         )
         .await;
 
+        let plugin_registry = Arc::new(PluginRegistry::load_default());
+        let task_status_registry = Arc::new(TaskStatusRegistry::new(200));
+        let memory_center = Arc::new(match &storage_path {
+            Some(path) => {
+                let mut persist_path = path.clone();
+                persist_path.push("memory-center.json");
+                MemoryCenter::with_persistence(persist_path).unwrap_or_else(|_| MemoryCenter::new())
+            }
+            None => MemoryCenter::new(),
+        });
+        let self_heal_registry = Arc::new(
+            SelfHealRegistry::load_from_path(Some(PathBuf::from("config/self_heal.yaml")))
+                .or_else(|err| {
+                    warn!(
+                        ?err,
+                        "failed to load configured self-heal registry; using defaults"
+                    );
+                    SelfHealRegistry::load_from_path(None)
+                })
+                .unwrap_or_else(|_| {
+                    SelfHealRegistry::load_from_path(None)
+                        .expect("self-heal registry default initialization")
+                }),
+        );
+
         Ok(Self {
             storage,
             auth_manager,
@@ -280,6 +313,10 @@ impl AppContext {
             scheduler_service,
             l0_bridge,
             l0_handles,
+            plugin_registry,
+            task_status_registry,
+            memory_center,
+            self_heal_registry,
         })
     }
 
@@ -316,6 +353,22 @@ impl AppContext {
         &self,
     ) -> Arc<SchedulerService<RegistryImpl, ToolManagerExecutorAdapter>> {
         self.scheduler_service.clone()
+    }
+
+    pub fn plugin_registry(&self) -> Arc<PluginRegistry> {
+        self.plugin_registry.clone()
+    }
+
+    pub fn task_status_registry(&self) -> Arc<TaskStatusRegistry> {
+        self.task_status_registry.clone()
+    }
+
+    pub fn memory_center(&self) -> Arc<MemoryCenter> {
+        self.memory_center.clone()
+    }
+
+    pub fn self_heal_registry(&self) -> Arc<SelfHealRegistry> {
+        self.self_heal_registry.clone()
     }
 
     pub fn scheduler_runtime(&self) -> Arc<SchedulerRuntime> {
@@ -417,6 +470,7 @@ impl SchedulerToolExecutor for ToolManagerExecutorAdapter {
         let _guard = span.enter();
 
         let subject = route.frame.0.clone();
+        let timeout_ms = request.options.timeout.as_millis().min(u64::MAX as u128) as u64;
         let result = self
             .tools
             .execute_with_route(
@@ -424,6 +478,7 @@ impl SchedulerToolExecutor for ToolManagerExecutorAdapter {
                 &subject,
                 request.tool_call.payload.clone(),
                 Some(route.clone()),
+                Some(timeout_ms),
             )
             .await;
 

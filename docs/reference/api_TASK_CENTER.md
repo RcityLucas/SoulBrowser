@@ -36,7 +36,7 @@ Response:
 ```
 
 Notes:
-- `plan` follows `docs/agent/PLAN_SCHEMA.md` (UI renders each `steps[*]`).
+- `plan` follows `docs/reference/PLAN_SCHEMA.md` (UI renders each `steps[*]`).
 - Open `links.stream` immediately for realtime updates.
 
 ---
@@ -143,7 +143,7 @@ Use the `Last-Event-ID` header to resume after network interruptions.
 ---
 
 ## 5. Related references
-- Planner schema & overlays: `docs/agent/PLAN_SCHEMA.md`
+- Planner schema & overlays: `docs/reference/PLAN_SCHEMA.md`
 - Web console usage: `docs/guides/WEB_CONSOLE_USAGE.md`
 - SDK type definitions: `sdk/python/soulbrowser_sdk/types.py`, `sdk/typescript/src/types.ts`
 

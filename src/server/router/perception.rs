@@ -11,7 +11,7 @@ use base64::{engine::general_purpose::STANDARD as Base64, Engine as _};
 use perceiver_hub::models::MultiModalPerception;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{debug, error};
+use tracing::{debug, error, instrument};
 
 use crate::load_console_fixture;
 use crate::perception_service::{CookieOverride, PerceptionJob, ViewportConfig};
@@ -85,6 +85,11 @@ struct UiPerceiveResponse {
     error: Option<String>,
 }
 
+#[instrument(
+    name = "soul.perception.request",
+    skip(state, req),
+    fields(client_ip = %client_addr, url = %req.url)
+)]
 async fn serve_perceive_handler(
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
     State(state): State<ServeState>,
@@ -191,6 +196,7 @@ async fn serve_perceive_handler(
     }
 }
 
+#[instrument(name = "soul.perception.metrics", skip(state))]
 async fn perception_metrics_handler(State(state): State<ServeState>) -> impl IntoResponse {
     let metrics = state.perception_service.metrics_snapshot();
     let pooling_cooldown = state.perception_service.pooling_cooldown_secs();

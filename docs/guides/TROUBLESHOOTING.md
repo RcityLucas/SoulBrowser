@@ -38,7 +38,8 @@ Use this checklist to diagnose the most common issues when running SoulBrowser l
 - `git clean -fdx web-console/node_modules` fixes broken node installs.
 
 For deeper dives refer to:
-- Backend usage guide: `docs/guides/BACKEND_USAGE.md`
+- Backend quick reference + command cheatsheet: `docs/guides/BACKEND_USAGE.md`
+- Legacy full walkthrough (if you need the old flow): `docs/ARCHIVE/BACKEND_USAGE_LEGACY.md`
 - Web console usage: `docs/guides/WEB_CONSOLE_USAGE.md`
 - Task Center schema: `docs/reference/api_TASK_CENTER.md`
 

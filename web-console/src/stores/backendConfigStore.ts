@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { soulbrowserAPI } from '@/api/soulbrowser';
+import { apiClient } from '@/api/client';
 
 export type BackendStatus = 'unknown' | 'checking' | 'online' | 'offline';
 
@@ -10,6 +11,7 @@ interface BackendConfigState {
   lastChecked?: string;
   setBaseUrl: (url: string) => void;
   setStatus: (status: BackendStatus, checkedAt?: string) => void;
+  checkBackend: () => Promise<void>;
 }
 
 const defaultBaseUrl = soulbrowserAPI.getBaseUrl();
@@ -23,18 +25,23 @@ const legacyBaseUrls = new Set([
   'http://127.0.0.1:8800',
   'http://localhost:8800',
   'http://0.0.0.0:8800',
+  'http://127.0.0.1:8801',
+  'http://localhost:8801',
+  'http://0.0.0.0:8801',
 ]);
 
 export const useBackendConfigStore = create<BackendConfigState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       baseUrl: defaultBaseUrl,
       status: 'unknown',
       lastChecked: undefined,
       setBaseUrl: (url) => {
         const trimmed = url.trim();
         soulbrowserAPI.setBaseUrl(trimmed);
-        set({ baseUrl: trimmed, status: 'unknown' });
+        apiClient.setBaseUrl(trimmed);
+        set({ baseUrl: trimmed, status: 'checking' });
+        void get().checkBackend();
       },
       setStatus: (status, checkedAt) =>
         set((state) => ({
@@ -44,6 +51,18 @@ export const useBackendConfigStore = create<BackendConfigState>()(
               ? checkedAt ?? new Date().toISOString()
               : state.lastChecked,
         })),
+      checkBackend: async () => {
+        set({ status: 'checking' });
+        try {
+          const ok = await apiClient.healthCheck();
+          set({
+            status: ok ? 'online' : 'offline',
+            lastChecked: new Date().toISOString(),
+          });
+        } catch {
+          set({ status: 'offline', lastChecked: new Date().toISOString() });
+        }
+      },
     }),
     {
       name: 'soulbrowser-backend-config',
@@ -67,6 +86,7 @@ export const useBackendConfigStore = create<BackendConfigState>()(
         }
         if (state.baseUrl) {
           soulbrowserAPI.setBaseUrl(state.baseUrl);
+          apiClient.setBaseUrl(state.baseUrl);
         }
       },
     }

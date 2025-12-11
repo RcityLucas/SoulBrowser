@@ -5,15 +5,22 @@
 
 pub mod convert;
 pub mod errors;
+pub mod llm_provider;
 pub mod model;
 pub mod plan;
+pub mod plan_validator;
 pub mod planner;
 
 pub use convert::{plan_to_flow, PlanToFlowOptions, PlanToFlowResult};
 pub use errors::AgentError;
-pub use model::{AgentContext, AgentRequest, ConversationRole, ConversationTurn};
+pub use llm_provider::{LlmProvider, MockLlmProvider};
+pub use model::{
+    AgentContext, AgentIntentMetadata, AgentRequest, ConversationRole, ConversationTurn,
+    RequestedOutput,
+};
 pub use plan::{
     AgentLocator, AgentPlan, AgentPlanMeta, AgentPlanStep, AgentScrollTarget, AgentTool,
     AgentToolKind, AgentValidation, AgentWaitCondition, WaitMode,
 };
+pub use plan_validator::PlanValidator;
 pub use planner::{AgentPlanner, PlannerConfig, PlannerOutcome, RuleBasedPlanner};

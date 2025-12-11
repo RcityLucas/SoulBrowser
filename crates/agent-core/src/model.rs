@@ -61,6 +61,40 @@ impl AgentContext {
     }
 }
 
+/// High-level intent metadata inferred from prompts or templates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIntentMetadata {
+    pub intent_id: Option<String>,
+    pub primary_goal: Option<String>,
+    #[serde(default)]
+    pub target_sites: Vec<String>,
+    #[serde(default)]
+    pub required_outputs: Vec<RequestedOutput>,
+    pub preferred_language: Option<String>,
+    #[serde(default)]
+    pub blocker_remediations: Vec<(String, String)>,
+}
+
+/// Structured output requested by the caller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestedOutput {
+    pub schema: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub include_screenshot: bool,
+}
+
+impl RequestedOutput {
+    pub fn new(schema: impl Into<String>) -> Self {
+        Self {
+            schema: schema.into(),
+            description: None,
+            include_screenshot: false,
+        }
+    }
+}
+
 /// Request envelope passed into the agent planner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
@@ -85,6 +119,9 @@ pub struct AgentRequest {
     /// Arbitrary metadata for experimentation or caller supplied hints.
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Optional intent metadata populated by the caller.
+    #[serde(default)]
+    pub intent: AgentIntentMetadata,
 }
 
 fn default_allow_custom() -> bool {
@@ -102,6 +139,7 @@ impl AgentRequest {
             preferred_tools: Vec::new(),
             allow_custom_tools: false,
             metadata: HashMap::new(),
+            intent: AgentIntentMetadata::default(),
         }
     }
 

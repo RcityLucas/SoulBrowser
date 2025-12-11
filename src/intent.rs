@@ -1,169 +1,39 @@
+use agent_core::{AgentRequest, RequestedOutput};
+use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
-use agent_core::{AgentIntentMetadata, AgentRequest, RequestedOutput};
-use once_cell::sync::OnceCell;
-use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::Deserialize;
-use serde::Deserializer;
-use serde_json::Value;
-use serde_yaml::Value as YamlValue;
-use tracing::warn;
-
-const DEFAULT_INTENT_PATH: &str = "config/intent_config.yaml";
-
-static INTENT_CONFIG: OnceCell<IntentConfig> = OnceCell::new();
-
-pub fn intent_config() -> &'static IntentConfig {
-    INTENT_CONFIG.get_or_init(|| {
-        let path = resolve_intent_config_path();
-        IntentConfig::from_path(path.as_deref()).unwrap_or_else(|| {
-            warn!(
-                "intent config not found at {:?}; falling back to defaults",
-                path
-            );
-            IntentConfig::default()
-        })
-    })
-}
-
+/// Attach lightweight intent hints to the request so downstream planners have
+/// consistent metadata regardless of which frontend produced the prompt.
 pub fn enrich_request_with_intent(request: &mut AgentRequest, prompt: &str) {
-    if request.intent.intent_id.is_some() {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
         return;
     }
-    let trimmed_prompt = prompt.trim();
-    if trimmed_prompt.is_empty() {
-        return;
-    }
-    if let Some(intent) = intent_config().detect(trimmed_prompt) {
-        request.intent = intent;
-    } else if contains_cjk(trimmed_prompt) {
+    request
+        .intent
+        .primary_goal
+        .get_or_insert_with(|| trimmed.to_string());
+    request
+        .metadata
+        .entry("primary_goal".to_string())
+        .or_insert_with(|| Value::String(trimmed.to_string()));
+    if contains_cjk(trimmed) {
+        request.intent.preferred_language = Some("zh-CN".to_string());
         request
-            .intent
-            .preferred_language
-            .get_or_insert_with(|| "zh-CN".to_string());
+            .metadata
+            .entry("preferred_language".to_string())
+            .or_insert_with(|| Value::String("zh-CN".to_string()));
     }
-
-    if request.intent.primary_goal.is_none() && !trimmed_prompt.is_empty() {
-        request.intent.primary_goal = Some(trimmed_prompt.to_string());
-    }
-
-    request.sync_intent_metadata();
+    apply_configured_intent(request, trimmed);
     update_todo_snapshot(request);
 }
 
-fn resolve_intent_config_path() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("SOULBROWSER_INTENT_CONFIG") {
-        let buf = PathBuf::from(path);
-        if buf.exists() {
-            return Some(buf);
-        }
-    }
-    let candidate = PathBuf::from(DEFAULT_INTENT_PATH);
-    if candidate.exists() {
-        Some(candidate)
-    } else {
-        None
-    }
-}
-
-#[derive(Debug, Clone)]
-struct IntentDefinition {
-    id: String,
-    triggers: Vec<String>,
-    primary_goal: Option<String>,
-    target_sites: Vec<String>,
-    required_outputs: Vec<IntentOutput>,
-    preferred_language: Option<String>,
-    blockers: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct IntentDefinitionSpec {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    triggers: Vec<String>,
-    #[serde(default)]
-    primary_goal: Option<String>,
-    #[serde(default, alias = "primary_sites")]
-    target_sites: Vec<String>,
-    #[serde(default, alias = "outputs", alias = "output")]
-    required_outputs: IntentOutputList,
-    #[serde(default)]
-    preferred_language: Option<String>,
-    #[serde(default)]
-    blockers: HashMap<String, String>,
-}
-
-impl IntentDefinitionSpec {
-    fn into_definition(self, fallback_id: Option<&str>) -> Option<IntentDefinition> {
-        let id = self
-            .id
-            .or_else(|| fallback_id.map(|value| value.to_string()))?;
-        Some(IntentDefinition {
-            id,
-            triggers: self.triggers,
-            primary_goal: self.primary_goal,
-            target_sites: self.target_sites,
-            required_outputs: self.required_outputs.into_vec(),
-            preferred_language: self.preferred_language,
-            blockers: self.blockers,
-        })
-    }
-}
-
-impl IntentDefinition {
-    fn matches(&self, prompt: &str) -> bool {
-        if self.triggers.is_empty() {
-            return false;
-        }
-        let haystack = prompt.to_ascii_lowercase();
-        self.triggers.iter().any(|trigger| {
-            let needle = trigger.to_ascii_lowercase();
-            haystack.contains(&needle)
-        })
-    }
-
-    fn to_metadata(&self, prompt: &str) -> AgentIntentMetadata {
-        let mut metadata = AgentIntentMetadata::default();
-        metadata.intent_id = Some(self.id.clone());
-        metadata.primary_goal = self
-            .primary_goal
-            .clone()
-            .or_else(|| Some(prompt.to_string()));
-        if !self.target_sites.is_empty() {
-            metadata.target_sites = self.target_sites.clone();
-        }
-        if !self.required_outputs.is_empty() {
-            metadata.required_outputs = self
-                .required_outputs
-                .iter()
-                .map(|req| {
-                    let mut output = RequestedOutput::new(&req.schema);
-                    output.include_screenshot = req.include_screenshot;
-                    output.description = req.description.clone();
-                    output
-                })
-                .collect();
-        }
-        metadata.preferred_language = self.preferred_language.clone().or_else(|| {
-            if contains_cjk(prompt) {
-                Some("zh-CN".to_string())
-            } else {
-                None
-            }
-        });
-        metadata.blocker_remediations = self.blockers.clone();
-        metadata
-    }
-}
-
-/// Generate a markdown-friendly todo snapshot that mirrors BrowserUse's `todo.md`.
+/// Generate a markdown-friendly todo list that mirrors BrowserUse's `todo.md`.
 pub fn build_todo_snapshot(request: &AgentRequest) -> Option<String> {
     let mut bullets = Vec::new();
 
@@ -171,31 +41,10 @@ pub fn build_todo_snapshot(request: &AgentRequest) -> Option<String> {
         .intent
         .primary_goal
         .as_deref()
-        .filter(|value| !value.trim().is_empty())
+        .or_else(|| request.metadata.get("primary_goal").and_then(Value::as_str))
         .unwrap_or_else(|| request.goal.as_str());
     if !goal.trim().is_empty() {
         bullets.push(format!("[ ] 达成目标: {}", goal.trim()));
-    }
-
-    if !request.intent.target_sites.is_empty() {
-        for (idx, site) in request.intent.target_sites.iter().enumerate() {
-            bullets.push(format!("[ ] 第{}优先站点: {}", idx + 1, site));
-        }
-    }
-
-    if !request.intent.required_outputs.is_empty() {
-        for output in &request.intent.required_outputs {
-            let mut parts = vec![output.schema.clone()];
-            if let Some(desc) = output.description.as_deref() {
-                if !desc.trim().is_empty() {
-                    parts.push(desc.trim().to_string());
-                }
-            }
-            if output.include_screenshot {
-                parts.push("需要截图".to_string());
-            }
-            bullets.push(format!("[ ] 产出结构化结果: {}", parts.join(" | ")));
-        }
     }
 
     if !request.constraints.is_empty() {
@@ -206,6 +55,12 @@ pub fn build_todo_snapshot(request: &AgentRequest) -> Option<String> {
         .intent
         .preferred_language
         .as_deref()
+        .or_else(|| {
+            request
+                .metadata
+                .get("preferred_language")
+                .and_then(Value::as_str)
+        })
         .filter(|value| !value.trim().is_empty())
     {
         bullets.push(format!("[ ] 回复语言: {}", lang));
@@ -229,271 +84,283 @@ pub fn update_todo_snapshot(request: &mut AgentRequest) {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct IntentOutput {
-    schema: String,
-    #[serde(default)]
-    include_screenshot: bool,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct IntentOutputList(Vec<IntentOutput>);
-
-impl IntentOutputList {
-    fn into_vec(self) -> Vec<IntentOutput> {
-        self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for IntentOutputList {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct OutputVisitor;
-
-        impl<'de> Visitor<'de> for OutputVisitor {
-            type Value = IntentOutputList;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a structured output or list of structured outputs")
-            }
-
-            fn visit_unit<E>(self) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(IntentOutputList::default())
-            }
-
-            fn visit_none<E>(self) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(IntentOutputList::default())
-            }
-
-            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let outputs: Vec<IntentOutput> =
-                    Deserialize::deserialize(SeqAccessDeserializer::new(seq))?;
-                Ok(IntentOutputList(outputs))
-            }
-
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let output: IntentOutput =
-                    Deserialize::deserialize(MapAccessDeserializer::new(map))?;
-                Ok(IntentOutputList(vec![output]))
-            }
-        }
-
-        deserializer.deserialize_any(OutputVisitor)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct IntentConfig {
-    intents: Vec<IntentDefinition>,
-}
-
-impl IntentConfig {
-    fn from_path(path: Option<&Path>) -> Option<Self> {
-        let path = path?;
-        let raw = fs::read_to_string(path).ok()?;
-        Self::from_yaml(&raw)
-    }
-
-    fn from_yaml(raw: &str) -> Option<Self> {
-        let intents = load_intent_definitions(raw)?;
-        Some(Self { intents })
-    }
-
-    pub fn detect(&self, prompt: &str) -> Option<AgentIntentMetadata> {
-        self.intents
-            .iter()
-            .find(|intent| intent.matches(prompt))
-            .map(|intent| intent.to_metadata(prompt))
-    }
-}
-
-impl Default for IntentConfig {
-    fn default() -> Self {
-        let definition = IntentDefinition {
-            id: "search_market_info".to_string(),
-            triggers: vec![
-                "搜行情".to_string(),
-                "行情".to_string(),
-                "stock quote".to_string(),
-                "market index".to_string(),
-                "A股".to_string(),
-            ],
-            primary_goal: Some("Collect the latest market index snapshot".to_string()),
-            target_sites: vec![
-                "https://www.google.com".to_string(),
-                "https://www.baidu.com".to_string(),
-            ],
-            required_outputs: vec![IntentOutput {
-                schema: "market_info_v1.json".to_string(),
-                include_screenshot: true,
-                description: Some("List indices with latest value and change".to_string()),
-            }],
-            preferred_language: Some("zh-CN".to_string()),
-            blockers: HashMap::from([
-                (
-                    "consent_gate".to_string(),
-                    "accept_google_consent".to_string(),
-                ),
-                ("unusual_traffic".to_string(), "switch_to_baidu".to_string()),
-                ("captcha".to_string(), "require_manual_captcha".to_string()),
-                (
-                    "permission_request".to_string(),
-                    "ack_permission_prompt".to_string(),
-                ),
-                (
-                    "download_prompt".to_string(),
-                    "wait_download_complete".to_string(),
-                ),
-                ("blank_page".to_string(), "auto_retry".to_string()),
-            ]),
-        };
-        Self {
-            intents: vec![definition],
-        }
-    }
-}
-
 fn contains_cjk(input: &str) -> bool {
     input
         .chars()
-        .any(|ch| matches!(ch as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2EBE0))
+        .any(|ch| matches!(ch, '\u{4E00}'..='\u{9FFF}'))
 }
 
-fn load_intent_definitions(raw: &str) -> Option<Vec<IntentDefinition>> {
-    let yaml: YamlValue = serde_yaml::from_str(raw).ok()?;
-    let intents_value = match yaml {
-        YamlValue::Mapping(map) => map
-            .get(&YamlValue::String("intents".to_string()))
-            .cloned()
-            .unwrap_or(YamlValue::Sequence(Vec::new())),
-        _ => YamlValue::Sequence(Vec::new()),
+fn apply_configured_intent(request: &mut AgentRequest, prompt: &str) {
+    let Some((intent_id, definition)) = match_intent(prompt) else {
+        return;
     };
-    Some(parse_intent_entries(intents_value))
-}
 
-fn parse_intent_entries(value: YamlValue) -> Vec<IntentDefinition> {
-    match value {
-        YamlValue::Sequence(entries) => entries
-            .into_iter()
-            .filter_map(|entry| parse_intent_spec(entry, None))
-            .collect(),
-        YamlValue::Mapping(map) => map
-            .into_iter()
-            .filter_map(|(key, value)| {
-                if let Some(key) = key.as_str() {
-                    parse_intent_spec(value, Some(key))
-                } else {
-                    warn!("intent key must be a string; skipping entry");
-                    None
-                }
-            })
-            .collect(),
-        other => {
-            warn!("intents entry must be a list or mapping, got {:?}", other);
-            Vec::new()
+    request.intent.intent_id = Some(intent_id.clone());
+    request
+        .metadata
+        .insert("intent_id".to_string(), Value::String(intent_id));
+
+    if let Some(goal) = definition.primary_goal.as_deref() {
+        request.intent.primary_goal = Some(goal.to_string());
+        request
+            .metadata
+            .insert("primary_goal".to_string(), Value::String(goal.to_string()));
+    }
+
+    if !definition.primary_sites.is_empty() {
+        request.intent.target_sites = definition.primary_sites.clone();
+        request.metadata.insert(
+            "target_sites".to_string(),
+            Value::Array(
+                request
+                    .intent
+                    .target_sites
+                    .iter()
+                    .map(|site| Value::String(site.clone()))
+                    .collect(),
+            ),
+        );
+    }
+
+    if let Some(lang) = definition.preferred_language.as_deref() {
+        request.intent.preferred_language = Some(lang.to_string());
+        request.metadata.insert(
+            "preferred_language".to_string(),
+            Value::String(lang.to_string()),
+        );
+    }
+
+    if let Some(output) = definition.output.as_ref() {
+        if let Some(schema) = output.schema.as_deref() {
+            let mut requested = RequestedOutput::new(schema);
+            requested.description = output.description.clone();
+            requested.include_screenshot = output.include_screenshot.unwrap_or(false);
+            request.intent.required_outputs = vec![requested];
+            request.metadata.insert(
+                "required_output_schema".to_string(),
+                Value::String(schema.to_string()),
+            );
         }
+    }
+
+    if !definition.blockers.is_empty() {
+        request.intent.blocker_remediations = definition
+            .blockers
+            .iter()
+            .map(|(kind, remediation)| (kind.clone(), remediation.clone()))
+            .collect();
     }
 }
 
-fn parse_intent_spec(value: YamlValue, fallback_id: Option<&str>) -> Option<IntentDefinition> {
-    match serde_yaml::from_value::<IntentDefinitionSpec>(value) {
-        Ok(spec) => spec.into_definition(fallback_id).or_else(|| {
-            warn!("intent entry missing id; skipping");
-            None
-        }),
-        Err(err) => {
-            warn!("failed to parse intent entry: {}", err);
-            None
+fn match_intent(prompt: &str) -> Option<(String, IntentDefinition)> {
+    let config = load_intent_config()?;
+    config
+        .entries
+        .iter()
+        .find(|entry| entry.definition.matches(prompt))
+        .map(|entry| (entry.id.clone(), entry.definition.clone()))
+}
+
+fn load_intent_config() -> Option<IntentConfig> {
+    let path = intent_config_path()?;
+    {
+        let cache = intent_cache().read().unwrap();
+        if cache.path.as_ref() == Some(&path) {
+            return cache.config.clone();
         }
     }
+
+    let bytes = fs::read(&path).ok()?;
+    let file: IntentConfigFile = serde_yaml::from_slice(&bytes).ok()?;
+    let config = IntentConfig::from(file);
+    let mut cache = intent_cache().write().unwrap();
+    cache.path = Some(path);
+    cache.config = Some(config.clone());
+    Some(config)
+}
+
+fn intent_config_path() -> Option<PathBuf> {
+    if let Ok(env_path) = env::var("SOULBROWSER_INTENT_CONFIG") {
+        let path = PathBuf::from(env_path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let default = Path::new("config/intent_config.yaml").to_path_buf();
+    if default.exists() {
+        Some(default)
+    } else {
+        None
+    }
+}
+
+fn intent_cache() -> &'static RwLock<IntentConfigCache> {
+    static CACHE: OnceLock<RwLock<IntentConfigCache>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(IntentConfigCache::default()))
+}
+
+#[cfg(test)]
+fn reset_intent_cache_for_tests() {
+    if let Ok(mut guard) = intent_cache().write() {
+        *guard = IntentConfigCache::default();
+    }
+}
+
+#[derive(Default)]
+struct IntentConfigCache {
+    path: Option<PathBuf>,
+    config: Option<IntentConfig>,
+}
+
+#[derive(Clone)]
+struct IntentConfig {
+    entries: Vec<IntentEntry>,
+}
+
+impl From<IntentConfigFile> for IntentConfig {
+    fn from(value: IntentConfigFile) -> Self {
+        let entries = value
+            .intents
+            .into_iter()
+            .map(|(id, definition)| IntentEntry { id, definition })
+            .collect();
+        Self { entries }
+    }
+}
+
+#[derive(Clone)]
+struct IntentEntry {
+    id: String,
+    definition: IntentDefinition,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IntentConfigFile {
+    intents: HashMap<String, IntentDefinition>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IntentDefinition {
+    #[serde(default)]
+    triggers: Vec<String>,
+    #[serde(default)]
+    primary_goal: Option<String>,
+    #[serde(default, rename = "primary_sites")]
+    primary_sites: Vec<String>,
+    #[serde(default)]
+    output: Option<IntentOutput>,
+    #[serde(default)]
+    preferred_language: Option<String>,
+    #[serde(default)]
+    blockers: HashMap<String, String>,
+}
+
+impl IntentDefinition {
+    fn matches(&self, prompt: &str) -> bool {
+        if self.triggers.is_empty() {
+            return false;
+        }
+        let haystack_lower = prompt.to_ascii_lowercase();
+        self.triggers.iter().any(|trigger| {
+            let trimmed = trigger.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            haystack_lower.contains(&trimmed.to_ascii_lowercase()) || prompt.contains(trimmed)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IntentOutput {
+    schema: Option<String>,
+    #[serde(default)]
+    include_screenshot: Option<bool>,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use soulbrowser_core_types::TaskId;
+    use std::env;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
-    fn detects_default_search_intent() {
-        let config = IntentConfig::default();
-        let intent = config
-            .detect("帮我搜行情，看看今天A股变化")
-            .expect("intent detected");
-        assert_eq!(intent.intent_id.as_deref(), Some("search_market_info"));
-        assert!(!intent.target_sites.is_empty());
-        assert_eq!(intent.preferred_language.as_deref(), Some("zh-CN"));
-        assert_eq!(intent.required_outputs[0].schema, "market_info_v1.json");
+    fn todo_snapshot_includes_goal_and_constraints() {
+        let mut request = AgentRequest::new(TaskId::new(), "test goal");
+        request.constraints.push("be careful".to_string());
+        let snapshot = build_todo_snapshot(&request).expect("snapshot");
+        assert!(snapshot.contains("test goal"));
+        assert!(snapshot.contains("be careful"));
     }
 
     #[test]
-    fn cjk_detection_handles_ascii() {
-        assert!(contains_cjk("行情"));
-        assert!(!contains_cjk("market"));
+    fn enrich_request_sets_language_for_cjk() {
+        let mut request = AgentRequest::new(TaskId::new(), "");
+        enrich_request_with_intent(&mut request, "查看行情");
+        assert_eq!(request.intent.preferred_language.as_deref(), Some("zh-CN"));
+        let lang_meta = request
+            .metadata
+            .get("preferred_language")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(lang_meta, "zh-CN");
     }
 
     #[test]
-    fn parses_map_based_intent_config() {
-        let yaml = r#"
+    fn applies_predefined_intent_from_config() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("intent.yaml");
+        fs::write(
+            &path,
+            r#"
 intents:
-  summarize_news:
-    triggers: ["news summary"]
-    primary_goal: "Summarize tech headlines"
+  special:
+    triggers: ["special run"]
+    primary_goal: "Run special workflow"
     primary_sites:
-      - https://news.google.com
+      - "https://example.com"
+      - "https://backup.example.com"
     output:
-      schema: news_brief_v1.json
-      include_screenshot: false
-      description: Latest headlines
-    preferred_language: zh-CN
+      schema: market_info_v1.json
+      include_screenshot: true
+      description: "Special report"
+    preferred_language: en-US
     blockers:
-      consent_gate: accept_google_consent
-"#;
-        let config = IntentConfig::from_yaml(yaml).expect("parse config");
-        let intent = config
-            .detect("帮我做一个 news summary")
-            .expect("intent detected");
-        assert_eq!(intent.intent_id.as_deref(), Some("summarize_news"));
-        assert_eq!(intent.target_sites[0], "https://news.google.com");
-        assert_eq!(intent.required_outputs[0].schema, "news_brief_v1.json");
-    }
+      captcha: require_manual_captcha
+        "#,
+        )
+        .expect("write config");
 
-    #[test]
-    fn todo_snapshot_lists_goal_sites_outputs() {
-        let mut request = AgentRequest::new(TaskId::new(), "搜行情");
-        request.intent.primary_goal = Some("查看今天A股行情".to_string());
-        request.intent.target_sites = vec![
-            "https://www.google.com".to_string(),
-            "https://www.baidu.com".to_string(),
-        ];
-        let mut output = RequestedOutput::new("market_info_v1.json");
-        output.include_screenshot = true;
-        output.description = Some("最新指数".to_string());
-        request.intent.required_outputs = vec![output];
-        request.intent.preferred_language = Some("zh-CN".to_string());
-        request.constraints = vec!["优先使用中文数据源".to_string()];
+        reset_intent_cache_for_tests();
+        env::set_var("SOULBROWSER_INTENT_CONFIG", path.to_str().unwrap());
 
-        let snapshot = build_todo_snapshot(&request).expect("todo snapshot");
-        assert!(snapshot.contains("达成目标"));
-        assert!(snapshot.contains("第1优先站点"));
-        assert!(snapshot.contains("market_info_v1.json"));
-        assert!(snapshot.contains("需要截图"));
-        assert!(snapshot.contains("遵循限制"));
-        assert!(snapshot.contains("回复语言: zh-CN"));
+        let mut request = AgentRequest::new(TaskId::new(), "special run");
+        enrich_request_with_intent(&mut request, "Please special run this workflow");
+
+        assert_eq!(request.intent.intent_id.as_deref(), Some("special"));
+        assert_eq!(
+            request.intent.primary_goal.as_deref(),
+            Some("Run special workflow")
+        );
+        assert_eq!(request.intent.target_sites.len(), 2);
+        assert_eq!(request.intent.preferred_language.as_deref(), Some("en-US"));
+        assert_eq!(request.intent.required_outputs.len(), 1);
+        let output = &request.intent.required_outputs[0];
+        assert_eq!(output.schema, "market_info_v1.json");
+        assert!(output.include_screenshot);
+        assert!(request
+            .intent
+            .blocker_remediations
+            .iter()
+            .any(
+                |(kind, remediation)| kind == "captcha" && remediation == "require_manual_captcha"
+            ));
+
+        env::remove_var("SOULBROWSER_INTENT_CONFIG");
+        reset_intent_cache_for_tests();
     }
 }

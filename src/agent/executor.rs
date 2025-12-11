@@ -15,7 +15,7 @@ use soulbrowser_scheduler::model::{
 use soulbrowser_scheduler::Dispatcher;
 use tracing::{debug, info, warn};
 
-use crate::app_context::AppContext;
+use crate::{app_context::AppContext, metrics};
 
 /// Execution options for running an agent plan.
 #[derive(Clone, Debug)]
@@ -47,10 +47,13 @@ pub enum StepExecutionStatus {
 pub struct StepExecutionReport {
     pub step_id: String,
     pub title: String,
+    pub tool_kind: String,
     pub status: StepExecutionStatus,
     pub attempts: u8,
     pub error: Option<String>,
     pub dispatches: Vec<DispatchRecord>,
+    pub total_wait_ms: u64,
+    pub total_run_ms: u64,
 }
 
 /// Aggregate execution report for an entire plan.
@@ -113,21 +116,27 @@ async fn execute_step<D: Dispatcher + ?Sized>(
     routing_hint: &Option<RoutingHint>,
     options: &FlowExecutionOptions,
 ) -> StepExecutionReport {
+    let tool_kind = tool_kind_label(step);
     let total_attempts = options.max_retries.max(1);
     let mut attempts = 0;
     let mut last_error: Option<String> = None;
 
-    let specs = match build_dispatch_specs(step) {
+    let specs = match build_dispatch_specs(step, &task_id) {
         Ok(specs) => specs,
         Err(err) => {
-            return StepExecutionReport {
+            let report = StepExecutionReport {
                 step_id: step.id.clone(),
                 title: step.title.clone(),
+                tool_kind: tool_kind.clone(),
                 status: StepExecutionStatus::Failed,
                 attempts: 0,
                 error: Some(err.to_string()),
                 dispatches: Vec::new(),
-            }
+                total_wait_ms: 0,
+                total_run_ms: 0,
+            };
+            record_step_metrics(&report);
+            return report;
         }
     };
 
@@ -196,28 +205,40 @@ async fn execute_step<D: Dispatcher + ?Sized>(
         }
 
         if !failed {
-            return StepExecutionReport {
+            let (total_wait_ms, total_run_ms) = aggregate_dispatch_totals(&step_dispatches);
+            let report = StepExecutionReport {
                 step_id: step.id.clone(),
                 title: step.title.clone(),
+                tool_kind: tool_kind.clone(),
                 status: StepExecutionStatus::Success,
                 attempts,
                 error: None,
                 dispatches: step_dispatches,
+                total_wait_ms,
+                total_run_ms,
             };
+            record_step_metrics(&report);
+            return report;
         }
 
         debug!(step = %step.id, attempt, "Retrying plan step after failure");
         last_dispatches = step_dispatches;
     }
 
-    StepExecutionReport {
+    let (total_wait_ms, total_run_ms) = aggregate_dispatch_totals(&last_dispatches);
+    let report = StepExecutionReport {
         step_id: step.id.clone(),
         title: step.title.clone(),
+        tool_kind: tool_kind.clone(),
         status: StepExecutionStatus::Failed,
         attempts,
         error: last_error,
         dispatches: last_dispatches,
-    }
+        total_wait_ms,
+        total_run_ms,
+    };
+    record_step_metrics(&report);
+    report
 }
 
 async fn dispatch_once<D: Dispatcher + ?Sized>(
@@ -334,9 +355,31 @@ fn extract_bytes(value: Value) -> Option<Vec<u8>> {
     }
 }
 
-fn build_dispatch_specs(step: &AgentPlanStep) -> Result<Vec<DispatchSpec>> {
+fn aggregate_dispatch_totals(dispatches: &[DispatchRecord]) -> (u64, u64) {
+    dispatches
+        .iter()
+        .fold((0u64, 0u64), |(wait_acc, run_acc), dispatch| {
+            (wait_acc + dispatch.wait_ms, run_acc + dispatch.run_ms)
+        })
+}
+
+fn record_step_metrics(report: &StepExecutionReport) {
+    let result = match report.status {
+        StepExecutionStatus::Success => "success",
+        StepExecutionStatus::Failed => "failed",
+    };
+    metrics::observe_execution_step(
+        &report.tool_kind,
+        result,
+        report.total_wait_ms,
+        report.total_run_ms,
+        report.attempts as u64,
+    );
+}
+
+fn build_dispatch_specs(step: &AgentPlanStep, task_id: &TaskId) -> Result<Vec<DispatchSpec>> {
     let mut specs = Vec::new();
-    specs.push(step_to_spec(step)?);
+    specs.push(step_to_spec(step, task_id)?);
 
     for (idx, validation) in step.validations.iter().enumerate() {
         if let Some(spec) = validation_to_spec(step, validation, idx)? {
@@ -347,8 +390,8 @@ fn build_dispatch_specs(step: &AgentPlanStep) -> Result<Vec<DispatchSpec>> {
     Ok(specs)
 }
 
-fn step_to_spec(step: &AgentPlanStep) -> Result<DispatchSpec> {
-    let (tool, mut payload) = tool_payload(&step.tool)?;
+fn step_to_spec(step: &AgentPlanStep, task_id: &TaskId) -> Result<DispatchSpec> {
+    let (tool, mut payload) = tool_payload(&step.tool, task_id)?;
     if let Some(wait) = wait_mode_value(step.tool.wait) {
         payload
             .as_object_mut()
@@ -445,7 +488,7 @@ fn validation_to_spec(
     }
 }
 
-fn tool_payload(tool: &AgentTool) -> Result<(String, Value)> {
+fn tool_payload(tool: &AgentTool, task_id: &TaskId) -> Result<(String, Value)> {
     match &tool.kind {
         AgentToolKind::Navigate { url } => {
             Ok(("navigate-to-url".to_string(), json!({ "url": url })))
@@ -486,11 +529,42 @@ fn tool_payload(tool: &AgentTool) -> Result<(String, Value)> {
             }),
         )),
         AgentToolKind::Wait { condition } => wait_tool_payload(condition),
-        AgentToolKind::Custom { name, .. } => Err(anyhow!(
-            "Custom tool '{}' is not supported for automated execution",
-            name
-        )),
+        AgentToolKind::Custom { name, payload } => {
+            let normalized = name.trim();
+            if normalized.starts_with("data.parse.")
+                || normalized == "data.extract-site"
+                || normalized == "data.deliver.structured"
+            {
+                Ok((
+                    normalized.to_string(),
+                    merge_custom_payload(payload, task_id),
+                ))
+            } else if normalized == "deliver" {
+                Ok((
+                    "data.deliver.structured".to_string(),
+                    merge_custom_payload(payload, task_id),
+                ))
+            } else {
+                Err(anyhow!(
+                    "Custom tool '{}' is not supported for automated execution",
+                    name
+                ))
+            }
+        }
     }
+}
+
+fn tool_kind_label(step: &AgentPlanStep) -> String {
+    match &step.tool.kind {
+        AgentToolKind::Navigate { .. } => "navigate",
+        AgentToolKind::Click { .. } => "click",
+        AgentToolKind::TypeText { .. } => "type_text",
+        AgentToolKind::Select { .. } => "select",
+        AgentToolKind::Scroll { .. } => "scroll",
+        AgentToolKind::Wait { .. } => "wait",
+        AgentToolKind::Custom { name, .. } => name.as_str(),
+    }
+    .to_string()
 }
 
 fn wait_tool_payload(condition: &AgentWaitCondition) -> Result<(String, Value)> {
@@ -540,6 +614,13 @@ fn locator_to_json(locator: &AgentLocator) -> Value {
             "exact": exact,
         }),
     }
+}
+
+fn merge_custom_payload(payload: &Value, task_id: &TaskId) -> Value {
+    let mut obj = payload.as_object().cloned().unwrap_or_default();
+    obj.entry("task_id".to_string())
+        .or_insert(json!(task_id.0.clone()));
+    Value::Object(obj)
 }
 
 fn scroll_target_json(target: &AgentScrollTarget) -> Value {

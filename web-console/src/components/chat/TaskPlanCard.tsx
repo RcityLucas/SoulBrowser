@@ -1,16 +1,7 @@
-import { Card, Steps, Tag, Button, Space, Collapse } from 'antd';
-import {
-  ClockCircleOutlined,
-  CheckCircleOutlined,
-  WarningOutlined,
-  PlayCircleOutlined,
-} from '@ant-design/icons';
+import { Card, Steps, Tag, Space, Typography, List } from 'antd';
+import { ClockCircleOutlined, CheckCircleOutlined, WarningOutlined, PlayCircleOutlined } from '@ant-design/icons';
 import type { TaskPlan } from '@/types';
-import { formatDuration } from '@/utils/format';
-import { useTaskStore } from '@/stores/taskStore';
 import styles from './TaskPlanCard.module.css';
-
-const { Panel } = Collapse;
 
 interface Props {
   plan: TaskPlan;
@@ -18,43 +9,56 @@ interface Props {
 }
 
 export default function TaskPlanCard({ plan, className }: Props) {
-  const createTask = useTaskStore((state) => state.createTask);
+  if (!plan) {
+    return null;
+  }
 
-  const handleExecute = async () => {
-    try {
-      const task = await createTask(plan.id, '执行任务计划');
-      // Navigate to task page or start execution
-      console.log('Task created:', task);
-    } catch (error) {
-      console.error('Failed to create task:', error);
-    }
-  };
+  const rationale = plan.meta?.rationale ?? [];
+  const riskAssessment = plan.meta?.risk_assessment ?? [];
 
-  const getRiskColor = (level: string) => {
-    switch (level) {
-      case 'low':
-        return 'success';
-      case 'medium':
-        return 'warning';
-      case 'high':
-        return 'error';
-      default:
-        return 'default';
+  const getToolName = (tool?: TaskPlan['steps'][number]['tool']) =>
+    tool?.kind ? Object.keys(tool.kind)[0] : 'Custom';
+
+  const formatToolDetail = (tool?: TaskPlan['steps'][number]['tool']) => {
+    if (!tool?.kind) {
+      return null;
     }
+    const name = getToolName(tool);
+    const payload = tool.kind[name];
+    if (!payload || typeof payload !== 'object') {
+      return null;
+    }
+    if (name === 'Navigate') {
+      return `URL: ${payload.url}`;
+    }
+    if (name === 'TypeText') {
+      return `输入: ${payload.text}`;
+    }
+    if (name === 'Click' && payload.locator) {
+      return `定位: ${JSON.stringify(payload.locator)}`;
+    }
+    if (name === 'Custom') {
+      return payload.name || '自定义工具';
+    }
+    return JSON.stringify(payload);
   };
 
   return (
     <Card className={`${styles.planCard} ${className}`} bordered>
       <div className={styles.planHeader}>
-        <h3>任务执行计划</h3>
+        <h3>{plan.title || '任务执行计划'}</h3>
+        {plan.description && (
+          <Typography.Paragraph className={styles.description}>
+            {plan.description}
+          </Typography.Paragraph>
+        )}
         <Space>
           <Tag icon={<ClockCircleOutlined />}>
-            预计耗时: {formatDuration(plan.estimatedDuration)}
+            步骤数: {plan.steps?.length ?? 0}
           </Tag>
-          <Tag color={getRiskColor(plan.riskLevel)}>
-            风险等级: {plan.riskLevel === 'low' ? '低' : plan.riskLevel === 'medium' ? '中' : '高'}
-          </Tag>
-          <Tag>成功率: {(plan.successProbability * 100).toFixed(0)}%</Tag>
+          {riskAssessment.length > 0 && (
+            <Tag color="warning">存在风险提示</Tag>
+          )}
         </Space>
       </div>
 
@@ -62,26 +66,29 @@ export default function TaskPlanCard({ plan, className }: Props) {
         <Steps
           direction="vertical"
           size="small"
-          items={plan.steps.map((step) => ({
-            title: step.name,
+          items={(plan.steps ?? []).map((step, index) => ({
+            title: step.title || `步骤 ${index + 1}`,
             description: (
               <div>
-                <div>{step.description}</div>
-                {step.locator && (
-                  <div className={styles.stepDetails}>
-                    <Tag size="small">工具: {step.tool}</Tag>
-                    <Tag size="small">
-                      定位: {step.locator.primary.type} - {step.locator.primary.value}
-                    </Tag>
-                    <Tag size="small">
-                      置信度: {(step.locator.confidence * 100).toFixed(0)}%
-                    </Tag>
-                  </div>
-                )}
+                {step.detail && <div>{step.detail}</div>}
+                <div className={styles.stepDetails}>
+                  <Tag size="small">工具: {getToolName(step.tool)}</Tag>
+                  {formatToolDetail(step.tool) && (
+                    <Tag size="small">{formatToolDetail(step.tool)}</Tag>
+                  )}
+                  {step.tool?.wait && <Tag size="small">等待: {step.tool.wait}</Tag>}
+                  {typeof step.tool?.timeout_ms === 'number' && (
+                    <div className={styles.stepDetails}>
+                      <Tag size="small">超时: {step.tool.timeout_ms}ms</Tag>
+                    </div>
+                  )}
+                </div>
               </div>
             ),
             icon:
-              step.status === 'completed' ? (
+              index === 0 ? (
+                <PlayCircleOutlined />
+              ) : index === (plan.steps?.length ?? 1) - 1 ? (
                 <CheckCircleOutlined />
               ) : (
                 <ClockCircleOutlined />
@@ -90,35 +97,39 @@ export default function TaskPlanCard({ plan, className }: Props) {
         />
       </div>
 
-      {plan.policyChecks.length > 0 && (
-        <div className={styles.policyChecks}>
-          <h4>策略检查</h4>
-          {plan.policyChecks.map((check) => (
-            <div
-              key={check.policyId}
-              className={`${styles.policyCheck} ${
-                check.passed ? styles.passed : styles.failed
-              }`}
-            >
-              {check.passed ? (
-                <CheckCircleOutlined style={{ color: '#52c41a' }} />
-              ) : (
-                <WarningOutlined style={{ color: '#ff4d4f' }} />
-              )}
-              <span>{check.policyName}</span>
-              {check.message && <span className={styles.checkMessage}>{check.message}</span>}
+      {(rationale.length > 0 || riskAssessment.length > 0) && (
+        <div className={styles.planMeta}>
+          {rationale.length > 0 && (
+            <div>
+              <Typography.Text strong>规划依据</Typography.Text>
+              <List
+                size="small"
+                dataSource={rationale}
+                renderItem={(item) => <List.Item>{item}</List.Item>}
+              />
             </div>
-          ))}
+          )}
+          {riskAssessment.length > 0 && (
+            <div className={styles.riskBlock}>
+              <Typography.Text strong>风险提示</Typography.Text>
+              <List
+                size="small"
+                dataSource={riskAssessment}
+                renderItem={(item) => (
+                  <List.Item>
+                    <WarningOutlined style={{ color: '#faad14', marginRight: 6 }} />
+                    {item}
+                  </List.Item>
+                )}
+              />
+            </div>
+          )}
         </div>
       )}
 
-      <div className={styles.planActions}>
-        <Button type="primary" icon={<PlayCircleOutlined />} onClick={handleExecute} size="large">
-          开始执行
-        </Button>
-        <Button>查看详情</Button>
-        <Button>修改计划</Button>
-      </div>
+      <Space className={styles.planActions}>
+        <Tag color="blue">计划已自动执行</Tag>
+      </Space>
     </Card>
   );
 }

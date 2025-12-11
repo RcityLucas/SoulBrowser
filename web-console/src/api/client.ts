@@ -2,15 +2,17 @@
  * HTTP API Client
  */
 
-import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
+import axios, { AxiosInstance } from 'axios';
+import { message } from 'antd';
 import type { Task, CreateTaskRequest, TaskFilter, MetricsQuery, MetricsReport } from '@/types';
+import { soulbrowserAPI, resolveServeToken } from '@/api/soulbrowser';
 
 class ApiClient {
   private client: AxiosInstance;
 
-  constructor(baseURL: string = '/api') {
+  constructor() {
     this.client = axios.create({
-      baseURL,
+      baseURL: deriveApiBaseUrl(),
       timeout: 30000,
       headers: {
         'Content-Type': 'application/json',
@@ -20,9 +22,14 @@ class ApiClient {
     // Request interceptor
     this.client.interceptors.request.use(
       (config) => {
-        // Add auth token if available
-        const token = localStorage.getItem('auth_token');
+        const baseURL = deriveApiBaseUrl();
+        if (baseURL) {
+          config.baseURL = baseURL;
+        }
+        const token = resolveServeToken();
         if (token) {
+          config.headers = config.headers ?? {};
+          config.headers['x-soulbrowser-token'] = token;
           config.headers.Authorization = `Bearer ${token}`;
         }
         return config;
@@ -35,69 +42,77 @@ class ApiClient {
       (response) => response,
       (error) => {
         if (error.response?.status === 401) {
-          // Handle unauthorized
           window.location.href = '/login';
         }
+        const backendError =
+          (error.response?.data && (error.response.data.error || error.response.data.message)) ||
+          error.message ||
+          '请求失败，请检查后端服务';
+        message.error(backendError);
         return Promise.reject(error);
       }
     );
   }
 
+  setBaseUrl(baseURL: string) {
+    this.client.defaults.baseURL = deriveApiBaseUrl(baseURL);
+  }
+
   // Task APIs
   async listTasks(filter?: TaskFilter): Promise<Task[]> {
-    const response = await this.client.get<Task[]>('/tasks', { params: filter });
+    const response = await this.client.get<Task[]>('/api/tasks', { params: filter });
     return response.data;
   }
 
   async getTask(id: string): Promise<Task> {
-    const response = await this.client.get<Task>(`/tasks/${id}`);
+    const response = await this.client.get<Task>(`/api/tasks/${id}`);
     return response.data;
   }
 
   async createTask(request: CreateTaskRequest): Promise<Task> {
-    const response = await this.client.post<Task>('/tasks', request);
+    const response = await this.client.post<Task>('/api/tasks', request);
     return response.data;
   }
 
   async startTask(id: string): Promise<void> {
-    await this.client.post(`/tasks/${id}/start`);
+    await this.client.post(`/api/tasks/${id}/start`);
   }
 
   async pauseTask(id: string): Promise<void> {
-    await this.client.post(`/tasks/${id}/pause`);
+    await this.client.post(`/api/tasks/${id}/pause`);
   }
 
   async resumeTask(id: string): Promise<void> {
-    await this.client.post(`/tasks/${id}/resume`);
+    await this.client.post(`/api/tasks/${id}/resume`);
   }
 
   async cancelTask(id: string): Promise<void> {
-    await this.client.post(`/tasks/${id}/cancel`);
+    await this.client.post(`/api/tasks/${id}/cancel`);
   }
 
   async deleteTask(id: string): Promise<void> {
-    await this.client.delete(`/tasks/${id}`);
+    await this.client.delete(`/api/tasks/${id}`);
   }
 
   async retryTask(id: string): Promise<Task> {
-    const response = await this.client.post<Task>(`/tasks/${id}/retry`);
+    const response = await this.client.post<Task>(`/api/tasks/${id}/retry`);
     return response.data;
   }
 
   // Metrics APIs
   async getMetrics(query?: MetricsQuery): Promise<MetricsReport> {
-    const response = await this.client.get<MetricsReport>('/metrics', { params: query });
+    const response = await this.client.get<MetricsReport>('/api/metrics', { params: query });
     return response.data;
   }
 
   async getTaskStatistics(): Promise<any> {
-    const response = await this.client.get('/metrics/statistics');
+    const response = await this.client.get('/api/metrics/statistics');
     return response.data;
   }
 
   // Chat APIs
   async sendChatMessage(message: string): Promise<any> {
-    const response = await this.client.post('/chat', { content: message });
+    const response = await this.client.post('/api/chat', { content: message });
     return response.data;
   }
 
@@ -114,3 +129,21 @@ class ApiClient {
 
 export const apiClient = new ApiClient();
 export default apiClient;
+
+function deriveApiBaseUrl(baseURL?: string): string | undefined {
+  const candidates = [
+    baseURL,
+    import.meta.env.VITE_BACKEND_URL,
+    typeof window !== 'undefined' ? window.location.origin : undefined,
+    soulbrowserAPI.getBaseUrl(),
+  ];
+
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim();
+    if (trimmed) {
+      return trimmed.replace(/\/+$/, '');
+    }
+  }
+
+  return undefined;
+}
