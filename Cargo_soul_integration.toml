@@ -5,15 +5,15 @@
 members = [
     ".",
     # Include soul-base crates that use Rust 2021
-    "../soul-base-main/soul-base-main/crates/soulbase-auth",
-    "../soul-base-main/soul-base-main/crates/soulbase-config", 
-    "../soul-base-main/soul-base-main/crates/soulbase-errors",
-    "../soul-base-main/soul-base-main/crates/soulbase-interceptors",
-    "../soul-base-main/soul-base-main/crates/soulbase-llm",
-    "../soul-base-main/soul-base-main/crates/soulbase-sandbox",
-    "../soul-base-main/soul-base-main/crates/soulbase-storage",
-    "../soul-base-main/soul-base-main/crates/soulbase-tools",
-    "../soul-base-main/soul-base-main/crates/soulbase-tx",
+    "third_party/soul-base/crates/soulbase-auth",
+    "third_party/soul-base/crates/soulbase-config", 
+    "third_party/soul-base/crates/soulbase-errors",
+    "third_party/soul-base/crates/soulbase-interceptors",
+    "third_party/soul-base/crates/soulbase-llm",
+    "third_party/soul-base/crates/soulbase-sandbox",
+    "third_party/soul-base/crates/soulbase-storage",
+    "third_party/soul-base/crates/soulbase-tools",
+    "third_party/soul-base/crates/soulbase-tx",
     # Skip soulbase-types (uses edition 2024)
 ]
 
@@ -21,49 +21,49 @@ members = [
 # === DIRECTLY REUSABLE SOUL-BASE CRATES (Rust 2021) ===
 
 # Error system with HTTP/gRPC mapping and retry semantics
-soulbase-errors = { path = "../soul-base-main/soul-base-main/crates/soulbase-errors" }
+soulbase-errors = { path = "third_party/soul-base/crates/soulbase-errors" }
 
 # Schema-driven configuration with validation and hot reload
-soulbase-config = { path = "../soul-base-main/soul-base-main/crates/soulbase-config" }
+soulbase-config = { path = "third_party/soul-base/crates/soulbase-config" }
 
 # Tool manifest, registry, and invocation protocol
-soulbase-tools = { path = "../soul-base-main/soul-base-main/crates/soulbase-tools" }
+soulbase-tools = { path = "third_party/soul-base/crates/soulbase-tools" }
 
 # Secure sandboxed execution with resource limits
-soulbase-sandbox = { path = "../soul-base-main/soul-base-main/crates/soulbase-sandbox" }
+soulbase-sandbox = { path = "third_party/soul-base/crates/soulbase-sandbox" }
 
 # LLM integration for AI-powered automation
-soulbase-llm = { path = "../soul-base-main/soul-base-main/crates/soulbase-llm" }
+soulbase-llm = { path = "third_party/soul-base/crates/soulbase-llm" }
 
 # Authentication and authorization
-soulbase-auth = { path = "../soul-base-main/soul-base-main/crates/soulbase-auth" }
+soulbase-auth = { path = "third_party/soul-base/crates/soulbase-auth" }
 
 # Interceptor chains for middleware
-soulbase-interceptors = { path = "../soul-base-main/soul-base-main/crates/soulbase-interceptors" }
+soulbase-interceptors = { path = "third_party/soul-base/crates/soulbase-interceptors" }
 
 # Storage abstraction with multiple backends
-soulbase-storage = { path = "../soul-base-main/soul-base-main/crates/soulbase-storage" }
+soulbase-storage = { path = "third_party/soul-base/crates/soulbase-storage" }
 
 # Transaction management with saga support
-soulbase-tx = { path = "../soul-base-main/soul-base-main/crates/soulbase-tx" }
+soulbase-tx = { path = "third_party/soul-base/crates/soulbase-tx" }
 
 # === SOUL-BASE CRATES REQUIRING WORKSPACE EDITION CHECK ===
 # These use edition.workspace = true, defaulting to 2021
 
 # Two-level caching with Redis support (if compatible)
-# soulbase-cache = { path = "../soul-base-main/soul-base-main/crates/soulbase-cache" }
+# soulbase-cache = { path = "third_party/soul-base/crates/soulbase-cache" }
 
 # Object storage for screenshots (if compatible)
-# soulbase-blob = { path = "../soul-base-main/soul-base-main/crates/soulbase-blob" }
+# soulbase-blob = { path = "third_party/soul-base/crates/soulbase-blob" }
 
 # Cryptography utilities (if compatible)
-# soulbase-crypto = { path = "../soul-base-main/soul-base-main/crates/soulbase-crypto" }
+# soulbase-crypto = { path = "third_party/soul-base/crates/soulbase-crypto" }
 
 # HTTP client with retry/failover (if compatible)
-# soulbase-net = { path = "../soul-base-main/soul-base-main/crates/soulbase-net" }
+# soulbase-net = { path = "third_party/soul-base/crates/soulbase-net" }
 
 # Observability pipeline (if compatible)
-# soulbase-observe = { path = "../soul-base-main/soul-base-main/crates/soulbase-observe" }
+# soulbase-observe = { path = "third_party/soul-base/crates/soulbase-observe" }
 
 # === INCOMPATIBLE CRATE (Rust 2024) ===
 # soulbase-types requires Rust edition 2024 - must use adapted version

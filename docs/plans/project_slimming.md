@@ -12,19 +12,29 @@
 - **模块分层整理**：`
   - `src/main.rs` 长达数千行，按子域（CLI command handlers、Serve 路由、任务查询、记忆中心等）拆分成 `src/cli/*` 与 `src/server/*`，导出清晰接口。 
   - 将 `ServeState` / rate limiter / perception handler 等独立到 `src/server/serve.rs`、`src/server/rate_limit.rs`，降低单文件复杂度。 
-- ✅ 首批拆分：`cmd_serve`、`ServeArgs` 迁移到 `src/cli/serve.rs`，`src/main.rs` 仅保留命令分派逻辑，其余 Serve 启动细节集中至模块，后续可继续拆分任务/记忆等子域。 
-- ✅ Gateway CLI 同步拆分：`GatewayArgs`/`cmd_gateway`/策略加载已迁移到 `src/cli/gateway.rs`，主文件只保留运行时 handler，方便继续瘦身 Task/Gateway 逻辑。
+- ✅ `Kernel::serve`/`Kernel::gateway` 已实现，Serve/Gateway CLI 只做参数解析；`src/main.rs` 仍需继续瘦身 demo/replay/record/memory 等命令，逐步改为调用 `Kernel` API。
 - ✅ CLI 子命令持续瘦身：内存相关 Args/handlers (`cmd_memory`) 已迁入 `src/cli/memory.rs`，共用的模板/标签工具通过模块导出供 Serve/API 复用。
 - ✅ Artifacts CLI 迁出：`ArtifactsArgs`/`cmd_artifacts` 与过滤、提取、摘要逻辑集中到 `src/cli/artifacts.rs`，`src/main.rs` 仅保留命令分派和共享的 `load_run_bundle`。 
 - ✅ Tasks CLI 拆分：任务计划列表/展示命令已迁入 `src/cli/tasks.rs`，main 只负责分发，`TaskPlanStore` 交互集中在模块内。 
 - ✅ Metrics CLI 拆分：指标相关 Args/handlers (`cmd_metrics`) 迁入 `src/cli/metrics.rs`，主文件仅保留指标计算逻辑 `compute_metrics_from_report`。 
 - ✅ Schema CLI 拆分：`SchemaArgs`/`cmd_schema` 已迁入 `src/cli/schema.rs`，schema 校验逻辑通过模块复用，`src/main.rs` 不再承载这些子命令定义。 
+- ✅ **CLI 参数模块化**：`Start/Run/Demo/Perceive/Replay/Export` 参数与枚举迁入各自模块，`src/main.rs` 只负责命令分派，移除 300+ 行重复定义与对应的未使用导入。 
+- ✅ **命令辅助函数下沉**：录制命令的 `persist_event` 与相关 `BrowserEvent` 写入逻辑迁至 `src/cli/record.rs`，`main.rs` 中不再维护专用 helper，进一步缩小入口文件依赖。 
+- ✅ **入口辅助模块化**：`load_local_env_overrides`、`load_config`、`init_logging`、`apply_runtime_overrides` 等通用启动逻辑集中到 `src/cli/runtime.rs`，`src/main.rs` 只负责 CLI 解析与命令分派。
+- ✅ **CLI 常量聚合**：`DEFAULT_LARGE_THRESHOLD` 等公共阈值集中在 `src/cli/constants.rs`，子命令直接引用该模块，避免在 main.rs 保持多余常量。
+- ✅ **命令定义外移**：`Commands` 枚举迁入 `src/cli/commands.rs`，`main.rs` 仅引用导出的枚举，进一步缩短入口文件并保持 clap 宏近模块维护。
+- ✅ **输出格式统一**：`OutputFormat` ValueEnum 迁至 `src/cli/output.rs`，由 CLI 模块集中导入，`main.rs` 与 `chat` 仅引用该模块，维持入口文件的轻量化。
+- ✅ **CLI 顶层参数外移**：`CliArgs` 定义与 clap attributes 迁入 `src/cli/env.rs`，`main.rs` 通过模块导出的 `CliArgs::parse()` 获取参数，避免入口文件堆满 clap 注解。
+- ✅ **命令分发模块化**：`match` 分派逻辑迁至 `src/cli/dispatch.rs`，Main 只调用 `dispatch(&CliArgs)`，进一步减少入口体积并让子命令扩展聚焦在 CLI 模块。
+- ✅ **入口封装**：新增 `src/cli/app.rs::run()` 承载环境加载、日志初始化、配置读取和异常处理，`main.rs` 仅调用 `cli::app::run()`；`Config` 不再由根模块 re-export，子命令直接使用 `soulbrowser_kernel::Config`。
+- ✅ **CLI 内聚**：`src/cli/mod.rs` 不再批量 re-export 子命令，`dispatch.rs` 和 `commands.rs` 直接引用对应模块，减少全局命名污染并保持模块边界清晰。
+- ✅ **Serve/Kernel 警告清理**：整理 `ServeState` 与路由模块的未使用字段/导入，合并多余的 `mut` 绑定，WebSocket/插件路由按需保留字段，`cargo check` 不再受 kernel 层警告干扰。 
 - ✅ **去除未使用 Feature**：移除 `full-stack`/`legacy-tests`/`legacy-examples`/`soul-adapted` feature gates，旧示例与测试源码迁入 `docs/examples/legacy_code/`，Cargo 默认构建不再携带这些标志。 
-- **重复工具整合**：集中 `tools/`、`automation/`、`export/` 中的相似逻辑（如 CSV/JSON 导出、计划执行）到共享库，减少多处复制；在模块头部补加“用途/状态”注释。 
+- **重复工具整合**：集中 `tools/`、`automation/`、`export/` 中的相似逻辑（如 CSV/JSON 导出、计划执行）到共享库，减少多处复制；`soulbrowser_kernel::tools` 仍需将 `register_*` 改成数据驱动，以便未来增删 manifest。 
 - ✅ **test/示例压缩**：依赖旧 soul-base API 的 examples/tests 已迁入 `docs/examples/legacy_code/`（含源码与说明），默认仓库仅保留 Serve/API 相关示例与测试。 
 
 ## 3. 依赖与构建优化
-- **依赖审计**：运行 `cargo udeps`/`cargo tree -d` 查找未使用或重复依赖，记录在本计划，并分两阶段移除：优先删无引用的 crate，再评估是否需要替换重型依赖（如 `openssl vendored`）。 
+- **依赖审计**：运行 `cargo udeps`/`cargo tree -d` 查找未使用或重复依赖，记录在本计划，并分两阶段移除：优先删无引用的 crate（如 action-* 系列仍待合并），再评估是否需要替换重型依赖（如 `openssl vendored`）。 
 - ✅ **脚本清理**：`scripts/README.md` 记录了受支持的工具（clean_output、cleanup_profiles、perception_bench），并移除了重复的 `perception_benchmark.sh`，保留 sh/ps1 各 1 份，旧入口在 README 中标注迁移说明。 
 - ✅ **配置示例瘦身**：`config/README.md` 说明现役 `.example` 文件和目录的用途（config.yaml、local.env、data_extract_profiles、plugins/permissions/policies/self_heal等），`config/archive/README.md` 则约定旧样例的归宿，防止顶层 `config/` 再次堆积遗留文件。 
 - **CI/工具链**：若存在重复的 lint/test pipeline（例如 `ci/` + GitHub Actions + scripts/dev_checks.sh`），整合成一条标准流程，并在贡献指南中明确。

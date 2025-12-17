@@ -78,7 +78,7 @@ fn write_parser_module(module: &str, parser_fn: &str, schema: &str, force: bool)
     let template = format!(
         r#"use anyhow::{{anyhow, Result}};
 use serde_json::Value;
-use crate::parsers::helpers::extract_observation_metadata;
+use soulbrowser_kernel::parsers::helpers::extract_observation_metadata;
 
 const SCHEMA_ID: &str = "{schema}";
 

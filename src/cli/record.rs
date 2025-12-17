@@ -1,18 +1,17 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Args;
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::app_context::get_or_create_context;
-use crate::browser_impl::{BrowserConfig, L0Protocol, L1BrowserManager};
-use crate::storage::BrowserSessionEntity;
-use crate::types::BrowserType;
-use crate::{persist_event, Config};
-use soulbase_types::tenant::TenantId;
+use crate::cli::context::CliContext;
+use soulbrowser_kernel::browser_impl::{BrowserConfig, L0Protocol, L1BrowserManager};
+use soulbrowser_kernel::storage::{BrowserEvent, BrowserSessionEntity, StorageManager};
+use soulbrowser_kernel::types::{BrowserType, TenantId};
 
 #[derive(Args, Clone, Debug)]
 pub struct RecordArgs {
@@ -48,16 +47,16 @@ pub struct RecordArgs {
     pub performance: bool,
 }
 
-pub async fn cmd_record(args: RecordArgs, config: &Config) -> Result<()> {
+pub async fn cmd_record(args: RecordArgs, ctx: &CliContext) -> Result<()> {
     info!("Starting recording session: {}", args.name);
 
+    let config = ctx.config();
     let storage_path = args
         .output_dir
         .clone()
         .or_else(|| Some(config.output_dir.clone()));
 
-    let context =
-        get_or_create_context("cli".to_string(), storage_path, config.policy_paths.clone()).await?;
+    let context = ctx.app_context_with("cli", storage_path).await?;
     let storage = context.storage();
 
     let tenant_id = TenantId("cli".to_string());
@@ -170,6 +169,34 @@ pub async fn cmd_record(args: RecordArgs, config: &Config) -> Result<()> {
         "Recording session {} complete. Replay with: cargo run -- replay {}",
         session_id, session_id
     );
+
+    Ok(())
+}
+
+async fn persist_event(
+    storage: &Arc<StorageManager>,
+    tenant: &TenantId,
+    session_id: &str,
+    sequence: u64,
+    event_type: &str,
+    data: JsonValue,
+) -> Result<()> {
+    let event = BrowserEvent {
+        id: Uuid::new_v4().to_string(),
+        tenant: tenant.clone(),
+        session_id: session_id.to_string(),
+        timestamp: Utc::now().timestamp_millis(),
+        event_type: event_type.to_string(),
+        data,
+        sequence,
+        tags: vec!["recording".to_string()],
+    };
+
+    storage
+        .backend()
+        .store_event(event)
+        .await
+        .context("Failed to persist recording event")?;
 
     Ok(())
 }

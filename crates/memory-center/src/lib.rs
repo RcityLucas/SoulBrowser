@@ -6,7 +6,8 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -44,11 +45,16 @@ impl MemoryRecord {
     }
 }
 
-#[derive(Default)]
 pub struct MemoryCenter {
-    inner: DashMap<String, Vec<MemoryRecord>>,
-    storage_path: Option<PathBuf>,
+    inner: Arc<DashMap<String, Vec<MemoryRecord>>>,
+    persistence: Option<PersistenceHandle>,
     metrics: MemoryMetrics,
+}
+
+impl Default for MemoryCenter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Default)]
@@ -77,17 +83,19 @@ pub struct MemoryStatsSnapshot {
 impl MemoryCenter {
     pub fn new() -> Self {
         Self {
-            inner: DashMap::new(),
-            storage_path: None,
+            inner: Arc::new(DashMap::new()),
+            persistence: None,
             metrics: MemoryMetrics::default(),
         }
     }
 
     pub fn with_persistence(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
+        let inner = Arc::new(DashMap::new());
+        let persistence = Some(PersistenceHandle::new(path.clone(), Arc::clone(&inner)));
         let center = Self {
-            inner: DashMap::new(),
-            storage_path: Some(path.clone()),
+            inner,
+            persistence,
             metrics: MemoryMetrics::default(),
         };
 
@@ -117,9 +125,7 @@ impl MemoryCenter {
             .or_insert_with(Vec::new)
             .push(record.clone());
         self.metrics.stores.fetch_add(1, Ordering::Relaxed);
-        if let Err(err) = self.persist_to_disk() {
-            warn!(error = %err, "memory-center persist failed after store");
-        }
+        self.schedule_flush();
         record
     }
 
@@ -192,9 +198,7 @@ impl MemoryCenter {
 
         if removed.is_some() {
             self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
-            if let Err(err) = self.persist_to_disk() {
-                warn!(error = %err, "memory-center persist failed after delete");
-            }
+            self.schedule_flush();
         }
 
         removed
@@ -214,16 +218,18 @@ impl MemoryCenter {
         }
 
         if updated.is_some() {
-            if let Err(err) = self.persist_to_disk() {
-                warn!(error = %err, "memory-center persist failed after update");
-            }
+            self.schedule_flush();
         }
 
         updated
     }
 
     pub fn persist_now(&self) -> io::Result<()> {
-        self.persist_to_disk()
+        if let Some(handle) = &self.persistence {
+            handle.flush_sync()
+        } else {
+            Ok(())
+        }
     }
 
     pub fn stats_snapshot(&self) -> MemoryStatsSnapshot {
@@ -287,21 +293,98 @@ impl MemoryCenter {
         });
     }
 
-    fn persist_to_disk(&self) -> io::Result<()> {
-        let Some(path) = self.storage_path.as_ref() else {
-            return Ok(());
-        };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+    fn schedule_flush(&self) {
+        if let Some(handle) = &self.persistence {
+            handle.schedule();
         }
-        let mut all_records: Vec<MemoryRecord> = Vec::new();
-        for entry in self.inner.iter() {
-            all_records.extend(entry.value().clone());
-        }
-        let json = serde_json::to_vec_pretty(&all_records)
-            .map_err(|err| io::Error::new(ErrorKind::Other, format!("{err}")))?;
-        fs::write(path, json)
     }
+
+    fn snapshot_records(inner: &DashMap<String, Vec<MemoryRecord>>) -> Vec<MemoryRecord> {
+        inner
+            .iter()
+            .flat_map(|entry| entry.value().clone())
+            .collect()
+    }
+}
+
+pub fn normalize_tags<I, S>(tags: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    tags.into_iter()
+        .filter_map(|tag| {
+            let trimmed = tag.as_ref().trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect()
+}
+
+pub fn normalize_note<S: AsRef<str>>(note: Option<S>) -> Option<String> {
+    note.and_then(|value| {
+        let trimmed = value.as_ref().trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+pub fn normalize_metadata(metadata: Option<Value>) -> Option<Value> {
+    match metadata {
+        Some(Value::Null) => None,
+        other => other,
+    }
+}
+
+struct PersistenceHandle {
+    tx: mpsc::Sender<PersistenceSignal>,
+    path: PathBuf,
+    inner: Arc<DashMap<String, Vec<MemoryRecord>>>,
+}
+
+impl PersistenceHandle {
+    fn new(path: PathBuf, inner: Arc<DashMap<String, Vec<MemoryRecord>>>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let worker_path = path.clone();
+        let worker_inner = Arc::clone(&inner);
+        thread::spawn(move || persistence_worker(worker_path, worker_inner, rx));
+        Self { tx, path, inner }
+    }
+
+    fn schedule(&self) {
+        let _ = self.tx.send(PersistenceSignal);
+    }
+
+    fn flush_sync(&self) -> io::Result<()> {
+        write_snapshot(&self.path, &self.inner)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PersistenceSignal;
+
+fn persistence_worker(
+    path: PathBuf,
+    inner: Arc<DashMap<String, Vec<MemoryRecord>>>,
+    rx: mpsc::Receiver<PersistenceSignal>,
+) {
+    while rx.recv().is_ok() {
+        while rx.try_recv().is_ok() {}
+        if let Err(err) = write_snapshot(&path, &inner) {
+            warn!(error = %err, "memory-center async persist failed");
+        }
+    }
+}
+
+fn write_snapshot(
+    path: &PathBuf,
+    inner: &Arc<DashMap<String, Vec<MemoryRecord>>>,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let snapshot = MemoryCenter::snapshot_records(inner);
+    let json = serde_json::to_vec_pretty(&snapshot)
+        .map_err(|err| io::Error::new(ErrorKind::Other, format!("{err}")))?;
+    fs::write(path, json)
 }
 
 pub type SharedMemoryCenter = Arc<MemoryCenter>;

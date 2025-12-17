@@ -1,0 +1,17 @@
+[package]
+name = "integration-soulbase"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+soulbrowser-kernel = { path = "../soulbrowser-kernel", default-features = false }
+# soul-base crates (path dependencies kept for now; will later move behind feature gate)
+soulbase-auth = { path = "../../third_party/soul-base/crates/soulbase-auth" }
+soulbase-config = { path = "../../third_party/soul-base/crates/soulbase-config" }
+soulbase-errors = { path = "../../third_party/soul-base/crates/soulbase-errors" }
+soulbase-interceptors = { path = "../../third_party/soul-base/crates/soulbase-interceptors" }
+soulbase-storage = { path = "../../third_party/soul-base/crates/soulbase-storage" }
+soulbase-tools = { path = "../../third_party/soul-base/crates/soulbase-tools" }
+soulbase-types = { path = "../../third_party/soul-base/crates/soulbase-types" }

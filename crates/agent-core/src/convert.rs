@@ -3,14 +3,14 @@ use crate::plan::{
     AgentLocator, AgentPlan, AgentPlanStep, AgentScrollTarget, AgentTool, AgentToolKind,
     AgentValidation, AgentWaitCondition, WaitMode,
 };
-use action_flow::types::{ActionType, FailureStrategy, Flow, FlowNode};
-use action_gate::{
+use serde_json::{Map as JsonMap, Value};
+use soulbrowser_actions::flow::types::{ActionType, FailureStrategy, Flow, FlowNode};
+use soulbrowser_actions::gate::types::{
     Condition, DomCondition, ExpectSpec, NetCondition, TitleCondition, UrlCondition,
 };
-use action_primitives::{
+use soulbrowser_actions::primitives::{
     AnchorDescriptor, ScrollBehavior, ScrollTarget, SelectMethod, WaitCondition, WaitTier,
 };
-use serde_json::{Map as JsonMap, Value};
 use std::collections::HashMap;
 
 /// Options controlling conversion from AgentPlan into Flow structures.

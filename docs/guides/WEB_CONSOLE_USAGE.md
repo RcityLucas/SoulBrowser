@@ -299,12 +299,24 @@ server: {
 }
 ```
 
+### 租户输出布局
+
+- 所有计划（`tasks/*.json`）和执行历史会写入 `soulbrowser-output/tenants/<tenant>/`，其中 `tasks/` 目录保存规划快照，`executions/<task_id>/` 保存 `plans.json`、`executions.json`、`state_events.json` 等运行产物。
+- 控制台和 CLI（`run`/`replay`/`export`/`analyze`/`chat`/`memory`/`observations`/`scheduler`/`policy`/`timeline`/`gateway`/`start`/`record` 等）都带有 `--tenant` 选项，可显式指定要读取/写入的租户；未指定时仍默认 `serve-api`。
+- 旧版 Serve/CLI 如果曾把执行记录写到 `soulbrowser-output/tasks/<id>`，可以运行 `scripts/migrate_execution_outputs.sh --tenant serve-api` 将历史数据迁移到新的 `tenants/<tenant>/executions/<id>` 目录，脚本支持 `--output-dir` 和 `--dry-run`。
+
 ### 存储保洁与并发控制
 
 - `SOUL_PLAN_TTL_DAYS`（默认 30）：Serve 启动时会扫描 `soulbrowser-output/tenants/<tenant>/tasks/*.json` 并清理早于该 TTL 的计划文件；设置为 `0` 可禁用自动清理。
-- `SOUL_OUTPUT_TTL_DAYS`（默认 30）：Serve 还会清理 `soulbrowser-output/tasks/<task_id>/` 下的执行记录（`plans.json`、`executions.json` 等）；对 demo/本地环境保留更长历史时可提高该值，设置 `0` 可关闭自动删除。
+- `SOUL_OUTPUT_TTL_DAYS`（默认 30）：Serve 还会清理 `soulbrowser-output/tenants/<tenant>/executions/<task_id>/` 下的执行记录（`plans.json`、`executions.json` 等）；对 demo/本地环境保留更长历史时可提高该值，设置 `0` 可关闭自动删除。
 - `SOUL_CHAT_CONTEXT_LIMIT`（默认 2）：限制 `/api/chat` 触发的感知上下文抓取同时运行数量，防止感知任务拖垮整个 Web Console。
 - `SOUL_CHAT_CONTEXT_WAIT_MS`（默认 750）：`capture_chat_context_snapshot` 等待 semaphore 的最长毫秒数，超时会跳过感知并返回异常，避免请求无限阻塞。
+
+### Serve 路由预设
+
+- `cargo run --bin soulbrowser -- serve --surface console`（默认）会加载 perception/chat/tasks/memory/plugins/self_heal/admin 等全部模块，适合内部/控制台。
+- `--surface gateway` 或 `SOUL_SERVE_SURFACE=gateway` 仅启动 perception/chat/tasks API，省略 memory/plugins/self_heal/admin 等敏感路由，适合暴露在公共入口的受限 Serve。
+- 也可以在 `config/config.yaml` 里设置 `serve_surface: gateway`，CLI 参数优先级最高，其次配置文件，最后是环境变量。
 
 ### 生产部署
 
@@ -316,6 +328,8 @@ npm run build
 ```
 
 构建产物位于 `web-console/dist/`。
+
+> 提示：Serve 内嵌的 `static/console.html`/`static/assets/*` 需要与 React 构建保持一致。仓库提供了 `scripts/ci/build_console.sh`，它会执行 `npm run build` 并将产物同步到 `static/`，CI 也可以调用该脚本自动刷新嵌入页面。
 
 #### 使用 Nginx 反向代理
 

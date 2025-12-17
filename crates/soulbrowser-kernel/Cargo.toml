@@ -1,0 +1,98 @@
+[package]
+name = "soulbrowser-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+ tokio = { version = "1.39", features = ["full"] }
+ tokio-util = { version = "0.7" }
+ async-trait = "0.1"
+ async-recursion = "1.0"
+ once_cell = "1.19"
+ async-stream = "0.3"
+ soulbrowser-core-types = { path = "../core-types", features = ["serde-full"] }
+ soulbrowser-event-bus = { path = "../event-bus" }
+ soulbrowser-registry = { path = "../registry" }
+ soulbrowser-scheduler = { path = "../scheduler", features = ["serde"] }
+ soulbrowser-state-center = { path = "../state-center" }
+ soulbrowser-policy-center = { path = "../policy-center" }
+ event-store = { path = "../event-store" }
+ cdp-adapter = { path = "../cdp-adapter" }
+ network-tap-light = { path = "../network-tap-light" }
+ action-primitives = { path = "../action-primitives" }
+ agent-core = { path = "../agent-core" }
+ dashmap = "5"
+ parking_lot = "0.12"
+ perceiver-structural = { path = "../perceiver-structural" }
+ perceiver-visual = { path = "../perceiver-visual" }
+ perceiver-semantic = { path = "../perceiver-semantic" }
+ perceiver-hub = { path = "../perceiver-hub" }
+ permissions-broker = { path = "../permissions-broker" }
+ url = "2.5"
+ base64 = "0.22"
+ hex = "0.4"
+ prometheus = "0.13"
+ lazy_static = "1.4"
+axum = { version = "0.7", features = ["tokio", "ws"] }
+futures = "0.3"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+tower = { version = "0.4", features = ["util"] }
+clap = { version = "4.4", features = ["derive"] }
+openssl = { version = "0.10", features = ["vendored"] }
+ l6-observe = { path = "../l6-observe" }
+ l6-timeline = { path = "../l6-timeline" }
+ l6-privacy = { path = "../l6-privacy" }
+ l7-adapter = { path = "../l7-adapter" }
+ l7-plugin = { path = "../l7-plugin" }
+ regex = "1.10"
+ reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ memory-center = { path = "../memory-center" }
+
+# Serialization
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
+ serde_yaml = "0.9"
+ schemars = "0.8"
+ csv = "1.3"
+ humantime = "2.1"
+
+# Error handling
+ thiserror = "1.0"
+ anyhow = "1.0"
+
+# Logging & Tracing
+ tracing = "0.1"
+ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+ tracing-appender = "0.2"
+
+# Configuration and directories
+ config = "0.14"
+ dirs = "5.0"
+ tempfile = "3.8"
+
+# Time & Date
+ chrono = { version = "0.4", features = ["serde"] }
+ uuid = { version = "1.0", features = ["v4", "serde"] }
+ sha2 = "0.10"
+
+# Direct soul-base components integration (optional for fallback builds)
+ soulbase-types = { path = "../../third_party/soul-base/crates/soulbase-types", optional = true }
+ soulbase-errors = { path = "../../third_party/soul-base/crates/soulbase-errors", optional = true }
+ soulbase-config = { path = "../../third_party/soul-base/crates/soulbase-config", optional = true }
+ soulbase-auth = { path = "../../third_party/soul-base/crates/soulbase-auth", optional = true }
+soulbase-interceptors = { path = "../../third_party/soul-base/crates/soulbase-interceptors", optional = true }
+soulbase-storage = { path = "../../third_party/soul-base/crates/soulbase-storage", optional = true }
+soulbase-tools = { path = "../../third_party/soul-base/crates/soulbase-tools", optional = true }
+
+[features]
+default = ["soulbase"]
+soulbase = [
+    "dep:soulbase-types",
+    "dep:soulbase-errors",
+    "dep:soulbase-config",
+    "dep:soulbase-auth",
+    "dep:soulbase-interceptors",
+    "dep:soulbase-storage",
+    "dep:soulbase-tools",
+]

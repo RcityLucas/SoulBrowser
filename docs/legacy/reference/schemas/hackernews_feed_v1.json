@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HackerNews Feed",
+  "description": "Ranked front page stories (title, points, comments)",
+  "type": "object",
+  "properties": {
+    "schema": { "type": "string", "const": "hackernews_feed_v1" },
+    "source_url": { "type": "string", "format": "uri" },
+    "captured_at": { "type": "string", "format": "date-time" },
+    "page_title": { "type": "string" },
+    "items": {
+      "type": "array",
+      "description": "Ordered HackerNews stories captured from the requested feed",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "rank": { "type": "integer", "minimum": 1 },
+          "title": { "type": "string", "minLength": 1 },
+          "url": { "type": "string", "format": "uri" },
+          "discussion_url": { "type": "string", "format": "uri" },
+          "points": { "type": "integer", "minimum": 0 },
+          "author": { "type": "string", "minLength": 1 },
+          "comment_count": { "type": "integer", "minimum": 0 }
+        },
+        "required": ["title", "url"]
+      }
+    }
+  },
+  "required": ["schema", "items"],
+  "additionalProperties": false
+}

@@ -27,7 +27,7 @@
 - ✅ **SSE 优化**：`TaskStatusRegistry` 发送批量事件（观察、Overlay 等）时只持有一次锁并一次广播，降低高并发下的锁争用，History buffer 仍支持 `Last-Event-ID` 重放。 
 
 ## 5. Task Center & 存储
-- ✅ **Plan/Artifact 生命周期**：`TaskPlanStore` 在 Serve 启动时依据 `SOUL_PLAN_TTL_DAYS` 清理过期计划；`soulbrowser-output/tasks/<task_id>` 目录也会根据 `SOUL_OUTPUT_TTL_DAYS` 自动移除旧的执行快照，避免输出目录无限增长。后续仍可补充压缩/归档策略与异步下载。 
+- ✅ **Plan/Artifact 生命周期**：`TaskPlanStore` 在 Serve 启动时依据 `SOUL_PLAN_TTL_DAYS` 清理过期计划；`soulbrowser-output/tenants/<tenant>/executions/<task_id>` 目录也会根据 `SOUL_OUTPUT_TTL_DAYS` 自动移除旧的执行快照，避免输出目录无限增长。后续仍可补充压缩/归档策略与异步下载。 
 - ✅ **断线恢复**：`/api/tasks/:id/events` SSE 支持 `Last-Event-ID`/`cursor` 回放，TypeScript SDK 提供 `client.streamTaskEvents()` 自动重连并暴露 `lastId`，控制台/脚本断线后可凭游标补齐事件。 
 - ✅ **日志分页**：`/api/tasks/:id/logs` 现支持 `limit`/`cursor`/`since`（RFC3339）筛选并返回 `next_cursor`，用于 Web Console 断线后增量补齐任务日志。 
 

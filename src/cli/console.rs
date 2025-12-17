@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use super::{artifacts::build_artifact_summary, run_bundle::load_run_bundle};
-use crate::{CONSOLE_HTML, DEFAULT_LARGE_THRESHOLD};
+use crate::cli::constants::DEFAULT_LARGE_THRESHOLD;
+use soulbrowser_kernel::CONSOLE_HTML;
 
 #[derive(Args, Clone, Debug)]
 pub struct ConsoleArgs {

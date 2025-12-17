@@ -4,7 +4,9 @@
 //! data structures and traits that the higher layers will wire against while the concrete
 //! implementation is filled in milestone by milestone.
 
+use std::{env, path::PathBuf};
 use tokio::sync::broadcast;
+use which::which;
 
 pub mod ids {
     use serde::{Deserialize, Serialize};
@@ -171,9 +173,12 @@ pub mod events {
 }
 
 pub mod config {
+    use crate::detect_chrome_executable;
     use serde::{Deserialize, Serialize};
-    use std::path::PathBuf;
-    use std::{env, path::Path};
+    use std::{
+        env,
+        path::{Path, PathBuf},
+    };
 
     /// Configuration for launching and tuning the adapter.
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -202,9 +207,7 @@ pub mod config {
     }
 
     fn default_chrome_path() -> PathBuf {
-        env::var("SOULBROWSER_CHROME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
+        detect_chrome_executable().unwrap_or_default()
     }
 
     fn default_profile_dir() -> PathBuf {
@@ -214,6 +217,180 @@ pub mod config {
 
         let default = Path::new("./.soulbrowser-profile");
         default.into()
+    }
+}
+
+fn detect_chrome_executable() -> Option<PathBuf> {
+    if let Ok(raw) = env::var("SOULBROWSER_CHROME") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let candidate = PathBuf::from(trimmed);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for name in chrome_executable_names() {
+        if let Ok(path) = which(name) {
+            return Some(path);
+        }
+    }
+
+    let skip_defaults = env::var("SOULBROWSER_SKIP_OS_PATHS")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+
+    if !skip_defaults {
+        for candidate in os_specific_chrome_paths() {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn chrome_executable_names() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &["chrome.exe", "chromium.exe", "msedge.exe"]
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
+    {
+        &[
+            "google-chrome-stable",
+            "google-chrome",
+            "chromium",
+            "chromium-browser",
+        ]
+    }
+
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd"
+    )))]
+    {
+        &["chrome"]
+    }
+}
+
+fn os_specific_chrome_paths() -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut paths = Vec::new();
+        for root in windows_search_roots() {
+            paths.push(root.join("Google/Chrome/Application/chrome.exe"));
+            paths.push(root.join("Chromium/Application/chrome.exe"));
+            paths.push(root.join("Microsoft/Edge/Application/msedge.exe"));
+        }
+        paths
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+        ]
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        vec![
+            PathBuf::from("/usr/bin/google-chrome-stable"),
+            PathBuf::from("/usr/bin/google-chrome"),
+            PathBuf::from("/usr/bin/chromium-browser"),
+            PathBuf::from("/usr/bin/chromium"),
+        ]
+    }
+
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd"
+    )))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for key in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"] {
+        if let Ok(value) = env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                roots.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+    roots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chrome_executable_names, detect_chrome_executable};
+    use std::{env, fs};
+    use tempfile::tempdir;
+
+    #[test]
+    fn detects_from_env_var() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("my-chrome");
+        fs::write(&exe_path, b"").unwrap();
+        let original = env::var("SOULBROWSER_CHROME").ok();
+        env::set_var("SOULBROWSER_CHROME", exe_path.to_string_lossy().to_string());
+        let detected = detect_chrome_executable();
+        if let Some(value) = original {
+            env::set_var("SOULBROWSER_CHROME", value);
+        } else {
+            env::remove_var("SOULBROWSER_CHROME");
+        }
+        assert_eq!(detected, Some(exe_path));
+    }
+
+    #[test]
+    fn detects_from_path_entries() {
+        let dir = tempdir().unwrap();
+        let name = chrome_executable_names()
+            .get(0)
+            .expect("chrome executable names must not be empty");
+        let exe_path = dir.path().join(name);
+        fs::write(&exe_path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&exe_path, perms).unwrap();
+        }
+        let original_path = env::var("PATH").ok();
+        let original_env = env::var("SOULBROWSER_CHROME").ok();
+        let skip_flag = env::var("SOULBROWSER_SKIP_OS_PATHS").ok();
+        env::set_var("SOULBROWSER_CHROME", "");
+        env::set_var("SOULBROWSER_SKIP_OS_PATHS", "1");
+        env::set_var("PATH", dir.path());
+        let detected = detect_chrome_executable();
+        if let Some(value) = original_path {
+            env::set_var("PATH", value);
+        }
+        if let Some(value) = original_env {
+            env::set_var("SOULBROWSER_CHROME", value);
+        } else {
+            env::remove_var("SOULBROWSER_CHROME");
+        }
+        if let Some(value) = skip_flag {
+            env::set_var("SOULBROWSER_SKIP_OS_PATHS", value);
+        } else {
+            env::remove_var("SOULBROWSER_SKIP_OS_PATHS");
+        }
+        assert_eq!(detected, Some(exe_path));
     }
 }
 
@@ -242,6 +419,8 @@ pub mod adapter {
     };
     use serde::{Deserialize, Serialize};
     use serde_json::{json, Number, Value};
+    use soulbrowser_core_types::ExecRoute;
+    use std::collections::HashSet;
     use std::env;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -277,6 +456,38 @@ pub mod adapter {
     /// Shared event bus type alias used by the adapter scaffold.
     pub type EventBus = broadcast::Sender<RawEvent>;
 
+    #[derive(Clone, Debug)]
+    pub struct ResolvedExecutionContext {
+        pub page: PageId,
+        pub frame_selector: Option<String>,
+        pub execution_context_id: Option<String>,
+    }
+
+    impl ResolvedExecutionContext {
+        pub fn for_page(page: PageId) -> Self {
+            Self {
+                page,
+                frame_selector: None,
+                execution_context_id: None,
+            }
+        }
+
+        pub fn with_frame(page: PageId, frame_selector: Option<String>) -> Self {
+            Self {
+                page,
+                frame_selector,
+                execution_context_id: None,
+            }
+        }
+
+        pub fn query_scope(&self) -> QueryScope {
+            match &self.frame_selector {
+                Some(selector) if !selector.is_empty() => QueryScope::Frame(selector.clone()),
+                _ => QueryScope::Document,
+            }
+        }
+    }
+
     /// Trait capturing the minimal CDP capability surface required by upper layers.
     #[async_trait]
     pub trait Cdp {
@@ -293,9 +504,22 @@ pub mod adapter {
             selector: &str,
             deadline: std::time::Duration,
         ) -> Result<(), AdapterError>;
+        async fn click_in_context(
+            &self,
+            ctx: &ResolvedExecutionContext,
+            selector: &str,
+            deadline: std::time::Duration,
+        ) -> Result<(), AdapterError>;
         async fn type_text(
             &self,
             page: PageId,
+            selector: &str,
+            text: &str,
+            deadline: std::time::Duration,
+        ) -> Result<(), AdapterError>;
+        async fn type_text_in_context(
+            &self,
+            ctx: &ResolvedExecutionContext,
             selector: &str,
             text: &str,
             deadline: std::time::Duration,
@@ -309,6 +533,11 @@ pub mod adapter {
         async fn evaluate_script(
             &self,
             page: PageId,
+            expression: &str,
+        ) -> Result<Value, AdapterError>;
+        async fn evaluate_script_in_context(
+            &self,
+            ctx: &ResolvedExecutionContext,
             expression: &str,
         ) -> Result<Value, AdapterError>;
         async fn wait_basic(
@@ -387,6 +616,9 @@ pub mod adapter {
         targets: DashMap<String, PageId>,
         sessions: DashMap<String, PageId>,
         frames: DashMap<String, FrameEntry>,
+        route_pages: DashMap<String, PageId>,
+        page_routes: DashMap<PageId, String>,
+        pending_routes: DashMap<String, Instant>,
         page_activity: DashMap<PageId, Instant>,
         network_tap: Arc<NetworkTapLight>,
         tap_maintenance: Mutex<Option<NetworkTapHandle>>,
@@ -399,7 +631,23 @@ pub mod adapter {
     }
 
     impl CdpAdapter {
-        pub fn new(cfg: CdpConfig, bus: EventBus) -> Self {
+        pub fn new(mut cfg: CdpConfig, bus: EventBus) -> Self {
+            if should_use_real_chrome() {
+                let detected = if cfg.executable.as_os_str().is_empty() {
+                    super::detect_chrome_executable()
+                } else if cfg.executable.exists() {
+                    Some(cfg.executable.clone())
+                } else {
+                    super::detect_chrome_executable()
+                };
+
+                cfg.executable = detected.unwrap_or_else(|| {
+                    panic!(
+                        "Chrome/Chromium executable not found. Install Google Chrome or set SOULBROWSER_CHROME to a valid path."
+                    )
+                });
+            }
+
             let transport: Arc<dyn CdpTransport> = if should_use_real_chrome() {
                 info!(target: "cdp-adapter", "using real Chromium transport");
                 Arc::new(ChromiumTransport::new(cfg.clone()))
@@ -428,6 +676,9 @@ pub mod adapter {
                 targets: DashMap::new(),
                 sessions: DashMap::new(),
                 frames: DashMap::new(),
+                route_pages: DashMap::new(),
+                page_routes: DashMap::new(),
+                pending_routes: DashMap::new(),
                 page_activity: DashMap::new(),
                 network_tap,
                 tap_maintenance: Mutex::new(None),
@@ -440,6 +691,119 @@ pub mod adapter {
 
         pub fn cancel_token(&self) -> CancellationToken {
             self.shutdown.clone()
+        }
+
+        pub async fn resolve_execution_context(
+            &self,
+            route: &ExecRoute,
+        ) -> Result<ResolvedExecutionContext, AdapterError> {
+            let page = self.resolve_page_for_route(route).await?;
+            let frame_selector = Some(route.frame.0.clone());
+            Ok(ResolvedExecutionContext::with_frame(page, frame_selector))
+        }
+
+        async fn resolve_page_for_route(&self, route: &ExecRoute) -> Result<PageId, AdapterError> {
+            let route_key = route.page.0.clone();
+            if let Some(existing) = self.route_pages.get(&route_key) {
+                return Ok(*existing.value());
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(AdapterError::new(AdapterErrorKind::Internal)
+                        .with_hint("No available CDP pages for execution route"));
+                }
+
+                self.cleanup_route_mappings();
+
+                if let Some(existing) = self.route_pages.get(&route_key) {
+                    return Ok(*existing.value());
+                }
+
+                let claimed: HashSet<PageId> =
+                    self.page_routes.iter().map(|entry| *entry.key()).collect();
+
+                let candidate = self
+                    .registry
+                    .iter()
+                    .into_iter()
+                    .filter(|(_, ctx)| ctx.cdp_session.is_some())
+                    .map(|(page, _)| page)
+                    .find(|page| !claimed.contains(page));
+
+                if let Some(page) = candidate {
+                    self.route_pages.insert(route_key.clone(), page);
+                    self.page_routes.insert(page, route_key.clone());
+                    return Ok(page);
+                }
+
+                if self.pending_routes.get(&route_key).is_some() {
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+
+                self.pending_routes
+                    .insert(route_key.clone(), Instant::now());
+                let create_result = self.create_page("about:blank").await;
+                self.pending_routes.remove(&route_key);
+
+                match create_result {
+                    Ok(_) => {
+                        sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    Err(err) => {
+                        if self.registry.iter().is_empty() {
+                            let synthetic = Self::synthetic_page_id(route);
+                            self.route_pages.insert(route_key.clone(), synthetic);
+                            return Ok(synthetic);
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        fn cleanup_route_mappings(&self) {
+            let active_pages: HashSet<PageId> = self
+                .registry
+                .iter()
+                .into_iter()
+                .map(|(page, _)| page)
+                .collect();
+
+            if active_pages.is_empty() {
+                return;
+            }
+
+            self.route_pages
+                .retain(|_, page| active_pages.contains(page));
+            self.page_routes
+                .retain(|page, _| active_pages.contains(page));
+        }
+
+        fn synthetic_page_id(route: &ExecRoute) -> PageId {
+            match uuid::Uuid::parse_str(&route.page.0) {
+                Ok(id) => PageId(id),
+                Err(_) => PageId(uuid::Uuid::new_v4()),
+            }
+        }
+
+        fn scope_expression(scope: &QueryScope) -> Result<String, AdapterError> {
+            match scope {
+                QueryScope::Document => Ok("document".to_string()),
+                QueryScope::Frame(frame_selector) => {
+                    let frame_literal = serde_json::to_string(frame_selector).map_err(|err| {
+                        AdapterError::new(AdapterErrorKind::Internal).with_hint(err.to_string())
+                    })?;
+                    Ok(format!(
+                        "(() => {{\n    try {{\n        const frameEl = document.querySelector({frame});\n        if (!frameEl) {{ return null; }}\n        const doc = frameEl.contentDocument || (frameEl.contentWindow ? frameEl.contentWindow.document : null);\n        return doc || null;\n    }} catch (err) {{\n        return null;\n    }}\n}})()",
+                        frame = frame_literal
+                    ))
+                }
+            }
         }
 
         pub async fn start(self: Arc<Self>) -> Result<(), AdapterError> {
@@ -1321,17 +1685,7 @@ pub mod adapter {
                 AdapterError::new(AdapterErrorKind::Internal).with_hint(err.to_string())
             })?;
 
-            let scope_expression = match spec.scope {
-                QueryScope::Document => "document".to_string(),
-                QueryScope::Frame(frame_selector) => {
-                    let frame_literal = serde_json::to_string(&frame_selector).map_err(|err| {
-                        AdapterError::new(AdapterErrorKind::Internal).with_hint(err.to_string())
-                    })?;
-                    format!(
-                        "(() => {{\n    try {{\n        const frameEl = document.querySelector({frame_literal});\n        if (!frameEl) {{ return null; }}\n        const doc = frameEl.contentDocument || (frameEl.contentWindow ? frameEl.contentWindow.document : null);\n        return doc || null;\n    }} catch (err) {{\n        return null;\n    }}\n}})()"
-                    )
-                }
-            };
+            let scope_expression = Self::scope_expression(&spec.scope)?;
 
             let expression = format!(
                 "(() => {{\n    const scope = {scope};\n    if (!scope) {{ return []; }}\n    let elements;\n    try {{\n        elements = scope.querySelectorAll({selector});\n    }} catch (err) {{\n        return [];\n    }}\n    return Array.from(elements, (el) => {{\n        if (!el) {{ return null; }}\n        const rect = el.getBoundingClientRect();\n        return {{\n            backendNodeId: null,\n            x: Number.isFinite(rect.left) ? rect.left + rect.width / 2 : 0,\n            y: Number.isFinite(rect.top) ? rect.top + rect.height / 2 : 0\n        }};\n    }}).filter(Boolean);\n}})()",
@@ -1390,13 +1744,23 @@ pub mod adapter {
             selector: &str,
             _deadline: std::time::Duration,
         ) -> Result<(), AdapterError> {
-            self.wait_for_page_ready(page).await?;
+            let ctx = ResolvedExecutionContext::for_page(page);
+            self.click_in_context(&ctx, selector, _deadline).await
+        }
+
+        async fn click_in_context(
+            &self,
+            ctx: &ResolvedExecutionContext,
+            selector: &str,
+            _deadline: std::time::Duration,
+        ) -> Result<(), AdapterError> {
+            self.wait_for_page_ready(ctx.page).await?;
             let anchors = self
                 .query(
-                    page,
+                    ctx.page,
                     QuerySpec {
                         selector: selector.to_string(),
-                        scope: QueryScope::Document,
+                        scope: ctx.query_scope(),
                     },
                 )
                 .await?;
@@ -1415,7 +1779,7 @@ pub mod adapter {
                 "clickCount": 1,
                 "pointerType": "mouse",
             });
-            self.send_page_command(page, "Input.dispatchMouseEvent", press_payload)
+            self.send_page_command(ctx.page, "Input.dispatchMouseEvent", press_payload)
                 .await?;
 
             let release_payload = json!({
@@ -1427,7 +1791,7 @@ pub mod adapter {
                 "clickCount": 1,
                 "pointerType": "mouse",
             });
-            self.send_page_command(page, "Input.dispatchMouseEvent", release_payload)
+            self.send_page_command(ctx.page, "Input.dispatchMouseEvent", release_payload)
                 .await?;
             Ok(())
         }
@@ -1439,19 +1803,34 @@ pub mod adapter {
             text: &str,
             _deadline: std::time::Duration,
         ) -> Result<(), AdapterError> {
-            self.wait_for_page_ready(page).await?;
+            let ctx = ResolvedExecutionContext::for_page(page);
+            self.type_text_in_context(&ctx, selector, text, _deadline)
+                .await
+        }
+
+        async fn type_text_in_context(
+            &self,
+            ctx: &ResolvedExecutionContext,
+            selector: &str,
+            text: &str,
+            _deadline: std::time::Duration,
+        ) -> Result<(), AdapterError> {
+            self.wait_for_page_ready(ctx.page).await?;
             let selector_literal = serde_json::to_string(&selector).map_err(|err| {
                 AdapterError::new(AdapterErrorKind::Internal).with_hint(err.to_string())
             })?;
 
+            let scope_expression = Self::scope_expression(&ctx.query_scope())?;
+
             let focus_expression = format!(
-                "(() => {{\n    const el = document.querySelector({selector});\n    if (!el) {{ return {{ status: 'not-found' }}; }}\n    if (typeof el.focus === 'function') {{ el.focus(); }}\n    return {{ status: 'focused' }};\n}})()",
-                selector = selector_literal
+                "(() => {{\n    const scope = {scope};\n    if (!scope) {{ return {{ status: 'not-found' }}; }}\n    const el = scope.querySelector({selector});\n    if (!el) {{ return {{ status: 'not-found' }}; }}\n    if (typeof el.focus === 'function') {{ el.focus(); }}\n    return {{ status: 'focused' }};\n}})()",
+                selector = selector_literal,
+                scope = scope_expression,
             );
 
             let focus_response = self
                 .send_page_command(
-                    page,
+                    ctx.page,
                     "Runtime.evaluate",
                     json!({
                         "expression": focus_expression,
@@ -1481,7 +1860,7 @@ pub mod adapter {
                 };
 
                 self.send_page_command(
-                    page,
+                    ctx.page,
                     "Input.dispatchKeyEvent",
                     json!({
                         "type": "char",
@@ -1493,7 +1872,7 @@ pub mod adapter {
                 .await?;
             }
 
-            self.send_page_command(page, "Input.insertText", json!({ "text": text }))
+            self.send_page_command(ctx.page, "Input.insertText", json!({ "text": text }))
                 .await?;
             Ok(())
         }
@@ -1614,10 +1993,19 @@ function(targetValue, matchLabel) {
             page: PageId,
             expression: &str,
         ) -> Result<Value, AdapterError> {
-            self.wait_for_page_ready(page).await?;
+            let ctx = ResolvedExecutionContext::for_page(page);
+            self.evaluate_script_in_context(&ctx, expression).await
+        }
+
+        async fn evaluate_script_in_context(
+            &self,
+            ctx: &ResolvedExecutionContext,
+            expression: &str,
+        ) -> Result<Value, AdapterError> {
+            self.wait_for_page_ready(ctx.page).await?;
             let response = self
                 .send_page_command(
-                    page,
+                    ctx.page,
                     "Runtime.evaluate",
                     json!({
                         "expression": expression,
@@ -3031,7 +3419,7 @@ function(targetValue, matchLabel) {
     }
 }
 
-pub use adapter::{Cdp, CdpAdapter, EventBus};
+pub use adapter::{Cdp, CdpAdapter, EventBus, ResolvedExecutionContext};
 pub use commands::*;
 pub use config::CdpConfig;
 pub use error::{AdapterError, AdapterErrorKind};

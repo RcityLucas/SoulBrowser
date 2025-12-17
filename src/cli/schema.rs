@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 use tokio::fs;
 
-use crate::structured_output;
+use soulbrowser_kernel::structured_output;
 
 #[derive(Args)]
 pub struct SchemaArgs {

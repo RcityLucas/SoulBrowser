@@ -1,20 +1,50 @@
-use crate::types::BrowserType;
-use crate::StartArgs;
-use crate::{
-    app_context::get_or_create_context,
-    browser_impl::{BrowserConfig, L0Protocol, L1BrowserManager},
-    Config,
-};
+use crate::cli::context::CliContext;
 use anyhow::{Context, Result};
+use clap::Args;
+use soulbrowser_kernel::browser_impl::{BrowserConfig, L0Protocol, L1BrowserManager};
+use soulbrowser_kernel::types::BrowserType;
 
-pub async fn cmd_start(args: StartArgs, config: &Config) -> Result<()> {
-    let _context = get_or_create_context(
-        "cli".to_string(),
-        Some(config.output_dir.clone()),
-        config.policy_paths.clone(),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+#[derive(Args, Clone, Debug)]
+pub struct StartArgs {
+    /// Browser type to launch
+    #[arg(short, long, default_value = "chromium")]
+    pub browser: BrowserType,
+
+    /// Start URL
+    #[arg(short, long)]
+    pub url: Option<String>,
+
+    /// Browser window size
+    #[arg(long, value_name = "WIDTHxHEIGHT")]
+    pub window_size: Option<String>,
+
+    /// Enable headless mode
+    #[arg(long)]
+    pub headless: bool,
+
+    /// Enable developer tools
+    #[arg(long)]
+    pub devtools: bool,
+
+    /// Session name for saving
+    #[arg(long)]
+    pub session_name: Option<String>,
+
+    /// Enable soul (AI) assistance
+    #[arg(long)]
+    pub soul: bool,
+
+    /// Soul model to use
+    #[arg(long, default_value = "gpt-4")]
+    pub soul_model: String,
+
+    /// Route through the L1 unified kernel scheduler
+    #[arg(long)]
+    pub unified_kernel: bool,
+}
+
+pub async fn cmd_start(args: StartArgs, ctx: &CliContext) -> Result<()> {
+    let _context = ctx.app_context().await?;
 
     let l0 = L0Protocol::new().await?;
     let browser_config = BrowserConfig {

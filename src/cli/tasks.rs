@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use serde_json::to_string_pretty;
 
-use crate::task_store::TaskPlanStore;
-use crate::Config;
+use soulbrowser_kernel::task_store::TaskPlanStore;
+use soulbrowser_kernel::Config;
 
 #[derive(Args)]
 pub struct TasksArgs {

@@ -45,6 +45,25 @@ pub struct StructuralAnalysis {
     pub has_navigation: bool,
 }
 
+impl StructuralAnalysis {
+    /// Create a placeholder entry representing disabled structural analysis
+    pub fn disabled() -> Self {
+        Self {
+            snapshot_id: "structural-disabled".to_string(),
+            dom_node_count: 0,
+            interactive_element_count: 0,
+            has_forms: false,
+            has_navigation: false,
+        }
+    }
+}
+
+impl Default for StructuralAnalysis {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 /// Visual analysis summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisualAnalysis {

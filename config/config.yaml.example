@@ -5,6 +5,7 @@ default_headless: false
 output_dir: ./soulbrowser-output
 session_timeout: 300
 strict_authorization: false
+serve_surface: console # console | gateway
 policy_paths:
   - config/policies/browser_policy.json
 

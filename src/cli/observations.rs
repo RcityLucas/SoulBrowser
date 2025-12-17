@@ -2,9 +2,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use serde_json::Value;
 
-use crate::app_context::get_or_create_context;
-use crate::task_status::TaskLogEntry;
-use crate::Config;
+use soulbrowser_kernel::app_context::get_or_create_context;
+use soulbrowser_kernel::task_status::TaskLogEntry;
+use soulbrowser_kernel::Config;
 
 #[derive(Args)]
 pub struct ObservationsArgs {

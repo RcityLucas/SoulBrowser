@@ -9,9 +9,9 @@ use tokio::fs;
 use tracing::warn;
 
 use super::run_bundle::load_run_bundle;
-use crate::DEFAULT_LARGE_THRESHOLD;
+use crate::cli::constants::DEFAULT_LARGE_THRESHOLD;
 
-#[derive(Args)]
+#[derive(Args, Clone, Debug)]
 pub struct ArtifactsArgs {
     /// Path to a saved run bundle (JSON produced by --save-run)
     #[arg(long, value_name = "FILE")]

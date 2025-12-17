@@ -10,6 +10,8 @@ pub enum PerceiverError {
     FrameLost,
     #[error("policy denied: {0}")]
     PolicyDenied(String),
+    #[error("hint not supported: {0}")]
+    UnsupportedHint(String),
     #[error("internal error: {0}")]
     Internal(String),
 }

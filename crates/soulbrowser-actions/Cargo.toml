@@ -1,0 +1,10 @@
+[package]
+name = "soulbrowser-actions"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+action-primitives = { path = "../action-primitives" }
+action-locator = { path = "../action-locator" }
+action-gate = { path = "../action-gate" }
+action-flow = { path = "../action-flow" }

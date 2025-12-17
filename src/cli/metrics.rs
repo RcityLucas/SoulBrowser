@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 use tokio::fs;
 
-use crate::compute_metrics_from_report;
+use soulbrowser_kernel::metrics::compute_metrics_from_report;
 
 #[derive(Args)]
 pub struct MetricsArgs {

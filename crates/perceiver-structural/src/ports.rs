@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::errors::PerceiverError;
 use crate::model::{AnchorDescriptor, AnchorGeometry, ResolveHint, SampledPair, Scope, SnapLevel};
+use soulbrowser_core_types::FrameId;
 
 #[async_trait]
 pub trait CdpPerceptionPort: Send + Sync {
@@ -147,51 +148,77 @@ where
         let page = Self::parse_page(route)?;
         let frame_id = route.frame.clone();
 
-        let (strategy, selector) = match hint {
-            ResolveHint::Css(sel) => ("css".to_string(), sel.clone()),
-            _ => return Ok(Vec::new()),
-        };
+        match hint {
+            ResolveHint::Css(selector) => {
+                let selector_value = selector.clone();
+                let query_scope = match scope {
+                    Scope::Frame(frame) => QueryScope::Frame(frame.0.clone()),
+                    Scope::Page(_) => QueryScope::Document,
+                };
+                let result = self
+                    .adapter
+                    .query(
+                        page,
+                        QuerySpec {
+                            selector: selector.clone(),
+                            scope: query_scope,
+                        },
+                    )
+                    .await
+                    .map_err(|err| {
+                        PerceiverError::internal(format!("query failed: {:?}", err.kind))
+                    })?;
 
-        let selector_value = selector.clone();
-        let query_scope = match scope {
-            Scope::Frame(frame) => QueryScope::Frame(frame.0.clone()),
-            Scope::Page(_) => QueryScope::Document,
-        };
-        let result = self
-            .adapter
-            .query(
-                page,
-                QuerySpec {
-                    selector: selector.clone(),
-                    scope: query_scope,
-                },
-            )
-            .await
-            .map_err(|err| PerceiverError::internal(format!("query failed: {:?}", err.kind)))?;
+                let anchors = result
+                    .into_iter()
+                    .map(|anchor| AnchorDescriptor {
+                        strategy: "css".to_string(),
+                        value: json!({
+                            "selector": selector_value.clone(),
+                            "backendNodeId": anchor.backend_node_id,
+                            "x": anchor.x,
+                            "y": anchor.y,
+                        }),
+                        frame_id: frame_id.clone(),
+                        confidence: 0.75,
+                        backend_node_id: anchor.backend_node_id,
+                        geometry: Some(AnchorGeometry {
+                            x: anchor.x,
+                            y: anchor.y,
+                            width: 0.0,
+                            height: 0.0,
+                        }),
+                    })
+                    .collect();
 
-        let anchors = result
-            .into_iter()
-            .map(|anchor| AnchorDescriptor {
-                strategy: strategy.clone(),
-                value: json!({
-                    "selector": selector_value.clone(),
-                    "backendNodeId": anchor.backend_node_id,
-                    "x": anchor.x,
-                    "y": anchor.y,
-                }),
-                frame_id: frame_id.clone(),
-                confidence: 0.75,
-                backend_node_id: anchor.backend_node_id,
-                geometry: Some(AnchorGeometry {
-                    x: anchor.x,
-                    y: anchor.y,
-                    width: 0.0,
-                    height: 0.0,
-                }),
-            })
-            .collect();
-
-        Ok(anchors)
+                Ok(anchors)
+            }
+            ResolveHint::Aria { role, name } => {
+                let token = format!("soul-aria-{}", Uuid::new_v4().simple());
+                let script = aria_marker_script(role, name.as_deref(), &token);
+                let hint_meta = json!({ "role": role, "name": name });
+                self.query_hint_with_marker(
+                    page, scope, &frame_id, "aria", hint_meta, script, &token, 0.72,
+                )
+                .await
+            }
+            ResolveHint::Text { pattern } => {
+                let token = format!("soul-text-{}", Uuid::new_v4().simple());
+                let script = text_marker_script(pattern, &token);
+                let hint_meta = json!({ "pattern": pattern });
+                self.query_hint_with_marker(
+                    page, scope, &frame_id, "text", hint_meta, script, &token, 0.6,
+                )
+                .await
+            }
+            ResolveHint::Backend(node_id) => {
+                let meta = self.backend_description(route, *node_id).await?;
+                Ok(vec![anchor_from_backend_meta(frame_id, *node_id, meta)])
+            }
+            ResolveHint::Geometry { x, y, w, h } => {
+                Ok(vec![anchor_from_geometry_hint(&frame_id, *x, *y, *w, *h)])
+            }
+        }
     }
 
     async fn describe_backend_node(
@@ -219,6 +246,99 @@ where
     ) -> Result<Option<Value>, PerceiverError> {
         let description = self.backend_description(route, backend_node_id).await?;
         Ok(description.get("style").cloned())
+    }
+}
+
+impl<C> AdapterPort<C>
+where
+    C: Cdp + Send + Sync,
+{
+    async fn query_hint_with_marker(
+        &self,
+        page: AdapterPageId,
+        scope: &Scope,
+        frame_id: &FrameId,
+        strategy: &str,
+        hint_meta: Value,
+        marker_script: String,
+        token: &str,
+        confidence: f32,
+    ) -> Result<Vec<AnchorDescriptor>, PerceiverError> {
+        let marker_result = self
+            .adapter
+            .evaluate_script(page, &marker_script)
+            .await
+            .map_err(|err| {
+                PerceiverError::internal(format!("marker script failed: {:?}", err.kind))
+            })?;
+
+        if !marker_result.as_bool().unwrap_or(false) {
+            return Ok(Vec::new());
+        }
+
+        let selector_literal = format!("[data-soulbrowser-hint=\"{token}\"]");
+        let anchors = self
+            .query_with_selector(
+                page,
+                scope,
+                frame_id,
+                &selector_literal,
+                strategy,
+                hint_meta,
+                confidence,
+            )
+            .await?;
+
+        let cleanup = cleanup_marker_script(token);
+        let _ = self.adapter.evaluate_script(page, &cleanup).await;
+
+        Ok(anchors)
+    }
+
+    async fn query_with_selector(
+        &self,
+        page: AdapterPageId,
+        scope: &Scope,
+        frame_id: &FrameId,
+        selector_literal: &str,
+        strategy: &str,
+        hint_meta: Value,
+        confidence: f32,
+    ) -> Result<Vec<AnchorDescriptor>, PerceiverError> {
+        let query_scope = match scope {
+            Scope::Frame(frame) => QueryScope::Frame(frame.0.clone()),
+            Scope::Page(_) => QueryScope::Document,
+        };
+        let result = self
+            .adapter
+            .query(
+                page,
+                QuerySpec {
+                    selector: selector_literal.to_string(),
+                    scope: query_scope,
+                },
+            )
+            .await
+            .map_err(|err| PerceiverError::internal(format!("query failed: {:?}", err.kind)))?;
+
+        let anchors = result
+            .into_iter()
+            .map(|anchor| AnchorDescriptor {
+                strategy: strategy.to_string(),
+                value: anchor_hint_value(selector_literal, &hint_meta, &anchor),
+                frame_id: frame_id.clone(),
+                confidence,
+                backend_node_id: anchor.backend_node_id,
+                geometry: Some(AnchorGeometry {
+                    x: anchor.x,
+                    y: anchor.y,
+                    width: 0.0,
+                    height: 0.0,
+                }),
+            })
+            .collect();
+
+        Ok(anchors)
     }
 }
 
@@ -366,4 +486,168 @@ fn decode_string(strings: &[Value], value: &Value) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+fn anchor_hint_value(
+    selector: &str,
+    hint_meta: &Value,
+    anchor: &cdp_adapter::commands::Anchor,
+) -> Value {
+    let mut base = json!({
+        "selector": selector,
+        "x": anchor.x,
+        "y": anchor.y,
+    });
+    if let Some(id) = anchor.backend_node_id {
+        base["backendNodeId"] = Value::from(id);
+    }
+    if !hint_meta.is_null() {
+        base["hint"] = hint_meta.clone();
+    }
+    base
+}
+
+fn anchor_from_backend_meta(
+    frame_id: FrameId,
+    backend_node_id: u64,
+    meta: JsonMap<String, Value>,
+) -> AnchorDescriptor {
+    let geometry = meta
+        .get("geometry")
+        .and_then(|value| geometry_from_value(value));
+    AnchorDescriptor {
+        strategy: "backend".to_string(),
+        value: Value::Object(meta),
+        frame_id,
+        confidence: 0.82,
+        backend_node_id: Some(backend_node_id),
+        geometry,
+    }
+}
+
+fn anchor_from_geometry_hint(
+    frame_id: &FrameId,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> AnchorDescriptor {
+    AnchorDescriptor {
+        strategy: "geometry".to_string(),
+        value: json!({
+            "geometry": { "x": x, "y": y, "width": w, "height": h }
+        }),
+        frame_id: frame_id.clone(),
+        confidence: 0.6,
+        backend_node_id: None,
+        geometry: Some(AnchorGeometry {
+            x: x as f64,
+            y: y as f64,
+            width: w as f64,
+            height: h as f64,
+        }),
+    }
+}
+
+fn geometry_from_value(value: &Value) -> Option<AnchorGeometry> {
+    let obj = value.as_object()?;
+    Some(AnchorGeometry {
+        x: obj.get("x")?.as_f64().unwrap_or(0.0),
+        y: obj.get("y")?.as_f64().unwrap_or(0.0),
+        width: obj.get("width")?.as_f64().unwrap_or(0.0),
+        height: obj.get("height")?.as_f64().unwrap_or(0.0),
+    })
+}
+
+fn aria_marker_script(role: &str, name: Option<&str>, token: &str) -> String {
+    let attr = "data-soulbrowser-hint";
+    let role_literal = serde_json::to_string(role).unwrap();
+    let name_literal = serde_json::to_string(name.unwrap_or("")).unwrap();
+    let token_literal = serde_json::to_string(token).unwrap();
+    let attr_literal = serde_json::to_string(attr).unwrap();
+    format!(
+        r#"(() => {{
+            const attr = {attr};
+            const token = {token};
+            const targetRole = {role};
+            const targetName = {name};
+            const hasName = targetName.length > 0;
+            const normalize = (input) => (input || '').trim().toLowerCase();
+            const computeName = (el) => {{
+                if (!el) return '';
+                const aria = el.getAttribute('aria-label');
+                if (aria) return aria;
+                const labelledby = el.getAttribute('aria-labelledby');
+                if (labelledby) {{
+                    return labelledby
+                        .split(' ')
+                        .map((id) => {{
+                            const ref = document.getElementById(id);
+                            return ref ? (ref.innerText || ref.textContent || '') : '';
+                        }})
+                        .join(' ');
+                }}
+                return el.innerText || el.textContent || '';
+            }};
+            const candidates = Array.from(document.querySelectorAll('[role]'));
+            const match = candidates.find((el) => {{
+                if (targetRole && el.getAttribute('role') !== targetRole) return false;
+                if (hasName) {{
+                    return normalize(computeName(el)).includes(normalize(targetName));
+                }}
+                return true;
+            }});
+            if (!match) return false;
+            match.setAttribute(attr, token);
+            return true;
+        }})()"#,
+        attr = attr_literal,
+        token = token_literal,
+        role = role_literal,
+        name = name_literal,
+    )
+}
+
+fn text_marker_script(pattern: &str, token: &str) -> String {
+    let attr = "data-soulbrowser-hint";
+    let token_literal = serde_json::to_string(token).unwrap();
+    let attr_literal = serde_json::to_string(attr).unwrap();
+    let pattern_literal = serde_json::to_string(pattern).unwrap();
+    format!(
+        r#"(() => {{
+            const attr = {attr};
+            const token = {token};
+            const target = {pattern};
+            const normalize = (input) => (input || '').trim().toLowerCase();
+            const targetValue = normalize(target);
+            if (!targetValue) return false;
+            const nodes = Array.from(document.querySelectorAll('body *'));
+            const match = nodes.find((el) => {{
+                if (!(el instanceof Element)) return false;
+                const text = normalize(el.innerText || el.textContent || '');
+                if (!text) return false;
+                return text.includes(targetValue);
+            }});
+            if (!match) return false;
+            match.setAttribute(attr, token);
+            return true;
+        }})()"#,
+        attr = attr_literal,
+        token = token_literal,
+        pattern = pattern_literal,
+    )
+}
+
+fn cleanup_marker_script(token: &str) -> String {
+    let attr_literal = serde_json::to_string("data-soulbrowser-hint").unwrap();
+    let token_literal = serde_json::to_string(token).unwrap();
+    format!(
+        r#"(() => {{
+            const nodes = document.querySelectorAll('[' + {attr} + '="' + {token} + '"]');
+            nodes.forEach((el) => el.removeAttribute({attr}));
+            return true;
+        }})()"#,
+        attr = attr_literal,
+        token = token_literal,
+    )
 }

@@ -1,13 +1,13 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use memory_center::{MemoryRecord, MemoryStatsSnapshot};
+use memory_center::{normalize_note, normalize_tags, MemoryRecord, MemoryStatsSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use tokio::fs;
 
-use crate::app_context::get_or_create_context;
-use crate::Config;
+use soulbrowser_kernel::app_context::get_or_create_context;
+use soulbrowser_kernel::Config;
 
 #[derive(Args)]
 pub struct MemoryArgs {
@@ -152,8 +152,8 @@ pub async fn cmd_memory(args: MemoryArgs, config: &Config) -> Result<()> {
         }
         MemoryCommand::Add(opts) => {
             let mut record = MemoryRecord::new(&opts.namespace, &opts.key);
-            record.tags = normalize_memory_tags(&opts.tags);
-            record.note = normalize_memory_note(opts.note.as_deref());
+            record.tags = normalize_tags(&opts.tags);
+            record.note = normalize_note(opts.note.as_deref());
             if let Some(metadata_raw) = opts.metadata.as_deref() {
                 let value: Value =
                     serde_json::from_str(metadata_raw).context("metadata must be valid JSON")?;
@@ -196,9 +196,9 @@ pub async fn cmd_memory(args: MemoryArgs, config: &Config) -> Result<()> {
                 None => None,
             };
 
-            let tags_patch = opts.tags.as_ref().map(|tags| normalize_memory_tags(tags));
+            let tags_patch = opts.tags.as_ref().map(|tags| normalize_tags(tags));
             let note_field_provided = opts.note.is_some();
-            let note_value = normalize_memory_note(opts.note.as_deref());
+            let note_value = normalize_note(opts.note.as_deref());
             let metadata_field_provided = metadata_value.is_some();
             let metadata_patch = metadata_value.clone();
 
@@ -282,22 +282,6 @@ pub async fn cmd_memory(args: MemoryArgs, config: &Config) -> Result<()> {
     }
 
     Ok(())
-}
-
-pub(crate) fn normalize_memory_tags(raw: &[String]) -> Vec<String> {
-    raw.iter()
-        .filter_map(|tag| {
-            let trimmed = tag.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .collect()
-}
-
-pub(crate) fn normalize_memory_note(note: Option<&str>) -> Option<String> {
-    note.and_then(|value| {
-        let trimmed = value.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    })
 }
 
 fn print_memory_table(records: &[MemoryRecord]) {

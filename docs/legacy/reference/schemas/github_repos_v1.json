@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GitHub Repository Summary",
+  "description": "Normalized GitHub repository metadata fetched via the deterministic parser in the agent executor.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "github_repos_v1"
+    },
+    "source_username": {
+      "type": "string",
+      "description": "GitHub username that was parsed"
+    },
+    "fetched_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": ["string", "null"] },
+          "language": { "type": ["string", "null"] },
+          "topics": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "stars": { "type": "integer" },
+          "forks": { "type": "integer" },
+          "watchers": { "type": "integer" },
+          "open_issues": { "type": "integer" },
+          "visibility": { "type": "string" },
+          "default_branch": { "type": "string" },
+          "html_url": { "type": "string", "format": "uri" },
+          "homepage": { "type": ["string", "null"] },
+          "archived": { "type": "boolean" },
+          "disabled": { "type": "boolean" },
+          "is_fork": { "type": "boolean" },
+          "license": { "type": ["string", "null"] },
+          "pushed_at": { "type": ["string", "null"], "format": "date-time" },
+          "updated_at": { "type": ["string", "null"], "format": "date-time" },
+          "created_at": { "type": ["string", "null"], "format": "date-time" },
+          "owner": { "type": ["string", "null"] },
+          "language_color": { "type": ["string", "null"] }
+        },
+        "required": [
+          "name",
+          "topics",
+          "stars",
+          "forks",
+          "watchers",
+          "open_issues",
+          "visibility",
+          "default_branch",
+          "html_url",
+          "archived",
+          "disabled",
+          "is_fork"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema", "source_username", "fetched_at", "items"],
+  "additionalProperties": false
+}

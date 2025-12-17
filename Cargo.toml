@@ -15,7 +15,6 @@ members = [
     "crates/policy-center",
     "crates/event-store",
     "crates/snapshot-store",
-    "crates/recipes",
     "crates/perceiver-structural",
     "crates/perceiver-visual",
     "crates/perceiver-semantic",
@@ -25,18 +24,20 @@ members = [
     "crates/action-gate",
     "crates/action-flow",
     "crates/agent-core",
-    "crates/tool-click",
-    "crates/tool-type-text",
-    "crates/tool-select-option",
     "crates/l6-observe",
     "crates/l6-timeline",
     "crates/l6-privacy",
     "crates/l7-adapter",
     "crates/l7-plugin",
-    "crates/l7-wd-bridge",
     "crates/memory-center",
+    "crates/soulbrowser-kernel",
+    "crates/integration-soulbase",
+    "crates/soulbrowser-actions",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+home = { version = "=0.5.5" }
 
 [package]
 name = "soulbrowser-cli"
@@ -77,6 +78,7 @@ cdp-adapter = { path = "crates/cdp-adapter" }
 network-tap-light = { path = "crates/network-tap-light" }
 action-primitives = { path = "crates/action-primitives" }
 agent-core = { path = "crates/agent-core" }
+soulbrowser-kernel = { path = "crates/soulbrowser-kernel" }
 dashmap = "5"
 parking_lot = "0.12"
 perceiver-structural = { path = "crates/perceiver-structural" }
@@ -92,14 +94,12 @@ lazy_static = "1.4"
 axum = { version = "0.7", features = ["tokio", "ws"] }
 futures = "0.3"
 tower-http = { version = "0.5", features = ["cors"] }
-openssl = { version = "0.10", features = ["vendored"] }
 l6-observe = { path = "crates/l6-observe" }
 l6-timeline = { path = "crates/l6-timeline" }
 event-store = { path = "crates/event-store" }
 l7-adapter = { path = "crates/l7-adapter" }
-l7-wd-bridge = { path = "crates/l7-wd-bridge" }
 regex = "1.10"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 memory-center = { path = "crates/memory-center" }
 
 # CLI and argument parsing
@@ -120,10 +120,8 @@ anyhow = "1.0"
 # Logging & Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2"
 
 # Configuration and directories
-config = "0.14"
 dirs = "5.0"
 tempfile = "3.8"
 
@@ -132,23 +130,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 sha2 = "0.10"
 
-# Direct soul-base components integration
-soulbase-types = { path = "../soul-base-main/soul-base-main/crates/soulbase-types" }
-soulbase-errors = { path = "../soul-base-main/soul-base-main/crates/soulbase-errors" }
-soulbase-config = { path = "../soul-base-main/soul-base-main/crates/soulbase-config" }
-soulbase-auth = { path = "../soul-base-main/soul-base-main/crates/soulbase-auth" }
-soulbase-interceptors = { path = "../soul-base-main/soul-base-main/crates/soulbase-interceptors" }
-soulbase-storage = { path = "../soul-base-main/soul-base-main/crates/soulbase-storage" }
-soulbase-tools = { path = "../soul-base-main/soul-base-main/crates/soulbase-tools" }
-# Future integration (currently unused, commented out to speed up builds)
-# soulbase-sandbox = { path = "../soul-base-main/soul-base-main/crates/soulbase-sandbox" }
-# soulbase-llm = { path = "../soul-base-main/soul-base-main/crates/soulbase-llm" }
-# soulbase-tx = { path = "../soul-base-main/soul-base-main/crates/soulbase-tx" }
-# soulbase-observe = { path = "../soul-base-main/soul-base-main/crates/soulbase-observe" }
-# soulbase-cache = { path = "../soul-base-main/soul-base-main/crates/soulbase-cache" }
-# soulbase-blob = { path = "../soul-base-main/soul-base-main/crates/soulbase-blob" }
-# soulbase-crypto = { path = "../soul-base-main/soul-base-main/crates/soulbase-crypto" }
-# soulbase-net = { path = "../soul-base-main/soul-base-main/crates/soulbase-net" }
+
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -165,7 +147,8 @@ assert_cmd = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 [features]
-default = []
+default = ["soulbase"]
+soulbase = ["soulbrowser-kernel/soulbase"]
 
 [profile.dev]
 opt-level = 0
