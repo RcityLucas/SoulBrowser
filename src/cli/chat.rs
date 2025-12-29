@@ -10,8 +10,10 @@ use tracing::info;
 
 use agent_core::{AgentContext, AgentRequest, ConversationRole, ConversationTurn};
 use soulbrowser_kernel::agent::{
-    execute_plan, ChatRunner, ChatSessionOutput, FlowExecutionOptions, FlowExecutionReport,
-    StepExecutionStatus,
+    execute_plan, ChatSessionOutput, FlowExecutionOptions, FlowExecutionReport, StepExecutionStatus,
+};
+use soulbrowser_kernel::chat_support::{
+    build_chat_runner, ChatRunnerBuild, LlmProviderConfig, LlmProviderSelection, PlannerSelection,
 };
 use soulbrowser_kernel::plan_payload;
 use soulbrowser_state_center::{DispatchStatus, PerceiverEventKind, StateEvent};
@@ -84,6 +86,34 @@ pub struct ChatArgs {
     /// Skip submitting the form during the demo helpers
     #[arg(long)]
     pub skip_submit: bool,
+
+    /// Planner to use (rule or llm)
+    #[arg(long, value_name = "PLANNER")]
+    pub planner: Option<String>,
+
+    /// LLM provider to power planning (openai, anthropic, mock)
+    #[arg(long, value_name = "PROVIDER")]
+    pub llm_provider: Option<String>,
+
+    /// Override LLM model identifier
+    #[arg(long, value_name = "MODEL")]
+    pub llm_model: Option<String>,
+
+    /// Override LLM API base URL
+    #[arg(long, value_name = "URL")]
+    pub llm_api_base: Option<String>,
+
+    /// Override LLM temperature
+    #[arg(long, value_name = "TEMP")]
+    pub llm_temperature: Option<f32>,
+
+    /// Override LLM API key (falls back to env vars)
+    #[arg(long, value_name = "KEY")]
+    pub llm_api_key: Option<String>,
+
+    /// Override LLM max output tokens
+    #[arg(long, value_name = "TOKENS")]
+    pub llm_max_output_tokens: Option<u32>,
 }
 
 pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) -> Result<()> {
@@ -118,7 +148,48 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
         || !agent_context.memory_hints.is_empty()
         || !agent_context.metadata.is_empty();
 
-    let runner = ChatRunner::default();
+    let planner_choice = match args.planner.as_deref().map(PlannerSelection::from_str_case) {
+        Some(Some(kind)) => kind,
+        Some(None) => bail!("Unknown planner specified"),
+        None => PlannerSelection::Llm,
+    };
+
+    let llm_choice = match args
+        .llm_provider
+        .as_deref()
+        .map(LlmProviderSelection::from_str_case)
+    {
+        Some(Some(kind)) => Some(kind),
+        Some(None) => bail!("Unknown llm-provider specified"),
+        None => None,
+    };
+
+    let llm_config = LlmProviderConfig {
+        model: args.llm_model.clone(),
+        api_base: args.llm_api_base.clone(),
+        temperature: args.llm_temperature,
+        api_key: args.llm_api_key.clone(),
+        max_output_tokens: args.llm_max_output_tokens,
+    };
+
+    let ChatRunnerBuild {
+        runner,
+        planner_used: actual_planner,
+        provider_used,
+        fallback_reason,
+    } = build_chat_runner(planner_choice, llm_choice, llm_config, None, None)?;
+
+    let planner_warning = fallback_reason.clone();
+    if let Some(note) = planner_warning.as_ref() {
+        info!("Planner fallback: {note}");
+    } else {
+        let provider_label = provider_used.map(|p| p.label()).unwrap_or("-");
+        info!(
+            planner = actual_planner.label(),
+            llm_provider = provider_label,
+            "Planner configured"
+        );
+    }
     let mut exec_request = runner.request_from_prompt(
         prompt.clone(),
         if has_context {
@@ -128,6 +199,24 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
         },
         args.constraints.clone(),
     );
+
+    if let Some(note) = planner_warning {
+        exec_request
+            .metadata
+            .insert("planner_warning".to_string(), Value::String(note));
+    }
+
+    exec_request.metadata.insert(
+        "planner_used".to_string(),
+        Value::String(actual_planner.label().to_string()),
+    );
+
+    if let Some(provider) = provider_used {
+        exec_request.metadata.insert(
+            "llm_provider".to_string(),
+            Value::String(provider.label().to_string()),
+        );
+    }
 
     let mut current_session = runner.plan(exec_request.clone()).await?;
 
@@ -247,6 +336,22 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
 fn print_human_plan(session: &ChatSessionOutput, attempt: u32) {
     println!("Agent Plan (attempt {})", attempt + 1);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    if !session.plan.meta.overlays.is_empty() {
+        println!("Auto Repairs/Notes:");
+        for overlay in &session.plan.meta.overlays {
+            let title = overlay
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Auto repair");
+            let detail = overlay.get("detail").and_then(Value::as_str).unwrap_or("");
+            if detail.is_empty() {
+                println!("  - {}", title);
+            } else {
+                println!("  - {}: {}", title, detail);
+            }
+        }
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    }
     for (idx, step) in session.plan.steps.iter().enumerate() {
         println!("{}. {}", idx + 1, step.title);
     }

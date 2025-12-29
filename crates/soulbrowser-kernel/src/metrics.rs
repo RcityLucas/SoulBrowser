@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
@@ -15,13 +16,21 @@ use prometheus::{
 use soulbrowser_registry::metrics as registry_metrics;
 use soulbrowser_scheduler::metrics as scheduler_metrics;
 use tokio::{net::TcpListener, task::JoinHandle};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 static GLOBAL_REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 static REGISTER_ONCE: OnceCell<()> = OnceCell::new();
 static EXECUTION_STEP_LATENCY: OnceCell<HistogramVec> = OnceCell::new();
 static EXECUTION_STEP_ATTEMPTS: OnceCell<IntCounterVec> = OnceCell::new();
 static LLM_CACHE_EVENTS: OnceCell<IntCounterVec> = OnceCell::new();
+static EXECUTION_MISSING_RESULT: OnceCell<IntCounterVec> = OnceCell::new();
+static PLAN_REJECTIONS: OnceCell<IntCounterVec> = OnceCell::new();
+static PLAN_TEMPLATE_USAGE: OnceCell<IntCounterVec> = OnceCell::new();
+static PLAN_STRATEGY_USAGE: OnceCell<IntCounterVec> = OnceCell::new();
+static PLAN_AUTO_REPAIRS: OnceCell<IntCounterVec> = OnceCell::new();
+static MISSING_RESULT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+const MISSING_RESULT_ALERT_THRESHOLD: u64 = 10;
 
 pub fn register_metrics() {
     REGISTER_ONCE.get_or_init(|| {
@@ -31,6 +40,7 @@ pub fn register_metrics() {
         cdp_metrics::register_metrics(registry);
         register_execution_metrics(registry);
         register_llm_cache_metrics(registry);
+        register_plan_metrics(registry);
     });
 }
 
@@ -61,6 +71,19 @@ fn register_execution_metrics(registry: &Registry) {
         error!(?err, "failed to register execution attempts counter");
     }
     let _ = EXECUTION_STEP_ATTEMPTS.set(attempts);
+
+    let missing = IntCounterVec::new(
+        Opts::new(
+            "soul_execution_missing_result_total",
+            "Executions that finished without user-facing results",
+        ),
+        &["intent_kind"],
+    )
+    .expect("create missing result counter");
+    if let Err(err) = registry.register(Box::new(missing.clone())) {
+        error!(?err, "failed to register missing result counter");
+    }
+    let _ = EXECUTION_MISSING_RESULT.set(missing);
 }
 
 fn register_llm_cache_metrics(registry: &Registry) {
@@ -76,6 +99,60 @@ fn register_llm_cache_metrics(registry: &Registry) {
         error!(?err, "failed to register llm cache metrics");
     }
     let _ = LLM_CACHE_EVENTS.set(events);
+}
+
+fn register_plan_metrics(registry: &Registry) {
+    let rejections = IntCounterVec::new(
+        Opts::new(
+            "soul_plan_rejections_total",
+            "Plans rejected by validation grouped by reason",
+        ),
+        &["reason"],
+    )
+    .expect("create plan rejection counter");
+    if let Err(err) = registry.register(Box::new(rejections.clone())) {
+        error!(?err, "failed to register plan rejection counter");
+    }
+    let _ = PLAN_REJECTIONS.set(rejections);
+
+    let templates = IntCounterVec::new(
+        Opts::new(
+            "soul_plan_template_usage_total",
+            "Planner intent templates applied grouped by recipe",
+        ),
+        &["template"],
+    )
+    .expect("create template usage counter");
+    if let Err(err) = registry.register(Box::new(templates.clone())) {
+        error!(?err, "failed to register template usage counter");
+    }
+    let _ = PLAN_TEMPLATE_USAGE.set(templates);
+
+    let strategies = IntCounterVec::new(
+        Opts::new(
+            "soul_plan_strategy_usage_total",
+            "Stage strategy attempts grouped by stage and outcome",
+        ),
+        &["stage", "strategy", "result"],
+    )
+    .expect("create strategy usage counter");
+    if let Err(err) = registry.register(Box::new(strategies.clone())) {
+        error!(?err, "failed to register strategy usage counter");
+    }
+    let _ = PLAN_STRATEGY_USAGE.set(strategies);
+
+    let auto_repairs = IntCounterVec::new(
+        Opts::new(
+            "soul_plan_auto_repairs_total",
+            "Auto repair events aggregated by kind",
+        ),
+        &["kind"],
+    )
+    .expect("create auto repair counter");
+    if let Err(err) = registry.register(Box::new(auto_repairs.clone())) {
+        error!(?err, "failed to register auto repair counter");
+    }
+    let _ = PLAN_AUTO_REPAIRS.set(auto_repairs);
 }
 
 pub fn observe_execution_step(tool: &str, result: &str, wait_ms: u64, run_ms: u64, attempts: u64) {
@@ -171,6 +248,41 @@ pub fn record_llm_cache_event(namespace: &str, event: &str) {
     debug!(target = "llm_cache", %namespace, %event, "llm cache metric");
 }
 
+pub fn record_plan_rejection(reason: &str) {
+    register_metrics();
+    if let Some(counter) = PLAN_REJECTIONS.get() {
+        counter.with_label_values(&[reason]).inc();
+    }
+    debug!(target = "plan_validation", %reason, "plan rejected");
+}
+
+pub fn record_template_usage(template: &str) {
+    register_metrics();
+    if let Some(counter) = PLAN_TEMPLATE_USAGE.get() {
+        counter.with_label_values(&[template]).inc();
+    }
+    debug!(target = "planner", %template, "template recipe applied");
+}
+
+pub fn record_strategy_usage(stage: &str, strategy: &str, result: &str) {
+    register_metrics();
+    if let Some(counter) = PLAN_STRATEGY_USAGE.get() {
+        counter.with_label_values(&[stage, strategy, result]).inc();
+    }
+    debug!(target = "planner", %stage, %strategy, %result, "stage strategy usage");
+}
+
+pub fn record_auto_repair_events(kind: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    register_metrics();
+    if let Some(counter) = PLAN_AUTO_REPAIRS.get() {
+        counter.with_label_values(&[kind]).inc_by(count);
+    }
+    debug!(target = "planner", %kind, count, "auto repair recorded");
+}
+
 pub fn record_watchdog_event(kind: &str) {
     debug!(target = "watchdog", %kind, "watchdog event");
 }
@@ -181,4 +293,22 @@ pub fn record_permission_prompt() {
 
 pub fn record_download_prompt() {
     debug!(target = "watchdog", "download prompt detected");
+}
+
+pub fn record_missing_user_result(intent_kind: &str) {
+    register_metrics();
+    if let Some(counter) = EXECUTION_MISSING_RESULT.get() {
+        counter.with_label_values(&[intent_kind]).inc();
+    }
+    let total = MISSING_RESULT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    if total % MISSING_RESULT_ALERT_THRESHOLD == 0 {
+        warn!(
+            target = "execution",
+            total,
+            %intent_kind,
+            "executions succeeded without user-facing results"
+        );
+    } else {
+        debug!(target = "execution", %intent_kind, "execution missing user result");
+    }
 }

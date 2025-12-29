@@ -236,6 +236,7 @@ fn to_wait_condition(condition: &AgentWaitCondition) -> Result<WaitCondition, Ag
             Ok(WaitCondition::ElementHidden(to_anchor(locator)?))
         }
         AgentWaitCondition::UrlMatches(pattern) => Ok(WaitCondition::UrlMatches(pattern.clone())),
+        AgentWaitCondition::UrlEquals(expected) => Ok(WaitCondition::UrlEquals(expected.clone())),
         AgentWaitCondition::TitleMatches(pattern) => {
             Ok(WaitCondition::TitleMatches(pattern.clone()))
         }
@@ -284,6 +285,9 @@ fn to_condition(condition: &AgentWaitCondition) -> Result<Condition, AgentError>
         )),
         AgentWaitCondition::UrlMatches(pattern) => {
             Ok(Condition::Url(UrlCondition::Matches(pattern.clone())))
+        }
+        AgentWaitCondition::UrlEquals(expected) => {
+            Ok(Condition::Url(UrlCondition::Equals(expected.clone())))
         }
         AgentWaitCondition::TitleMatches(pattern) => {
             Ok(Condition::Title(TitleCondition::Matches(pattern.clone())))

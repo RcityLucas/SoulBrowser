@@ -5,3 +5,4 @@
 export * from './task';
 export * from './message';
 export * from './metrics';
+export * from './session';

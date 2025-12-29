@@ -10,6 +10,7 @@ use tokio::fs;
 use tokio::time::timeout;
 use tracing::{instrument, warn};
 
+use crate::agent::executor::UserResult;
 use crate::agent::{ChatRunner, ChatSessionOutput, FlowExecutionReport, StepExecutionStatus};
 use crate::console_fixture::PerceptionExecResult;
 use crate::llm::{
@@ -21,7 +22,8 @@ use crate::perception_service::{PerceptionJob, PerceptionOutput};
 use crate::plugin_registry::PluginRegistry;
 use crate::server::ServeState;
 use crate::task_status::{
-    AgentHistoryEntry, AgentHistoryStatus, TaskStatusHandle, TaskStatusRegistry, TaskStatusSnapshot,
+    AgentHistoryEntry, AgentHistoryStatus, TaskStatusHandle, TaskStatusRegistry,
+    TaskStatusSnapshot, TaskUserResult,
 };
 use crate::visualization::execution_artifacts_from_report;
 use soulbrowser_state_center::StateEvent;
@@ -693,6 +695,13 @@ pub fn sync_agent_execution_history(handle: &TaskStatusHandle, report: &FlowExec
             .and_then(|step| step.error.clone());
         handle.mark_failure(failure_reason);
     }
+
+    let converted: Vec<TaskUserResult> = report
+        .user_results
+        .iter()
+        .map(convert_user_result)
+        .collect();
+    handle.set_user_results(converted, report.missing_user_result);
 }
 
 pub fn flow_execution_report_payload(report: &FlowExecutionReport) -> Value {
@@ -727,8 +736,34 @@ pub fn flow_execution_report_payload(report: &FlowExecutionReport) -> Value {
                     })
                 }).collect::<Vec<_>>()
             })
-        }).collect::<Vec<_>>()
+        }).collect::<Vec<_>>(),
+        "user_results": report.user_results.iter().map(|result| {
+            json!({
+                "step_id": result.step_id,
+                "step_title": result.step_title,
+                "kind": result.kind.as_str(),
+                "schema": result.schema,
+                "content": result.content,
+                "artifact_path": result.artifact_path,
+            })
+        }).collect::<Vec<_>>(),
+        "missing_user_result": report.missing_user_result,
     })
+}
+
+fn convert_user_result(result: &UserResult) -> TaskUserResult {
+    TaskUserResult {
+        step_id: result.step_id.clone(),
+        step_title: result.step_title.clone(),
+        kind: result.kind.as_str().to_string(),
+        schema: result.schema.clone(),
+        content: if result.content.is_null() {
+            None
+        } else {
+            Some(result.content.clone())
+        },
+        artifact_path: result.artifact_path.clone(),
+    }
 }
 
 #[instrument(

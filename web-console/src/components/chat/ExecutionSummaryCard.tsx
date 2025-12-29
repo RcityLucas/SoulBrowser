@@ -1,15 +1,17 @@
-import { Card, Tag, List, Typography, Space } from 'antd';
+import { Card, Tag, List, Typography, Space, Alert, Button } from 'antd';
 import { CheckCircleTwoTone, CloseCircleTwoTone } from '@ant-design/icons';
 import type { ExecutionSummary } from '@/stores/chatStore';
 import styles from './ExecutionSummaryCard.module.css';
 
 interface Props {
   summary: ExecutionSummary;
+  onTriggerRemedy?: (action: 'capture' | 'summarize') => void;
 }
 
-export default function ExecutionSummaryCard({ summary }: Props) {
+export default function ExecutionSummaryCard({ summary, onTriggerRemedy }: Props) {
   const hasStdout = Boolean(summary.stdout?.trim());
   const hasStderr = Boolean(summary.stderr?.trim());
+  const missingResult = summary.success && summary.missingUserResult;
 
   return (
     <Card size="small" className={styles.summaryCard} bordered>
@@ -22,8 +24,30 @@ export default function ExecutionSummaryCard({ summary }: Props) {
         <Tag color={summary.success ? 'success' : 'error'}>
           {summary.success ? '执行成功' : '执行失败'}
         </Tag>
+        {missingResult && <Tag color="gold">缺少可读答案</Tag>}
         {summary.artifactPath && <span className={styles.artifact}>产出: {summary.artifactPath}</span>}
       </Space>
+
+      {missingResult && (
+        <Alert
+          type="warning"
+          showIcon
+          className={styles.missingAlert}
+          message="执行成功但未生成可读答案"
+          description={
+            onTriggerRemedy ? (
+              <Space size={8} wrap>
+                <Button size="small" type="primary" onClick={() => onTriggerRemedy('capture')}>
+                  抓取页面
+                </Button>
+                <Button size="small" onClick={() => onTriggerRemedy('summarize')}>
+                  总结结果
+                </Button>
+              </Space>
+            ) : undefined
+          }
+        />
+      )}
 
       {(hasStdout || hasStderr) && (
         <div className={styles.logs}>

@@ -3,23 +3,25 @@
 //!
 //! Provides browser automation tools using soulbase-tools
 
+use crate::block_detect::detect_block_reason;
 use crate::errors::SoulBrowserError;
 use crate::parsers::{
     parse_facebook_feed, parse_github_repos, parse_hackernews_feed, parse_linkedin_profile,
-    parse_market_info, parse_news_brief, parse_twitter_feed,
+    parse_market_info, parse_news_brief, parse_twitter_feed, parse_weather,
 };
-use crate::structured_output::validate_structured_output;
+use crate::structured_output::{summarize_structured_output, validate_structured_output};
 use action_primitives::{
-    ActionPrimitives, AnchorDescriptor, DefaultActionPrimitives, DefaultWaitStrategy, ExecCtx,
-    ScrollBehavior, ScrollTarget, SelectMethod, WaitCondition, WaitTier,
+    ActionError, ActionPrimitives, AnchorDescriptor, DefaultActionPrimitives, DefaultWaitStrategy,
+    ExecCtx, ScrollBehavior, ScrollTarget, SelectMethod, WaitCondition, WaitTier,
 };
-use cdp_adapter::{event_bus, Cdp, CdpAdapter, CdpConfig};
+use cdp_adapter::{event_bus, AdapterMode, Cdp, CdpAdapter, CdpConfig};
 use dashmap::DashMap;
 use l6_observe::{guard::LabelMap as ObsLabelMap, metrics as obs_metrics, tracing as obs_tracing};
 use once_cell::sync::Lazy;
+use regex::escape;
 use schemars::schema::{RootSchema, SchemaObject};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use soulbase_tools::{
     manifest::{
         CapabilityDecl, ConcurrencyKind, ConsentPolicy, IdempoKind, Limits, SafetyClass,
@@ -38,16 +40,33 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
+use url::{form_urlencoded, Url};
 use uuid::Uuid;
 
 const METRIC_TOOL_INVOCATIONS: &str = "soul.l5.tool.invocations";
 const METRIC_TOOL_LATENCY: &str = "soul.l5.tool.latency_ms";
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 30_000;
 const PAGE_OBSERVE_SCRIPT: &str = include_str!("scripts/page_observe.js");
+const WEATHER_CANDIDATE_LIMIT: usize = 5;
+const WEATHER_BLOCKED_CAUSE: &str = "WeatherLinkBlocked";
+const TRUSTED_WEATHER_DOMAINS: &[&str] = &[
+    "moji.com",
+    "tianqi.com",
+    "weather.com.cn",
+    "weather.com",
+    "weathercn.com",
+    "tianqi365.com",
+    "tianqi114.com",
+];
 const DATA_PARSE_TOOLS: &[(&str, &str)] = &[
     ("data.parse.generic", "Parse generic observation snapshot"),
     ("data.parse.market_info", "Parse market index snapshot"),
     ("data.parse.news_brief", "Parse news brief"),
+    (
+        "data.parse.weather",
+        "Parse weather widget into structured report",
+    ),
     ("data.parse.twitter-feed", "Parse Twitter/X feed"),
     ("data.parse.facebook-feed", "Parse Facebook feed"),
     ("data.parse.hackernews-feed", "Parse Hacker News feed"),
@@ -78,6 +97,11 @@ impl BrowserToolManager {
             tenant: TenantId(tenant_id),
             executor: Arc::new(BrowserToolExecutor::new()),
         }
+    }
+
+    /// Return the current adapter mode when available
+    pub fn adapter_mode(&self) -> Option<AdapterMode> {
+        self.executor.adapter_mode()
     }
 
     /// Register browser navigation tool
@@ -145,6 +169,23 @@ impl BrowserToolManager {
             .await
             .map_err(|e| {
                 SoulBrowserError::internal(&format!("Failed to register scroll tool: {}", e))
+            })?;
+
+        Ok(())
+    }
+
+    /// Register weather search macro tool
+    pub async fn register_weather_tool(&self) -> Result<(), SoulBrowserError> {
+        let manifest = create_weather_search_tool("weather.search");
+
+        self.registry
+            .upsert(&self.tenant, manifest)
+            .await
+            .map_err(|e| {
+                SoulBrowserError::internal(&format!(
+                    "Failed to register weather search tool: {}",
+                    e
+                ))
             })?;
 
         Ok(())
@@ -346,6 +387,7 @@ impl BrowserToolManager {
         self.register_scroll_tool().await?;
         self.register_wait_for_element_tool().await?;
         self.register_wait_for_condition_tool().await?;
+        self.register_weather_tool().await?;
         self.register_get_element_info_tool().await?;
         self.register_retrieve_history_tool().await?;
         self.register_take_screenshot_tool().await?;
@@ -608,6 +650,46 @@ fn create_scroll_tool(id: &str) -> ToolManifest {
             timeout_ms: 5000,
             max_bytes_in: 8 * 1024,
             max_bytes_out: 2 * 1024,
+            max_files: 0,
+            max_depth: 0,
+            max_concurrency: 1,
+        },
+        idempotency: IdempoKind::None,
+        concurrency: ConcurrencyKind::Queue,
+    }
+}
+
+/// Create weather search macro tool manifest
+fn create_weather_search_tool(id: &str) -> ToolManifest {
+    ToolManifest {
+        id: ToolId(id.to_string()),
+        version: "1.0.0".to_string(),
+        display_name: "Weather Search".to_string(),
+        description: "Navigate to a weather search page and ensure the widget loads".to_string(),
+        tags: vec![
+            "browser".to_string(),
+            "macro".to_string(),
+            "weather".to_string(),
+        ],
+        input_schema: create_simple_schema(),
+        output_schema: create_simple_schema(),
+        scopes: vec!["browser:macro".to_string()],
+        capabilities: vec![CapabilityDecl {
+            domain: "browser".to_string(),
+            action: "weather-search".to_string(),
+            resource: "*".to_string(),
+            attrs: serde_json::json!({}),
+        }],
+        side_effect: SideEffect::Browser,
+        safety_class: SafetyClass::Low,
+        consent: ConsentPolicy {
+            required: false,
+            max_ttl_ms: None,
+        },
+        limits: Limits {
+            timeout_ms: 45_000,
+            max_bytes_in: 8 * 1024,
+            max_bytes_out: 8 * 1024,
             max_files: 0,
             max_depth: 0,
             max_concurrency: 1,
@@ -1022,6 +1104,11 @@ pub trait ToolExecutor: Send + Sync {
     fn cdp_adapter(&self) -> Option<Arc<CdpAdapter>> {
         None
     }
+
+    /// Report the adapter mode when available (real vs stub)
+    fn adapter_mode(&self) -> Option<AdapterMode> {
+        self.cdp_adapter().as_ref().map(|adapter| adapter.mode())
+    }
 }
 
 /// Browser tool executor implementation
@@ -1094,6 +1181,33 @@ impl BrowserToolExecutor {
         labels.insert("success".into(), "false".into());
         obs_metrics::inc(METRIC_TOOL_INVOCATIONS, labels.clone());
         obs_metrics::observe(METRIC_TOOL_LATENCY, duration_ms, labels);
+    }
+
+    fn map_action_error(action: &str, err: ActionError) -> SoulBrowserError {
+        match err {
+            ActionError::AnchorNotFound(detail) => {
+                let user_msg = format!("{action} target not found: {detail}");
+                let dev_msg = format!("{action} failed: {detail}");
+                SoulBrowserError::validation_error(&user_msg, &dev_msg)
+            }
+            ActionError::NotClickable(detail) => {
+                let user_msg = format!("{action} target not clickable: {detail}");
+                SoulBrowserError::validation_error(&user_msg, &user_msg)
+            }
+            ActionError::NotEnabled(detail) => {
+                let user_msg = format!("{action} target not enabled: {detail}");
+                SoulBrowserError::validation_error(&user_msg, &user_msg)
+            }
+            ActionError::OptionNotFound(detail) | ActionError::ScrollTargetInvalid(detail) => {
+                let user_msg = format!("{action} failed: {detail}");
+                SoulBrowserError::validation_error(&user_msg, &user_msg)
+            }
+            ActionError::PolicyDenied(detail) => {
+                let user_msg = format!("{action} not allowed: {detail}");
+                SoulBrowserError::forbidden(&user_msg)
+            }
+            other => SoulBrowserError::internal(&format!("{action} failed: {}", other)),
+        }
     }
 
     async fn resolve_page_for_route(
@@ -1346,11 +1460,12 @@ impl BrowserToolExecutor {
         start: Instant,
         span: &tracing::Span,
     ) -> Result<ToolExecutionResult, SoulBrowserError> {
-        let schema = context
-            .input
-            .get("schema")
-            .and_then(|v| v.as_str())
-            .unwrap_or("generic_observation_v1");
+        let schema = required_deliver_field(
+            &context.input,
+            "schema",
+            "deliver_missing_schema",
+            "payload.schema 缺失，请补 generic_observation_v1 或对应解析 schema",
+        )?;
         let entry = OBSERVATION_CACHE
             .get_mut(&context.subject_id)
             .ok_or_else(|| {
@@ -1360,7 +1475,7 @@ impl BrowserToolExecutor {
             })?;
         let parsed_value = entry
             .parsed
-            .get(schema)
+            .get(&schema)
             .or_else(|| entry.parsed.values().next())
             .cloned()
             .ok_or_else(|| {
@@ -1370,7 +1485,7 @@ impl BrowserToolExecutor {
             })?;
         drop(entry);
 
-        validate_structured_output(schema, &parsed_value).map_err(|err| {
+        validate_structured_output(&schema, &parsed_value).map_err(|err| {
             self.record_error(context, start, span);
             SoulBrowserError::validation_error("Invalid structured output", &err.to_string())
         })?;
@@ -1380,17 +1495,25 @@ impl BrowserToolExecutor {
             .get("task_id")
             .and_then(|v| v.as_str())
             .unwrap_or("anonymous");
-        let artifact_label = context
-            .input
-            .get("artifact_label")
-            .and_then(|v| v.as_str())
-            .unwrap_or("structured");
-        let filename = context
-            .input
-            .get("filename")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(format!("{}_{}.json", artifact_label, schema)));
+        let artifact_label = required_deliver_field(
+            &context.input,
+            "artifact_label",
+            "deliver_missing_artifact_label",
+            "payload.artifact_label 缺失，用于命名结构化产物，请填写例如 structured.github_repos_v1",
+        )?;
+        let filename_value = required_deliver_field(
+            &context.input,
+            "filename",
+            "deliver_missing_filename",
+            "payload.filename 缺失，请指定例如 github_repos_v1.json",
+        )?;
+        let filename = PathBuf::from(filename_value.as_str());
+        let source_step_id = required_deliver_field(
+            &context.input,
+            "source_step_id",
+            "deliver_missing_source_step",
+            "payload.source_step_id 缺失，请引用前序解析步骤 ID",
+        )?;
 
         let root = PathBuf::from("soulbrowser-output")
             .join("artifacts")
@@ -1409,16 +1532,25 @@ impl BrowserToolExecutor {
 
         let artifact_path_str = artifact_path.to_string_lossy().to_string();
         let mut metadata = serde_json::Map::new();
-        metadata.insert("schema".into(), json!(schema));
+        metadata.insert("schema".into(), json!(schema.clone()));
+        metadata.insert("artifact_label".into(), json!(artifact_label.clone()));
+        metadata.insert("source_step_id".into(), json!(source_step_id.clone()));
         metadata.insert("artifact_path".into(), json!(artifact_path_str.clone()));
+
+        let mut output_payload = Map::new();
+        output_payload.insert("status".into(), json!("delivered"));
+        output_payload.insert("schema".into(), json!(schema.clone()));
+        output_payload.insert("artifact_label".into(), json!(artifact_label.clone()));
+        output_payload.insert("source_step_id".into(), json!(source_step_id.clone()));
+        output_payload.insert("artifact_path".into(), json!(artifact_path_str.clone()));
+        if let Some(summary) = summarize_structured_output(&schema, &parsed_value) {
+            output_payload.insert("summary".into(), json!(summary.clone()));
+            metadata.insert("summary".into(), json!(summary));
+        }
 
         let result = ToolExecutionResult {
             success: true,
-            output: Some(json!({
-                "status": "delivered",
-                "schema": schema,
-                "artifact_path": artifact_path_str,
-            })),
+            output: Some(Value::Object(output_payload)),
             error: None,
             duration_ms: start.elapsed().as_millis() as u64,
             metadata,
@@ -1457,6 +1589,11 @@ impl BrowserToolExecutor {
                 .map(|value| ("twitter_feed_v1".to_string(), value))
                 .map_err(|err| {
                     SoulBrowserError::internal(&format!("Parse twitter feed failed: {}", err))
+                }),
+            "data.parse.weather" => parse_weather(observation)
+                .map(|value| ("weather_report_v1".to_string(), value))
+                .map_err(|err| {
+                    SoulBrowserError::internal(&format!("Parse weather failed: {}", err))
                 }),
             "data.parse.facebook-feed" => parse_facebook_feed(observation)
                 .map(|value| ("facebook_feed_v1".to_string(), value))
@@ -1680,6 +1817,18 @@ impl BrowserToolExecutor {
     fn parse_wait_condition_for_expect(
         expect: &serde_json::Value,
     ) -> Result<WaitCondition, SoulBrowserError> {
+        if let Some(pattern) = expect.get("url_pattern").and_then(|v| v.as_str()) {
+            return Ok(WaitCondition::UrlMatches(pattern.to_string()));
+        }
+
+        if let Some(pattern) = expect.get("title_pattern").and_then(|v| v.as_str()) {
+            return Ok(WaitCondition::TitleMatches(pattern.to_string()));
+        }
+
+        if let Some(expected) = expect.get("url_equals").and_then(|v| v.as_str()) {
+            return Ok(WaitCondition::UrlEquals(expected.to_string()));
+        }
+
         if let Some(net) = expect.get("net") {
             if let Some(quiet_ms) = net.get("quiet_ms").and_then(|v| v.as_u64()) {
                 return Ok(WaitCondition::NetworkIdle(quiet_ms));
@@ -1696,8 +1845,361 @@ impl BrowserToolExecutor {
 
         Err(SoulBrowserError::validation_error(
             "Unsupported expect",
-            "wait-for-condition currently supports net.quiet_ms or duration_ms",
+            "wait-for-condition currently supports net.quiet_ms, duration_ms, url_pattern, url_equals, or title_pattern",
         ))
+    }
+}
+
+fn required_deliver_field(
+    input: &Value,
+    key: &str,
+    code: &'static str,
+    remedial: &'static str,
+) -> Result<String, SoulBrowserError> {
+    input
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .ok_or_else(|| SoulBrowserError::validation_error(code, remedial))
+}
+
+fn required_field(
+    input: &Value,
+    key: &str,
+    code: &'static str,
+    remedial: &'static str,
+) -> Result<String, SoulBrowserError> {
+    input
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .ok_or_else(|| SoulBrowserError::validation_error(code, remedial))
+}
+
+fn build_weather_search_url(query: &str, override_url: Option<&str>) -> String {
+    if let Some(custom) = override_url {
+        if !custom.trim().is_empty() {
+            return custom.to_string();
+        }
+    }
+    let encoded: String = form_urlencoded::byte_serialize(query.trim().as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
+    format!("https://www.baidu.com/s?wd={}", encoded)
+}
+
+fn weather_wait_condition(url: &str) -> WaitCondition {
+    if let Ok(parsed) = Url::parse(url) {
+        if let Some((_, value)) = parsed.query_pairs().find(|(key, _)| key == "wd") {
+            let mut base = format!(
+                "{}://{}",
+                parsed.scheme(),
+                parsed.host_str().unwrap_or_default()
+            );
+            if let Some(port) = parsed.port() {
+                base.push(':');
+                base.push_str(&port.to_string());
+            }
+            base.push_str(parsed.path());
+            let encoded: String = form_urlencoded::byte_serialize(value.as_bytes()).collect();
+            let mut pattern = format!("^{}.*", escape(&base));
+            pattern.push_str(&format!("wd={}.*", escape(&encoded)));
+            pattern.push('$');
+            return WaitCondition::UrlMatches(pattern);
+        }
+    }
+    WaitCondition::UrlEquals(url.to_string())
+}
+
+fn build_weather_link_patterns(input: &Value) -> Vec<String> {
+    let mut patterns = Vec::new();
+    if let Some(value) = input
+        .get("preferred_link_substrings")
+        .and_then(|v| v.as_array())
+    {
+        for entry in value {
+            if let Some(text) = entry.as_str() {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    let lowered = trimmed.to_ascii_lowercase();
+                    if !patterns.contains(&lowered) {
+                        patterns.push(lowered);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(text) = input
+        .get("preferred_link_substring")
+        .and_then(|v| v.as_str())
+    {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let lowered = trimmed.to_ascii_lowercase();
+            if !patterns.contains(&lowered) {
+                patterns.push(lowered);
+            }
+        }
+    }
+    const FALLBACKS: &[&str] = &[
+        "moji.com",
+        "墨迹",
+        "tianqi.com",
+        "中国天气",
+        "weather.com",
+        "weather.com.cn",
+        "weathercn.com",
+        "天气网",
+    ];
+    for fallback in FALLBACKS {
+        let lowered = fallback.to_ascii_lowercase();
+        if !patterns.contains(&lowered) {
+            patterns.push(lowered);
+        }
+    }
+    patterns
+}
+
+fn is_trusted_weather_url(url: &str, preferred_override: Option<&str>) -> bool {
+    if let Ok(parsed) = Url::parse(url) {
+        if let Some(host) = parsed.host_str().map(|h| h.to_ascii_lowercase()) {
+            if TRUSTED_WEATHER_DOMAINS
+                .iter()
+                .any(|domain| host.ends_with(domain))
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(extra) = preferred_override {
+        let trimmed = extra.trim();
+        if !trimmed.is_empty() {
+            let needle = trimmed.to_ascii_lowercase();
+            return url.to_ascii_lowercase().contains(&needle);
+        }
+    }
+    false
+}
+
+struct PageHealthSnapshot {
+    url: String,
+    title: String,
+    text_sample: String,
+}
+
+impl PageHealthSnapshot {
+    fn as_value(&self) -> Value {
+        json!({
+            "url": self.url,
+            "title": self.title,
+            "text_sample": self.text_sample,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WeatherCandidateOutcome {
+    final_url: String,
+    snapshot: Value,
+}
+
+enum WeatherCandidateEvaluation {
+    Ready(WeatherCandidateOutcome),
+    Blocked(String),
+}
+
+impl BrowserToolExecutor {
+    async fn extract_weather_result_links(
+        &self,
+        exec_ctx: &ExecCtx,
+        patterns: &[String],
+        limit: usize,
+        preferred_override: Option<&str>,
+    ) -> Result<Vec<String>, SoulBrowserError> {
+        if patterns.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let context = self
+            .primitives
+            .resolve_context(exec_ctx)
+            .await
+            .map_err(|err| {
+                SoulBrowserError::internal(&format!("Failed to resolve execution context: {}", err))
+            })?;
+        let pattern_literal = serde_json::to_string(patterns).map_err(|err| {
+            SoulBrowserError::internal(&format!("Invalid substring list: {}", err))
+        })?;
+        let template = r#"(() => {
+                const patterns = __PATTERNS__.map(p => (p || '').toLowerCase().trim()).filter(Boolean);
+                const anchors = Array.from(document.querySelectorAll('#content_left a[href]'));
+                const decodeCandidate = raw => {
+                    if (!raw) { return ''; }
+                    try {
+                        const parsed = new URL(raw, document.location.href);
+                        const param = parsed.searchParams.get('url');
+                        if (param) {
+                            let decoded = param;
+                            try { decoded = decodeURIComponent(param); } catch (err) { decoded = param; }
+                            if (/^https?:\/\//i.test(decoded)) {
+                                return decoded;
+                            }
+                        }
+                        return parsed.href;
+                    } catch (err) {
+                        return raw;
+                    }
+                };
+                const matches = [];
+                const seen = new Set();
+                for (const anchor of anchors) {
+                    if (matches.length >= __LIMIT__) { break; }
+                    const hrefAttr = (anchor.getAttribute('href') || '').trim();
+                    const dataAttr = (anchor.getAttribute('data-landurl') || anchor.getAttribute('data-url') || '').trim();
+                    const text = (anchor.innerText || '').toLowerCase();
+                    const haystacks = [hrefAttr.toLowerCase(), dataAttr.toLowerCase(), text];
+                    const matched = patterns.length === 0 || patterns.some(pattern => haystacks.some(h => h.includes(pattern)));
+                    if (!matched) { continue; }
+                    const raw = dataAttr || hrefAttr;
+                    if (!raw) { continue; }
+                    const candidate = decodeCandidate(raw);
+                    if (!candidate) { continue; }
+                    let absolute;
+                    try {
+                        absolute = new URL(candidate, document.location.href).href;
+                    } catch (err) {
+                        continue;
+                    }
+                    if (!/^https?:\/\//i.test(absolute)) { continue; }
+                    if (seen.has(absolute)) { continue; }
+                    seen.add(absolute);
+                    matches.push(absolute);
+                }
+                return matches;
+            })()"#;
+        let script = template
+            .replace("__PATTERNS__", &pattern_literal)
+            .replace("__LIMIT__", &limit.to_string());
+        let value = self
+            .primitives
+            .adapter()
+            .evaluate_script_in_context(&context, &script)
+            .await
+            .map_err(|err| {
+                SoulBrowserError::internal(&format!(
+                    "Failed to inspect weather result link: {}",
+                    err
+                ))
+            })?;
+        if let Some(array) = value.as_array() {
+            if array.is_empty() {
+                warn!(target: "weather.search", "Baidu result scan yielded 0 anchors");
+            }
+            let mut collected = Vec::new();
+            for entry in array {
+                if let Some(url) = entry.as_str() {
+                    if is_trusted_weather_url(url, preferred_override) {
+                        collected.push(url.to_string());
+                    }
+                }
+            }
+            if collected.is_empty() {
+                warn!(target: "weather.search", "No trusted weather domains found; falling back to generic anchors");
+                for entry in array {
+                    if let Some(url) = entry.as_str() {
+                        collected.push(url.to_string());
+                    }
+                    if collected.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            return Ok(collected);
+        }
+        Ok(Vec::new())
+    }
+
+    async fn capture_page_snapshot(
+        &self,
+        exec_ctx: &ExecCtx,
+    ) -> Result<PageHealthSnapshot, SoulBrowserError> {
+        let context = self
+            .primitives
+            .resolve_context(exec_ctx)
+            .await
+            .map_err(|err| {
+                SoulBrowserError::internal(&format!("Failed to resolve execution context: {}", err))
+            })?;
+        let script = "(() => { const title = document.title || ''; const text = (document.body && document.body.innerText) || ''; return { url: window.location.href || '', title, text: text.replace(/\\s+/g, ' ').slice(0, 4000) }; })()";
+        let value = self
+            .primitives
+            .adapter()
+            .evaluate_script_in_context(&context, script)
+            .await
+            .map_err(|err| {
+                SoulBrowserError::internal(&format!("Failed to capture page snapshot: {}", err))
+            })?;
+        let url = value
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = value
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let text_sample = value
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(PageHealthSnapshot {
+            url,
+            title,
+            text_sample,
+        })
+    }
+
+    async fn evaluate_weather_candidate(
+        &self,
+        exec_ctx: &ExecCtx,
+        candidate: &str,
+        destination_selector: &str,
+        timeout_ms: u64,
+    ) -> Result<WeatherCandidateEvaluation, SoulBrowserError> {
+        self.primitives
+            .navigate(exec_ctx, candidate, WaitTier::DomReady)
+            .await
+            .map_err(|err| Self::map_action_error("Weather result navigate", err))?;
+        self.primitives
+            .wait_for(
+                exec_ctx,
+                &WaitCondition::ElementVisible(AnchorDescriptor::Css(
+                    destination_selector.to_string(),
+                )),
+                timeout_ms,
+            )
+            .await
+            .map_err(|err| Self::map_action_error("Weather destination wait", err))?;
+        let snapshot = self.capture_page_snapshot(exec_ctx).await?;
+        if snapshot.url.to_ascii_lowercase().contains("baidu.com") {
+            return Ok(WeatherCandidateEvaluation::Blocked(
+                "Baidu relay did not resolve to a weather domain".to_string(),
+            ));
+        }
+        if let Some(reason) =
+            detect_block_reason(&snapshot.title, &snapshot.text_sample, Some(&snapshot.url))
+        {
+            return Ok(WeatherCandidateEvaluation::Blocked(reason));
+        }
+        Ok(WeatherCandidateEvaluation::Ready(WeatherCandidateOutcome {
+            final_url: snapshot.url.clone(),
+            snapshot: snapshot.as_value(),
+        }))
     }
 }
 
@@ -1741,7 +2243,7 @@ impl ToolExecutor for BrowserToolExecutor {
                     .await
                     .map_err(|err| {
                         self.record_error(&context, start, &span);
-                        SoulBrowserError::internal(&format!("Navigate failed: {}", err))
+                        Self::map_action_error("Navigate", err)
                     })?;
                 let duration = report.latency_ms.max(start.elapsed().as_millis() as u64);
                 let result = ToolExecutionResult {
@@ -1782,7 +2284,7 @@ impl ToolExecutor for BrowserToolExecutor {
                     .await
                     .map_err(|err| {
                         self.record_error(&context, start, &span);
-                        SoulBrowserError::internal(&format!("Click failed: {}", err))
+                        Self::map_action_error("Click", err)
                     })?;
                 let duration = report.latency_ms.max(start.elapsed().as_millis() as u64);
                 let result = ToolExecutionResult {
@@ -1837,7 +2339,7 @@ impl ToolExecutor for BrowserToolExecutor {
                     .await
                     .map_err(|err| {
                         self.record_error(&context, start, &span);
-                        SoulBrowserError::internal(&format!("Type failed: {}", err))
+                        Self::map_action_error("Type text", err)
                     })?;
                 let duration = report.latency_ms.max(start.elapsed().as_millis() as u64);
                 let result = ToolExecutionResult {
@@ -1891,7 +2393,7 @@ impl ToolExecutor for BrowserToolExecutor {
                     .await
                     .map_err(|err| {
                         self.record_error(&context, start, &span);
-                        SoulBrowserError::internal(&format!("Select failed: {}", err))
+                        Self::map_action_error("Select", err)
                     })?;
                 let duration = report.latency_ms.max(start.elapsed().as_millis() as u64);
                 let result = ToolExecutionResult {
@@ -1925,7 +2427,7 @@ impl ToolExecutor for BrowserToolExecutor {
                     .await
                     .map_err(|err| {
                         self.record_error(&context, start, &span);
-                        SoulBrowserError::internal(&format!("Scroll failed: {}", err))
+                        Self::map_action_error("Scroll", err)
                     })?;
                 let duration = report.latency_ms.max(start.elapsed().as_millis() as u64);
                 let result = ToolExecutionResult {
@@ -1963,7 +2465,7 @@ impl ToolExecutor for BrowserToolExecutor {
                     .await
                     .map_err(|err| {
                         self.record_error(&context, start, &span);
-                        SoulBrowserError::internal(&format!("Wait failed: {}", err))
+                        Self::map_action_error("Wait for element", err)
                     })?;
                 let duration = report.latency_ms.max(start.elapsed().as_millis() as u64);
                 let result = ToolExecutionResult {
@@ -1994,7 +2496,7 @@ impl ToolExecutor for BrowserToolExecutor {
                     .await
                     .map_err(|err| {
                         self.record_error(&context, start, &span);
-                        SoulBrowserError::internal(&format!("Wait failed: {}", err))
+                        Self::map_action_error("Wait for condition", err)
                     })?;
                 let duration = report.latency_ms.max(start.elapsed().as_millis() as u64);
                 let result = ToolExecutionResult {
@@ -2003,6 +2505,148 @@ impl ToolExecutor for BrowserToolExecutor {
                         "status": "condition_met",
                         "condition": format!("{:?}", wait_condition),
                         "latency_ms": report.latency_ms,
+                    })),
+                    error: None,
+                    duration_ms: duration,
+                    metadata,
+                };
+                let result = self.finish_tool(&context, start, &span, result);
+                Ok(result)
+            }
+            "weather.search" => {
+                let query = required_field(
+                    &context.input,
+                    "query",
+                    "Missing field",
+                    "'query' is required for weather.search",
+                )?;
+                let override_url = context.input.get("search_url").and_then(|v| v.as_str());
+                let search_url = build_weather_search_url(&query, override_url);
+                let result_selector = context
+                    .input
+                    .get("result_selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("div#content_left");
+                let follow_link = context
+                    .input
+                    .get("follow_result_link")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let link_patterns = build_weather_link_patterns(&context.input);
+                let preferred_override = context
+                    .input
+                    .get("preferred_link_substring")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let destination_selector = context
+                    .input
+                    .get("destination_selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("body");
+                let wait_condition = weather_wait_condition(&search_url);
+                let widget_anchor = AnchorDescriptor::Css(result_selector.to_string());
+
+                let nav_report = self
+                    .primitives
+                    .navigate(&exec_ctx, &search_url, WaitTier::DomReady)
+                    .await
+                    .map_err(|err| {
+                        self.record_error(&context, start, &span);
+                        Self::map_action_error("Weather search", err)
+                    })?;
+
+                self.primitives
+                    .wait_for(&exec_ctx, &wait_condition, context.timeout_ms)
+                    .await
+                    .map_err(|err| {
+                        self.record_error(&context, start, &span);
+                        Self::map_action_error("Weather search wait", err)
+                    })?;
+
+                self.primitives
+                    .wait_for(
+                        &exec_ctx,
+                        &WaitCondition::ElementVisible(widget_anchor.clone()),
+                        context.timeout_ms,
+                    )
+                    .await
+                    .map_err(|err| {
+                        self.record_error(&context, start, &span);
+                        Self::map_action_error("Weather widget wait", err)
+                    })?;
+
+                let mut destination_url = search_url.clone();
+                let mut page_snapshot = Value::Null;
+                if follow_link {
+                    let candidates = self
+                        .extract_weather_result_links(
+                            &exec_ctx,
+                            &link_patterns,
+                            WEATHER_CANDIDATE_LIMIT,
+                            preferred_override.as_deref(),
+                        )
+                        .await?;
+                    let mut last_block_reason: Option<String> = None;
+                    for candidate in candidates.iter() {
+                        match self
+                            .evaluate_weather_candidate(
+                                &exec_ctx,
+                                candidate,
+                                destination_selector,
+                                context.timeout_ms,
+                            )
+                            .await
+                        {
+                            Ok(WeatherCandidateEvaluation::Ready(outcome)) => {
+                                destination_url = outcome.final_url;
+                                page_snapshot = outcome.snapshot;
+                                break;
+                            }
+                            Ok(WeatherCandidateEvaluation::Blocked(reason)) => {
+                                warn!(target = %candidate, reason = %reason, "Weather candidate blocked");
+                                last_block_reason = Some(reason);
+                                continue;
+                            }
+                            Err(err) => {
+                                self.record_error(&context, start, &span);
+                                return Err(err);
+                            }
+                        }
+                    }
+                    if destination_url == search_url
+                        && !candidates.is_empty()
+                        && last_block_reason.is_some()
+                    {
+                        let reason = last_block_reason.unwrap();
+                        return Err(SoulBrowserError::forbidden(
+                            "天气站点被拦截，需人工验证或稍后重试",
+                        )
+                        .with_cause(WEATHER_BLOCKED_CAUSE, &reason));
+                    }
+                }
+
+                metadata.insert(
+                    "destination_url".to_string(),
+                    json!(destination_url.clone()),
+                );
+                metadata.insert("current_url".to_string(), json!(destination_url.clone()));
+                if !page_snapshot.is_null() {
+                    metadata.insert("page_snapshot".to_string(), page_snapshot.clone());
+                }
+
+                let duration = start.elapsed().as_millis() as u64;
+                let result = ToolExecutionResult {
+                    success: true,
+                    output: Some(serde_json::json!({
+                        "status": "weather_ready",
+                        "query": query,
+                        "url": search_url,
+                        "destination_url": destination_url,
+                        "page_snapshot": page_snapshot,
+                        "result_selector": result_selector,
+                        "latency_ms": nav_report.latency_ms,
                     })),
                     error: None,
                     duration_ms: duration,
@@ -2337,6 +2981,19 @@ mod tests {
             result["metadata"]["tool_id"].as_str().unwrap(),
             "navigate-to-url"
         );
+    }
+
+    #[test]
+    fn wait_condition_accepts_url_equals_literal() {
+        let expect = json!({ "url_equals": "https://example.com/search?q=test" });
+        let condition =
+            BrowserToolExecutor::parse_wait_condition_for_expect(&expect).expect("condition");
+        match condition {
+            WaitCondition::UrlEquals(value) => {
+                assert_eq!(value, "https://example.com/search?q=test")
+            }
+            other => panic!("unexpected condition: {other:?}"),
+        }
     }
 
     #[tokio::test]

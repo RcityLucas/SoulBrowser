@@ -89,7 +89,10 @@ export default function LiveCompanion({
   const [renderSize, setRenderSize] = useState({ width: 0, height: 0 });
   const imageRef = useRef<HTMLImageElement | null>(null);
 
-  const overlayList = useMemo(() => overlays.slice(-6).reverse(), [overlays]);
+  const overlayList = useMemo(
+    () => overlays.filter((item) => item.data?.bbox).slice(-6).reverse(),
+    [overlays]
+  );
   const filteredAnnotations = useMemo(() => {
     if (annotationSeverityFilter === 'all') {
       return annotations;
@@ -179,20 +182,25 @@ export default function LiveCompanion({
               最新截图：{formatTime(latestFrame.recordedAt)}
             </Typography.Text>
           )}
-         {taskId && (
+          {taskId && (
             <Typography.Text type="secondary" copyable>
               {taskId}
             </Typography.Text>
           )}
           {judgeVerdict && (
-            <Tag color={judgeVerdict.verdict.passed ? 'green' : 'red'}>
+            <Tag
+              color={judgeVerdict.verdict.passed ? 'green' : judgeVerdict.verdict.reason ? 'red' : 'gold'}
+              style={{ fontWeight: 600 }}
+            >
               QA {judgeVerdict.verdict.passed ? '通过' : '未通过'}
             </Tag>
           )}
           {judgeVerdict?.verdict.reason && (
-            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              {judgeVerdict.verdict.reason}
-            </Typography.Text>
+            <Tooltip title={judgeVerdict.verdict.reason}>
+              <Typography.Text type="danger" style={{ fontSize: 12 }}>
+                {judgeVerdict.verdict.reason}
+              </Typography.Text>
+            </Tooltip>
           )}
           {streamError && (
             <Tooltip title={streamError}>
@@ -200,7 +208,7 @@ export default function LiveCompanion({
             </Tooltip>
           )}
         </Space>
-        <Space>
+        <Space wrap>
           <Button
             icon={streamPaused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
             onClick={onTogglePause}

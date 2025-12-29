@@ -1,5 +1,9 @@
 .summaryCard {
   margin-top: 12px;
+  background: rgba(246, 247, 255, 0.9);
+  border: 1px solid rgba(223, 230, 255, 0.8);
+  border-radius: 16px;
+  padding: 16px;
 }
 
 .header {
@@ -7,12 +11,16 @@
 }
 
 .artifact {
-  color: var(--text-color-secondary);
+  color: #6a6f86;
   font-size: 12px;
 }
 
 .logs {
   margin-bottom: 8px;
+}
+
+.missingAlert {
+  margin-bottom: 12px;
 }
 
 .logBlock {

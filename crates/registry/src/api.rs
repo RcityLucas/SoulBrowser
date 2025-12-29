@@ -13,4 +13,3 @@ pub trait Registry: Send + Sync {
     async fn route_resolve(&self, hint: Option<RoutingHint>) -> Result<ExecRoute, SoulError>;
     async fn session_list(&self) -> Vec<SessionCtx>;
 }
-

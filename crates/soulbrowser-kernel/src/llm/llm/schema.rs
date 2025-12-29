@@ -7,6 +7,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 
+use crate::agent::{ContextResolver, StageContext};
+
 #[derive(Debug, Deserialize)]
 pub struct LlmJsonPlan {
     pub title: String,
@@ -76,8 +78,10 @@ pub fn plan_from_json_payload(
     let mut plan = AgentPlan::new(request.task_id.clone(), payload.title.clone())
         .with_description(payload.description.clone());
 
+    let stage_context = ContextResolver::new(request).build();
+
     for (index, step) in payload.steps.iter().enumerate() {
-        let tool = to_agent_tool(step)?;
+        let tool = to_agent_tool(step, &stage_context)?;
         let step_id = format!("llm-step-{}", index + 1);
         let mut agent_step =
             AgentPlanStep::new(step_id, step.title.clone(), tool).with_detail(step.detail.clone());
@@ -111,6 +115,7 @@ pub fn plan_from_json_payload(
         rationale: payload.rationale.clone(),
         risk_assessment: payload.risks.clone(),
         vendor_context,
+        overlays: Vec::new(),
     };
 
     let explanations = if plan.meta.rationale.is_empty() {
@@ -125,7 +130,7 @@ pub fn plan_from_json_payload(
     Ok(PlannerOutcome { plan, explanations })
 }
 
-fn to_agent_tool(step: &LlmJsonStep) -> Result<AgentTool, AgentError> {
+fn to_agent_tool(step: &LlmJsonStep, context: &StageContext) -> Result<AgentTool, AgentError> {
     let action = step.action.trim().to_ascii_lowercase();
     let wait = step
         .wait
@@ -137,10 +142,7 @@ fn to_agent_tool(step: &LlmJsonStep) -> Result<AgentTool, AgentError> {
 
     let kind = match action.as_str() {
         "navigate" | "nav" => AgentToolKind::Navigate {
-            url: step
-                .url
-                .clone()
-                .ok_or_else(|| AgentError::invalid_request("navigate step missing url"))?,
+            url: resolve_navigate_url(step, context)?,
         },
         "click" => AgentToolKind::Click {
             locator: parse_locator(step.locator.as_deref())?,
@@ -185,6 +187,25 @@ fn to_agent_tool(step: &LlmJsonStep) -> Result<AgentTool, AgentError> {
         wait,
         timeout_ms,
     })
+}
+
+fn resolve_navigate_url(
+    step: &LlmJsonStep,
+    context: &StageContext,
+) -> Result<String, AgentError> {
+    let explicit = step
+        .url
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    if let Some(url) = explicit {
+        return Ok(url);
+    }
+    if let Some(best) = context.best_known_url() {
+        return Ok(best);
+    }
+    Ok(context.fallback_search_url())
 }
 
 fn parse_locator(raw: Option<&str>) -> Result<AgentLocator, AgentError> {
@@ -256,6 +277,12 @@ fn parse_wait_condition(step: &LlmJsonStep) -> Result<AgentWaitCondition, AgentE
         if let Some(url) = target.strip_prefix("url=") {
             return Ok(AgentWaitCondition::UrlMatches(url.trim().to_string()));
         }
+        if let Some(url) = target
+            .strip_prefix("url_equals=")
+            .or_else(|| target.strip_prefix("url_exact="))
+        {
+            return Ok(AgentWaitCondition::UrlEquals(url.trim().to_string()));
+        }
         if let Some(selector) = target.strip_prefix("css=") {
             return Ok(AgentWaitCondition::ElementVisible(AgentLocator::Css(
                 selector.trim().to_string(),
@@ -293,6 +320,11 @@ fn to_validation(raw: &LlmJsonValidation) -> Result<AgentValidation, AgentError>
         .unwrap_or_else(|| "LLM validation".to_string());
     let condition = match raw.kind.to_ascii_lowercase().as_str() {
         "url_matches" | "url" => AgentWaitCondition::UrlMatches(
+            raw.argument
+                .clone()
+                .ok_or_else(|| AgentError::invalid_request("validation missing argument"))?,
+        ),
+        "url_equals" | "url_exact" => AgentWaitCondition::UrlEquals(
             raw.argument
                 .clone()
                 .ok_or_else(|| AgentError::invalid_request("validation missing argument"))?,

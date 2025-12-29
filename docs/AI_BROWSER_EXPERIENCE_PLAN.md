@@ -67,6 +67,12 @@
   - 计划、执行日志、截图可导出，视觉高亮可二次确认。
   - 控制台在 Chrome/Edge 最新版本稳定，WebSocket 延迟 <1s。
 
+#### 近期落地进度（2025-12）
+- ✅ **后端全托管管线**：`soulbrowser serve --surface console` 已承载对话流量，`/api/chat` 可传入/返回 `session_id`，若未提供会自动在 registry + session service 中创建持久会话，并把 `session_id` 写入 `PersistedPlanRecord` 与任务元数据，便于追踪。
+- ✅ **实时可视化链路**：`SessionService` 订阅任务流事件，将截图与 overlay 汇聚到会话级 SSE (`/api/sessions/:id/live`)，并带分享令牌控制访问，前端能即时播放 live viewer。
+- ✅ **控制台体验**：Chat 页新增「持久会话」控制卡（刷新/创建/切换会话并同步到 URL），Sessions 页实时画面与“最新事件”面板已连通；任务列表的 metadata 也包含 `session_id`，支持跳转对应会话。
+- ✅ **类型与构建**：TS/前端类型更新覆盖新字段，`npm run type-check` 与 `cargo check` 均通过，确保前后端契约统一。
+
 ### 阶段 2 · 个性化与记忆（3-4 周）
 **目标**：让 Agent 记住用户偏好、历史计划并加速重复任务，提供视觉记忆与模板复用能力。
 - 扩展 L4 `recipes` 为 `memory-center`，支持语义/视觉混合记忆、标签、TTL 管控。
@@ -137,7 +143,7 @@
 - `docs/PRODUCT_COMPLETION_PLAN.md`：基础能力交付计划（现已发布）。
 - `docs/AI_BROWSER_EXPERIENCE_PLAN.md`：本文件，覆盖 AI 浏览体验。
 - 后续需新增：
-  - `docs/plans/ARCHIVE/` —— Legacy Prompt 模板、计划 Schema、模型适配、Browser Use 差距追踪文档（仅供参考）。
+- `docs/plans/ARCHIVE/BROWSER_USE_ALIGNMENT.md` —— Browser Use 差距追踪与阶段性补齐记录（阶段覆盖日志与严格校验已补齐）。
   - `docs/ui/` —— 控制台 IA、视觉高亮、组件规范、Browser Use UI 模式对齐。
   - `docs/plugins/` —— Manifest 规范、审核流程、REST/SDK 文档、生态差距追踪。
   - `L8 Agent 与体验（Agent & Experience）` —— 分阶段技术实现与逻辑规约文档。

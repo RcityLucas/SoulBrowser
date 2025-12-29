@@ -5,7 +5,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -104,6 +104,19 @@ pub struct AgentHistoryEntry {
     pub run_ms: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskUserResult {
+    pub step_id: String,
+    pub step_title: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskStatusSnapshot {
     pub task_id: String,
@@ -128,6 +141,10 @@ pub struct TaskStatusSnapshot {
     pub annotations: Vec<TaskAnnotation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_history: Vec<AgentHistoryEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_results: Vec<TaskUserResult>,
+    #[serde(default)]
+    pub missing_user_result: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watchdog_events: Vec<WatchdogEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +175,8 @@ struct TaskStatusRecord {
     context_snapshot: Option<Value>,
     annotations: Vec<TaskAnnotation>,
     agent_history: Vec<AgentHistoryEntry>,
+    user_results: Vec<TaskUserResult>,
+    missing_user_result: bool,
     watchdog_events: Vec<WatchdogEvent>,
     judge_verdict: Option<TaskJudgeVerdict>,
     self_heal_events: Vec<SelfHealEvent>,
@@ -200,6 +219,8 @@ impl TaskStatusRecord {
             context_snapshot: None,
             annotations: Vec::new(),
             agent_history: Vec::new(),
+            user_results: Vec::new(),
+            missing_user_result: false,
             watchdog_events: Vec::new(),
             judge_verdict: None,
             self_heal_events: Vec::new(),
@@ -229,6 +250,8 @@ impl TaskStatusRecord {
             context_snapshot: self.context_snapshot.clone(),
             annotations: self.annotations.clone(),
             agent_history: self.agent_history.clone(),
+            user_results: self.user_results.clone(),
+            missing_user_result: self.missing_user_result,
             watchdog_events: self.watchdog_events.clone(),
             judge_verdict: self.judge_verdict.clone(),
             self_heal_events: self.self_heal_events.clone(),
@@ -256,6 +279,7 @@ pub struct TaskStatusRegistry {
     records: DashMap<String, Mutex<TaskStatusRecord>>,
     log_capacity: usize,
     streams: DashMap<String, Arc<TaskStreamChannel>>,
+    observers: RwLock<Vec<Arc<dyn TaskStreamObserver>>>,
 }
 
 impl TaskStatusRegistry {
@@ -264,7 +288,12 @@ impl TaskStatusRegistry {
             records: DashMap::new(),
             log_capacity: log_capacity.max(1),
             streams: DashMap::new(),
+            observers: RwLock::new(Vec::new()),
         }
+    }
+
+    pub fn add_stream_observer(&self, observer: Arc<dyn TaskStreamObserver>) {
+        self.observers.write().push(observer);
     }
 
     pub fn register(
@@ -568,6 +597,7 @@ impl TaskStatusRegistry {
         if events.is_empty() {
             return;
         }
+        self.notify_observers(task_id, &events);
         let Some(channel) = self.stream_channel(task_id) else {
             return;
         };
@@ -580,6 +610,21 @@ impl TaskStatusRegistry {
         };
         for envelope in envelopes {
             let _ = channel.sender.send(envelope);
+        }
+    }
+
+    fn notify_observers(&self, task_id: &str, events: &[TaskStreamEvent]) {
+        let observers: Vec<Arc<dyn TaskStreamObserver>> = {
+            let guard = self.observers.read();
+            if guard.is_empty() {
+                return;
+            }
+            guard.iter().cloned().collect()
+        };
+        for observer in observers {
+            for event in events {
+                observer.handle(task_id, event);
+            }
         }
     }
 }
@@ -720,6 +765,24 @@ impl TaskStatusHandle {
         }) {
             self.registry.emit_status(&self.task_id.0);
             self.registry.emit_agent_history(&self.task_id.0, entry);
+        }
+    }
+
+    pub fn set_user_results(&self, results: Vec<TaskUserResult>, missing: bool) {
+        if self.with_record(|record| {
+            record.user_results = results;
+            record.missing_user_result = missing;
+            record.touch();
+        }) {
+            self.registry.emit_status(&self.task_id.0);
+        }
+        if missing {
+            self.push_alert(TaskAlert {
+                timestamp: Utc::now(),
+                severity: "warn".to_string(),
+                message: "执行成功但未生成可读答案".to_string(),
+                kind: Some("missing_user_result".to_string()),
+            });
         }
     }
 
@@ -946,6 +1009,10 @@ impl TaskStreamEvent {
 pub struct TaskStreamEnvelope {
     pub id: u64,
     pub event: TaskStreamEvent,
+}
+
+pub trait TaskStreamObserver: Send + Sync {
+    fn handle(&self, task_id: &str, event: &TaskStreamEvent);
 }
 
 struct TaskStreamHistory {

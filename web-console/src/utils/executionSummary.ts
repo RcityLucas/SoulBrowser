@@ -4,6 +4,7 @@ export interface ExecutionResultEntry {
   label: string;
   data?: unknown;
   artifactPath?: string;
+  kind?: string;
 }
 
 export function buildExecutionSummary(
@@ -44,12 +45,22 @@ export function buildExecutionSummary(
     stderr,
     artifactPath,
     steps,
+    missingUserResult: Boolean(flow?.execution?.missing_user_result),
   };
 }
 
 export function extractExecutionResults(execution: any): ExecutionResultEntry[] {
   if (!execution || !Array.isArray(execution.steps)) {
     return [];
+  }
+
+  if (Array.isArray(execution.user_results) && execution.user_results.length) {
+    return execution.user_results.map((result: any) => ({
+      label: result.step_title || result.step_id || '结果',
+      data: result.content ?? undefined,
+      artifactPath: result.artifact_path ?? undefined,
+      kind: result.kind,
+    }));
   }
 
   const entries: ExecutionResultEntry[] = [];

@@ -34,8 +34,6 @@ export function formatRelativeTime(date: Date | string | number): string {
  * Format duration in seconds to human-readable string
  */
 export function formatDuration(seconds: number): string {
-  const d = dayjs.duration(seconds, 'seconds');
-
   if (seconds < 60) {
     return `${Math.round(seconds)}秒`;
   } else if (seconds < 3600) {
@@ -95,7 +93,7 @@ export function debounce<T extends (...args: any[]) => any>(
   func: T,
   wait: number
 ): (...args: Parameters<T>) => void {
-  let timeout: NodeJS.Timeout | null = null;
+  let timeout: ReturnType<typeof setTimeout> | null = null;
 
   return function (...args: Parameters<T>) {
     if (timeout) {

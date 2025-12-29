@@ -61,7 +61,7 @@ export default function PreviewPage() {
       <div className={styles.sidebar}>
         <Card title="操作历史" className={styles.card}>
           <Timeline
-            items={frameHistory.map((f, index) => ({
+            items={frameHistory.map((f) => ({
               children: (
                 <div>
                   <div>{formatTime(f.timestamp)}</div>

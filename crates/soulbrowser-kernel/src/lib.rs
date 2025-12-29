@@ -9,11 +9,13 @@ pub use soulbase_shim::{
 };
 
 pub mod agent;
+pub mod agent_judge;
 pub mod analytics;
 pub mod app_context;
 pub mod app_settings;
 pub mod auth;
 pub mod automation;
+pub mod block_detect;
 pub mod browser_impl;
 pub mod chat_support;
 pub mod config;
@@ -40,6 +42,7 @@ pub mod replay;
 pub mod runtime;
 pub mod self_heal;
 pub mod server;
+pub mod sessions;
 pub mod storage;
 pub mod structured_output;
 pub mod task_status;

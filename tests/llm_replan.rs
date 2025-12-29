@@ -23,6 +23,8 @@ impl MockFlowExecutor {
                     total_wait_ms: 0,
                     total_run_ms: 0,
                 }],
+                user_results: Vec::new(),
+                missing_user_result: false,
             }
         } else {
             FlowExecutionReport {
@@ -38,6 +40,8 @@ impl MockFlowExecutor {
                     total_wait_ms: 0,
                     total_run_ms: 0,
                 }],
+                user_results: Vec::new(),
+                missing_user_result: true,
             }
         }
     }

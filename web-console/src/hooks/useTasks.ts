@@ -22,6 +22,7 @@ export function useTasks() {
     retryTask,
     fetchTaskDetail,
     fetchTaskExecutions,
+    fetchTaskStatus,
   } = useTaskStore();
 
   // Fetch tasks on mount
@@ -43,6 +44,7 @@ export function useTasks() {
     retryTask,
     fetchTaskDetail,
     fetchTaskExecutions,
+    fetchTaskStatus,
     selectTask,
     setFilter,
   };

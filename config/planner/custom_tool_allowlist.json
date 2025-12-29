@@ -1,0 +1,39 @@
+{
+  "names": [
+    "data.extract-site",
+    "page.observe",
+    "data.parse.generic",
+    "data.parse.market_info",
+    "data.parse.news_brief",
+    "data.parse.weather",
+    "data.parse.twitter-feed",
+    "data.parse.facebook-feed",
+    "data.parse.hackernews-feed",
+    "data.parse.linkedin-profile",
+    "data.parse.github-repo",
+    "github.extract-repo",
+    "data.parse.github.extract-repo",
+    "weather.search",
+    "data.deliver.structured",
+    "agent.note",
+    "mock.llm.plan"
+  ],
+  "aliases": [
+    "parse",
+    "data.parse.twitter_feed",
+    "data.parse.twitter.feed",
+    "data.parse.facebook_feed",
+    "data.parse.facebook.feed",
+    "data.parse.hackernews_feed",
+    "data.parse.hackernews.feed",
+    "data.parse.linkedin_profile",
+    "data.parse.linkedin.profile"
+  ],
+  "prefixes": [
+    "plugin.",
+    "data.deliver."
+  ],
+  "suffixes": [
+    "note"
+  ]
+}

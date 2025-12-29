@@ -34,12 +34,32 @@ L0: Runtime & Adapters [In-flight]
 - **Policy center**: `soulbrowser policy show`/`override` exposes current limits and allows runtime overrides (with TTL) that feed into the scheduler/registry.
 - **Legacy assets archived**: historical demos/tests now live under `docs/examples/legacy_examples.md`; the default build focuses on the Serve/API stack.
 
-See `docs/PRODUCT_COMPLETION_PLAN.md` for the consolidated roadmap, `docs/L0_ACTUAL_PROGRESS.md` for runtime status details, and `docs/AI_BROWSER_EXPERIENCE_PLAN.md` for the upcoming AI browser experience work.
+See `docs/PRODUCT_COMPLETION_PLAN.md` for the consolidated roadmap, `docs/L0_ACTUAL_PROGRESS.md` for runtime status details, and `docs/AI_BROWSER_EXPERIENCE_PLAN.md` for the upcoming AI browser experience work. Plan contributors can consult `docs/plans/CUSTOM_TOOL_ALLOWLIST.md` for the supported custom tools and lint instructions before shipping structured runs.
 ```
 
 ## 🚀 Quick Start
 
 > 📖 **New User?** Start with our [快速开始指南](docs/快速开始指南.md) for a 5-minute walkthrough!
+
+### Zero-Config Dev Console
+
+```bash
+# 从根目录直接启动后端 + Web 控制台（自动: host=0.0.0.0、禁用鉴权、注入默认 token）
+./scripts/start_web_console.sh
+
+# 可选：自定义端口或 token
+BACKEND_PORT=8804 FRONTEND_PORT=5173 SERVE_TOKEN=my-dev-token ./scripts/start_web_console.sh
+
+# 后端就绪后，另开终端启动前端
+cd web-console && npm install && npm run dev
+```
+
+脚本会：
+
+- 自动编译（若无现成二进制）、关闭 Prometheus 端口，并以 `--host 0.0.0.0 --disable-auth` 方式启动 Serve，以便 WSL ⇄ Windows 直接访问。
+- 将 `SERVE_TOKEN` 注入后端的 `SOUL_SERVE_TOKEN`，并将 `VITE_SERVE_TOKEN/VITE_BACKEND_URL` 输出在当前 shell 环境，方便前端沿用。
+- 在 WSL 中提醒如何附加 Windows Chrome（或复用现有 DevTools WebSocket）。
+- 等待 `/health` 就绪后保持后端后台运行，显示“下一步”提示，前端由开发者在另一个终端执行 `npm run dev`。
 
 ```bash
 # Clone the repository

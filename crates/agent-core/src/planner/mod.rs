@@ -1,8 +1,12 @@
 mod rule_based;
+mod stage_graph;
+mod stages;
 
 use crate::{errors::AgentError, model::AgentRequest, plan::AgentPlan};
 
 pub use rule_based::RuleBasedPlanner;
+pub use stage_graph::{IntentStagePlan, PlanStageGraph, StageStrategyChain};
+pub use stages::{classify_step, plan_contains_stage, stage_index, PlanStageKind};
 
 /// Planner configuration controlling heuristic behaviour.
 #[derive(Debug, Clone)]
@@ -11,6 +15,8 @@ pub struct PlannerConfig {
     pub max_steps: usize,
     /// Whether to automatically prepend navigation when URL detected.
     pub auto_navigate: bool,
+    /// Whether to enforce strict plan validation without auto-repair.
+    pub strict_plan_validation: bool,
 }
 
 impl Default for PlannerConfig {
@@ -18,6 +24,7 @@ impl Default for PlannerConfig {
         Self {
             max_steps: 12,
             auto_navigate: true,
+            strict_plan_validation: false,
         }
     }
 }

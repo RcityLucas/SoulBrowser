@@ -61,8 +61,31 @@ impl AgentContext {
     }
 }
 
+/// Classification assigned to the user's intent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentIntentKind {
+    Operational,
+    Informational,
+}
+
+impl Default for AgentIntentKind {
+    fn default() -> Self {
+        AgentIntentKind::Operational
+    }
+}
+
+impl AgentIntentKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentIntentKind::Operational => "operational",
+            AgentIntentKind::Informational => "informational",
+        }
+    }
+}
+
 /// High-level intent metadata inferred from prompts or templates.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentIntentMetadata {
     pub intent_id: Option<String>,
     pub primary_goal: Option<String>,
@@ -73,6 +96,22 @@ pub struct AgentIntentMetadata {
     pub preferred_language: Option<String>,
     #[serde(default)]
     pub blocker_remediations: Vec<(String, String)>,
+    #[serde(default)]
+    pub intent_kind: AgentIntentKind,
+}
+
+impl Default for AgentIntentMetadata {
+    fn default() -> Self {
+        Self {
+            intent_id: None,
+            primary_goal: None,
+            target_sites: Vec::new(),
+            required_outputs: Vec::new(),
+            preferred_language: None,
+            blocker_remediations: Vec::new(),
+            intent_kind: AgentIntentKind::Operational,
+        }
+    }
 }
 
 /// Structured output requested by the caller.

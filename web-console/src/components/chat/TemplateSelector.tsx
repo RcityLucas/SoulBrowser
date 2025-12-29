@@ -72,9 +72,7 @@ export default function TemplateSelector({ onSelect }: Props) {
               <div className={styles.templateDescription}>{template.description}</div>
               <div className={styles.templateTags}>
                 {template.tags.map((tag) => (
-                  <Tag key={tag} size="small">
-                    {tag}
-                  </Tag>
+                  <Tag key={tag}>{tag}</Tag>
                 ))}
               </div>
             </div>

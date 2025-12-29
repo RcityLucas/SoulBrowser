@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiConfig {
@@ -84,6 +85,11 @@ impl OpenAiLlmProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<response unavailable>".to_string());
+            if status.as_u16() == 429 {
+                let friendly = openai_rate_limit_message(&text);
+                warn!(target: "openai", message = %friendly, raw = %text, "OpenAI rate limited plan request");
+                return Err(AgentError::invalid_request(friendly));
+            }
             return Err(AgentError::invalid_request(format!(
                 "openai returned {}: {}",
                 status, text
@@ -194,4 +200,30 @@ impl ChatCompletionContent {
 struct ChatCompletionPart {
     #[serde(default)]
     text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiErrorMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorMessage {
+    message: Option<String>,
+    #[serde(default)]
+    _code: Option<String>,
+    #[serde(default)]
+    _type: Option<String>,
+}
+
+fn openai_rate_limit_message(raw: &str) -> String {
+    if let Ok(envelope) = serde_json::from_str::<OpenAiErrorEnvelope>(raw) {
+        if let Some(message) = envelope.error.message {
+            return format!(
+                "OpenAI rate limit exceeded: {}. Please retry later or configure a higher tier.",
+                message.trim()
+            );
+        }
+    }
+    "OpenAI rate limit exceeded; please retry later or reduce usage.".to_string()
 }

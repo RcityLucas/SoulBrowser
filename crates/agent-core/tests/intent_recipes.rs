@@ -1,6 +1,6 @@
 use agent_core::{
-    AgentIntentMetadata, AgentPlanner, AgentRequest, AgentToolKind, RequestedOutput,
-    RuleBasedPlanner,
+    AgentIntentKind, AgentIntentMetadata, AgentPlanner, AgentRequest, AgentToolKind, PlanValidator,
+    RequestedOutput, RuleBasedPlanner,
 };
 use soulbrowser_core_types::TaskId;
 
@@ -14,6 +14,7 @@ fn search_market_info_intent_uses_recipe() {
         required_outputs: vec![RequestedOutput::new("market_info_v1.json")],
         preferred_language: Some("zh-CN".to_string()),
         blocker_remediations: Default::default(),
+        intent_kind: AgentIntentKind::Operational,
     };
 
     let planner = RuleBasedPlanner::default();
@@ -58,6 +59,7 @@ fn summarize_news_intent_uses_recipe() {
         required_outputs: vec![RequestedOutput::new("news_brief_v1.json")],
         preferred_language: Some("zh-CN".to_string()),
         blocker_remediations: Default::default(),
+        intent_kind: AgentIntentKind::Operational,
     };
 
     let planner = RuleBasedPlanner::default();
@@ -87,4 +89,50 @@ fn summarize_news_intent_uses_recipe() {
             Some("news_brief_v1.json")
         );
     }
+}
+
+#[test]
+fn fetch_weather_intent_uses_recipe() {
+    let mut request = AgentRequest::new(TaskId::new(), "查询深圳天气");
+    request.intent = AgentIntentMetadata {
+        intent_id: Some("fetch_weather".to_string()),
+        primary_goal: Some("查询深圳天气".to_string()),
+        target_sites: vec!["https://www.baidu.com".to_string()],
+        required_outputs: vec![RequestedOutput::new("weather_report_v1.json")],
+        preferred_language: Some("zh-CN".to_string()),
+        blocker_remediations: Default::default(),
+        intent_kind: AgentIntentKind::Informational,
+    };
+
+    let planner = RuleBasedPlanner::default();
+    let outcome = planner.draft_plan(&request).expect("weather plan");
+    let plan = outcome.plan;
+
+    assert_eq!(plan.steps.len(), 6, "weather template should emit 6 steps");
+    assert!(matches!(
+        plan.steps[0].tool.kind,
+        AgentToolKind::Navigate { .. }
+    ));
+    assert!(matches!(
+        plan.steps[1].tool.kind,
+        AgentToolKind::TypeText { .. }
+    ));
+    assert!(plan.steps.iter().any(|step| match &step.tool.kind {
+        AgentToolKind::Custom { name, .. } => name == "data.parse.weather",
+        _ => false,
+    }));
+    assert!(plan.steps.iter().any(|step| match &step.tool.kind {
+        AgentToolKind::Custom { name, payload } if name == "data.deliver.structured" => {
+            payload
+                .get("schema")
+                .and_then(|value| value.as_str())
+                .map(|schema| schema.eq_ignore_ascii_case("weather_report_v1"))
+                .unwrap_or(false)
+        }
+        _ => false,
+    }));
+
+    PlanValidator::strict()
+        .validate(&plan, &request)
+        .expect("weather plan passes validation");
 }

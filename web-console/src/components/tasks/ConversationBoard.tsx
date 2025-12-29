@@ -26,6 +26,21 @@ const renderOverlayLabel = (overlay: Record<string, any>, fallback: string) => {
   return fallback;
 };
 
+const overlayLevelColor = (level?: string) => {
+  switch ((level || '').toLowerCase()) {
+    case 'error':
+      return 'red';
+    case 'warn':
+      return 'orange';
+    case 'info':
+      return 'geekblue';
+    default:
+      return 'purple';
+  }
+};
+
+const isString = (value: unknown): value is string => typeof value === 'string';
+
 export default function ConversationBoard({
   planOverlays,
   executionOverlays,
@@ -76,41 +91,65 @@ export default function ConversationBoard({
           <List
             size="small"
             dataSource={latestOverlays}
-            renderItem={(item, index) => (
-              <List.Item key={`${item.task_id}-${index}`}>
-                <Space direction="vertical" size={2}>
-                  <Space size="small">
-                    <Tag color={item.source === 'execution' ? 'volcano' : 'geekblue'}>
-                      {item.source === 'execution' ? '执行' : '计划'}
-                    </Tag>
-                    <Typography.Text>
-                      {renderOverlayLabel(item.data, 'overlay')} ·
-                      {item.data?.step_id || 'step'}
-                    </Typography.Text>
-                  </Space>
-                  <Typography.Text type="secondary" className={styles.locatorText}>
-                    {formatTime(item.recorded_at)}
-                  </Typography.Text>
-                  {item.data?.bbox !== undefined && (
+            renderItem={(item, index) => {
+              const overlayData = (item.data ?? {}) as Record<string, unknown>;
+              const overlayKind = isString(overlayData.kind) ? overlayData.kind : undefined;
+              const overlayLevel = isString(overlayData.level) ? overlayData.level : undefined;
+              const overlayDetail = isString(overlayData.detail) ? overlayData.detail : undefined;
+              const overlayBase64 = isString(overlayData.data_base64)
+                ? overlayData.data_base64
+                : undefined;
+              const overlayScreenshot = isString(overlayData.screenshot_path)
+                ? overlayData.screenshot_path
+                : undefined;
+              const overlayContentType = isString(overlayData.content_type)
+                ? overlayData.content_type
+                : 'image/png';
+
+              return (
+                <List.Item key={`${item.task_id}-${index}`}>
+                  <Space direction="vertical" size={2}>
+                    <Space size="small" wrap>
+                      <Tag color={item.source === 'execution' ? 'volcano' : 'geekblue'}>
+                        {item.source === 'execution' ? '执行' : '计划'}
+                      </Tag>
+                      {overlayKind && (
+                        <Tag color={overlayLevelColor(overlayLevel)}>{overlayKind}</Tag>
+                      )}
+                      <Typography.Text>
+                        {renderOverlayLabel(overlayData as Record<string, any>, 'overlay')} ·
+                        {overlayData.step_id || 'step'}
+                      </Typography.Text>
+                    </Space>
                     <Typography.Text type="secondary" className={styles.locatorText}>
-                      bbox: {JSON.stringify(item.data.bbox)}
+                      {formatTime(item.recorded_at)}
                     </Typography.Text>
-                  )}
-                  {item.data?.data_base64 || item.data?.screenshot_path ? (
-                    <img
-                      className={styles.overlayThumbnail}
-                      src={
-                        item.data?.data_base64
-                          ? `data:${item.data?.content_type ?? 'image/png'};base64,${item.data.data_base64}`
-                          : (item.data?.screenshot_path as string)
-                      }
-                      alt={renderOverlayLabel(item.data, 'overlay')}
-                      onClick={() => onPreviewOverlay?.(item)}
-                    />
-                  ) : null}
-                </Space>
-              </List.Item>
-            )}
+                    {overlayDetail && (
+                      <Typography.Text type="secondary" className={styles.locatorText}>
+                        {overlayDetail}
+                      </Typography.Text>
+                    )}
+                    {overlayData.bbox !== undefined && (
+                      <Typography.Text type="secondary" className={styles.locatorText}>
+                        bbox: {JSON.stringify(overlayData.bbox)}
+                      </Typography.Text>
+                    )}
+                    {overlayBase64 || overlayScreenshot ? (
+                      <img
+                        className={styles.overlayThumbnail}
+                        src={
+                          overlayBase64
+                            ? `data:${overlayContentType};base64,${overlayBase64}`
+                            : overlayScreenshot!
+                        }
+                        alt={renderOverlayLabel(overlayData as Record<string, any>, 'overlay')}
+                        onClick={() => onPreviewOverlay?.(item)}
+                      />
+                    ) : null}
+                  </Space>
+                </List.Item>
+              );
+            }}
           />
         ) : (
           <Empty description="暂无实时覆盖" />
@@ -121,35 +160,51 @@ export default function ConversationBoard({
         </Typography.Title>
         {latestEvidence.length ? (
           <div className={styles.overlayPreviewGrid}>
-            {latestEvidence.map((item, index) => (
-              <div className={styles.overlayPreviewCard} key={`${item?.step_id ?? 'shot'}-${index}`}>
-                <Typography.Text className={styles.evidenceLabel}>
-                  {item?.label || item?.dispatch_label || '截图'}
-                </Typography.Text>
-                {(item?.observation_type || item?.content_type) && (
-                  <Tag color="blue" style={{ marginBottom: 4 }}>
-                    {item?.observation_type || item?.content_type}
-                  </Tag>
-                )}
-                <Typography.Text type="secondary" className={styles.locatorText}>
-                  {formatTime(item?.recorded_at)}
-                </Typography.Text>
-                {item.data_base64 || item.screenshot_path ? (
-                  <img
-                    src={
-                      item.data_base64
-                        ? `data:${item.content_type};base64,${item.data_base64}`
-                        : item.screenshot_path
-                    }
-                    alt={item?.label || `capture-${index}`}
-                    className={styles.previewableImage}
-                    onClick={() => onPreviewEvidence?.(item)}
-                  />
-                ) : (
-                  <Typography.Text type="secondary">暂无内嵌图像</Typography.Text>
-                )}
-              </div>
-            ))}
+            {latestEvidence.map((item, index) => {
+              const evidenceLabel = isString(item?.label)
+                ? item.label
+                : isString(item?.dispatch_label)
+                ? item.dispatch_label
+                : '截图';
+              const observationTag = isString(item?.observation_type)
+                ? item.observation_type
+                : isString(item?.content_type)
+                ? item.content_type
+                : undefined;
+              const evidenceBase64 = isString(item.data_base64) ? item.data_base64 : undefined;
+              const evidencePath = isString(item.screenshot_path) ? item.screenshot_path : undefined;
+              const evidenceContentType = isString(item.content_type)
+                ? item.content_type
+                : 'image/png';
+
+              return (
+                <div className={styles.overlayPreviewCard} key={`${item?.step_id ?? 'shot'}-${index}`}>
+                  <Typography.Text className={styles.evidenceLabel}>{evidenceLabel}</Typography.Text>
+                  {observationTag && (
+                    <Tag color="blue" style={{ marginBottom: 4 }}>
+                      {observationTag}
+                    </Tag>
+                  )}
+                  <Typography.Text type="secondary" className={styles.locatorText}>
+                    {formatTime(item?.recorded_at)}
+                  </Typography.Text>
+                  {evidenceBase64 || evidencePath ? (
+                    <img
+                      src={
+                        evidenceBase64
+                          ? `data:${evidenceContentType};base64,${evidenceBase64}`
+                          : evidencePath!
+                      }
+                      alt={evidenceLabel || `capture-${index}`}
+                      className={styles.previewableImage}
+                      onClick={() => onPreviewEvidence?.(item)}
+                    />
+                  ) : (
+                    <Typography.Text type="secondary">暂无内嵌图像</Typography.Text>
+                  )}
+                </div>
+              );
+            })}
           </div>
         ) : (
           <Empty description="暂无截图" />

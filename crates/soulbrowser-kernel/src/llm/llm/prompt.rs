@@ -1,7 +1,19 @@
-use agent_core::{AgentPlan, AgentRequest};
+use agent_core::{AgentIntentKind, AgentPlan, AgentRequest};
 use serde_json::Value;
 
 const CAPABILITY_OVERVIEW: &str = "- Browser automation core: navigate, click, type_text (with submit), select, scroll, wait (visible/hidden/network idle).\n- Observation -> Parse -> Deliver pipeline is enforced automatically; structured outputs always flow through `data.extract-site` -> `data.parse.*` -> `data.deliver.structured`.\n- Deterministic parsers available: generic observation, market info, news brief, GitHub repositories, Twitter feed, Facebook feed, LinkedIn profile, Hacker News feed.\n- GitHub repo parsing can auto-fill the username based on recent navigation/current URL if planner forgets.\n- Planner may insert `agent.note` for inline reporting when needed.\n- The executor automatically normalizes tool aliases (e.g., browser.*) and enforces sensible waits/timeouts.\n";
+
+const STRUCTURED_SCHEMA_GUIDE: &str = "- data.parse.generic -> schema=generic_observation_v1 (default when summarizing DOM observations).\n- data.parse.market_info -> schema=market_info_v1.\n- data.parse.news_brief -> schema=news_brief_v1.\n- data.parse.weather -> schema=weather_report_v1.\n- data.parse.github-repo / github.extract-repo -> schema=github_repos_v1.\n- data.parse.twitter-feed -> schema=twitter_feed_v1.\n- data.parse.facebook-feed -> schema=facebook_feed_v1.\n- data.parse.linkedin-profile -> schema=linkedin_profile_v1.\n- data.parse.hackernews-feed -> schema=hackernews_feed_v1.\n";
+
+const DELIVER_PAYLOAD_TEMPLATE: &str = r#"{
+  \"tool\": \"data.deliver.structured\",
+  \"payload\": {
+    \"schema\": \"generic_observation_v1\",
+    \"artifact_label\": \"structured.generic_observation_v1\",
+    \"filename\": \"generic_observation_v1.json\",
+    \"source_step_id\": \"llm-step-5\"
+  }
+}"#;
 
 pub struct PromptBuilder;
 
@@ -45,6 +57,16 @@ impl PromptBuilder {
                 request.intent.target_sites.join(" -> ")
             ));
         }
+        sections.push(format!(
+            "Intent type: {}",
+            request.intent.intent_kind.as_str()
+        ));
+        if matches!(request.intent.intent_kind, AgentIntentKind::Informational) {
+            sections.push(
+                "Informational intents must follow navigate -> (interact)* -> data.extract-site -> data.parse.* or agent.note -> data.deliver.*"
+                    .to_string(),
+            );
+        }
         if !request.intent.required_outputs.is_empty() {
             let outputs = request
                 .intent
@@ -64,6 +86,14 @@ impl PromptBuilder {
                 .join("\n");
             sections.push(format!("Required structured outputs:\n{}", outputs));
         }
+        sections.push(format!(
+            "Structured schema map (choose exact IDs, do not invent new schemas):\n{}",
+            STRUCTURED_SCHEMA_GUIDE
+        ));
+        sections.push(format!(
+            "data.deliver.structured payload template (missing schema/artifact_label/filename/source_step_id => plan rejected automatically):\n{}",
+            DELIVER_PAYLOAD_TEMPLATE
+        ));
         if let Some(language) = request.intent.preferred_language.as_ref() {
             sections.push(format!("Preferred language: {language}"));
         }
@@ -132,7 +162,7 @@ impl PromptBuilder {
         }
 
         format!(
-            "{header}\n\nProduce JSON following this schema: {schema}\nRules:\n1. Always emit valid JSON without markdown.\n2. Use css selectors prefixed with 'css=' when possible.\n3. Supported actions: navigate, click, type_text, select, scroll, wait.\n4. Use wait='idle' for network idle waits.\n5. Provide rationale and risks arrays even if empty.\n6. When structured outputs are requested, include explicit navigate -> observe -> act -> parse -> deliver steps covering data acquisition, parsing, and persistence.\n7. Parsing steps must cite deterministic parsers and final steps must mention the structured schema/screenshot that will be produced.\n8. Custom tool allowlist (anything else will be rejected): data.extract-site (observation), data.parse.market_info, data.parse.news_brief, data.parse.twitter-feed, data.parse.facebook-feed, data.parse.linkedin-profile, data.parse.hackernews-feed, data.parse.github-repo (or github.extract-repo alias), data.deliver.structured, and agent.note.\n9. `data.parse.github-repo` steps must include `payload.username` (GitHub handle without the leading `@`) derived from the navigation target or user request.\n10. To observe a page, rely on the automatically inserted data.extract-site step; do not schedule extra ad-hoc \"observe\" actions.\n",
+            "{header}\n\nProduce JSON following this schema: {schema}\nRules:\n1. Always emit valid JSON without markdown.\n2. Use css selectors prefixed with 'css=' when possible.\n3. Supported actions: navigate, click, type_text, select, scroll, wait.\n4. Use wait='idle' for network idle waits.\n5. Provide rationale and risks arrays even if empty.\n6. When structured outputs are requested, include explicit navigate -> observe -> act -> parse -> deliver steps covering data acquisition, parsing, and persistence.\n7. Parsing steps must cite deterministic parsers and final steps must mention the structured schema/screenshot that will be produced.\n8. Custom tool allowlist (anything else will be rejected): data.extract-site (observation), data.parse.market_info, data.parse.news_brief, data.parse.twitter-feed, data.parse.facebook-feed, data.parse.linkedin-profile, data.parse.hackernews-feed, data.parse.github-repo (or github.extract-repo alias), data.deliver.structured, and agent.note.\n9. `data.parse.github-repo` steps must include `payload.username` (GitHub handle without the leading `@`) derived from the navigation target or user request.\n10. To observe a page, rely on the automatically inserted data.extract-site step; do not schedule extra ad-hoc \"observe\" actions.\n11. When emitting `data.deliver.structured`, its payload must include `schema`, `artifact_label`, `filename`, and `source_step_id` pointing to the parse step that produced the data; missing any of these fields causes automatic plan rejection.\n12. Deliver `payload.schema` must come from the canonical map (generic_observation_v1, market_info_v1, news_brief_v1, github_repos_v1, twitter_feed_v1, facebook_feed_v1, linkedin_profile_v1, hackernews_feed_v1) aligned with the preceding parser.\n13. When submitting a Baidu search, target the actual submit button (`css=#su`, `text=百度一下`, or equivalent) rather than container selectors like `.s_search`.",
             header = sections.join("\n"),
             schema = JSON_SCHEMA
         )

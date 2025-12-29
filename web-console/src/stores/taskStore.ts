@@ -5,12 +5,13 @@
 import { message } from 'antd';
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
-import type { Task, TaskUpdate, TaskFilter, TaskStatus } from '@/types';
+import type { Task, TaskUpdate, TaskFilter } from '@/types';
 import { apiClient } from '@/api/client';
 import {
   soulbrowserAPI,
   type TaskSummary,
   type TaskDetailResponse,
+  type TaskStatusSnapshot,
 } from '@/api/soulbrowser';
 
 interface TaskState {
@@ -38,6 +39,7 @@ interface TaskState {
   retryTask: (taskId: string) => Promise<void>;
   fetchTaskDetail: (taskId: string) => Promise<TaskDetailResponse>;
   fetchTaskExecutions: (taskId: string) => Promise<any[]>;
+  fetchTaskStatus: (taskId: string) => Promise<TaskStatusSnapshot>;
 }
 
 export const useTaskStore = create<TaskState>()(
@@ -140,6 +142,10 @@ export const useTaskStore = create<TaskState>()(
     fetchTaskExecutions: async (taskId) => {
       return await soulbrowserAPI.getTaskExecutions(taskId);
     },
+
+    fetchTaskStatus: async (taskId) => {
+      return await soulbrowserAPI.getTaskStatus(taskId);
+    },
   }))
 );
 
@@ -176,6 +182,7 @@ function mapSummaryToTask(summary: TaskSummary): Task {
       llm_provider: summary.llm_provider,
       llm_model: summary.llm_model,
       artifact_path: summary.path,
+      session_id: summary.session_id,
     },
   };
 }

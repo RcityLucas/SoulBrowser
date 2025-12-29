@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use soulbrowser_core_types::ExecRoute;
 
 pub fn build_plan_overlays(plan: &AgentPlan) -> Value {
-    let overlays: Vec<Value> = plan
+    let mut overlays: Vec<Value> = plan
         .steps
         .iter()
         .filter_map(|step| {
@@ -29,6 +29,10 @@ pub fn build_plan_overlays(plan: &AgentPlan) -> Value {
             })
         })
         .collect();
+
+    if !plan.meta.overlays.is_empty() {
+        overlays.extend(plan.meta.overlays.iter().cloned());
+    }
 
     Value::Array(overlays)
 }

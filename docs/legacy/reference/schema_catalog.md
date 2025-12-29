@@ -6,6 +6,7 @@
 | --- | --- | --- | --- | --- | --- |
 | `market_info_v1` | `data.parse.market_info` | `src/parsers/market_info.rs` (`parse_market_info`) | [`schemas/market_info_v1.json`](schemas/market_info_v1.json) | `data.deliver.structured` (`schema=market_info_v1`) | Structured Outputs |
 | `news_brief_v1` | `data.parse.news_brief` | `src/parsers/news_brief.rs` (`parse_news_brief`) | [`schemas/news_brief_v1.json`](schemas/news_brief_v1.json) | `data.deliver.structured` (`schema=news_brief_v1`) | Structured Outputs |
+| `weather_report_v1` | `data.parse.weather` | `src/parsers/weather.rs` (`parse_weather`) | [`schemas/weather_report_v1.json`](schemas/weather_report_v1.json) | `data.deliver.structured` (`schema=weather_report_v1`) | Structured Outputs |
 | `github_repos_v1` | `data.parse.github-repo` / `github.extract-repo` | `src/agent/executor.rs::handle_parse_github_repos` | [`schemas/github_repos_v1.json`](schemas/github_repos_v1.json) | `data.deliver.structured` (`schema=github_repos_v1`) | Integrations |
 | `twitter_feed_v1` | `data.parse.twitter-feed` | `src/parsers/twitter_feed.rs` (`parse_twitter_feed`) | [`schemas/twitter_feed_v1.json`](schemas/twitter_feed_v1.json) | `data.deliver.structured` (`schema=twitter_feed_v1`) | Integrations |
 | `facebook_feed_v1` | `data.parse.facebook-feed` | `src/parsers/facebook_feed.rs` (`parse_facebook_feed`) | [`schemas/facebook_feed_v1.json`](schemas/facebook_feed_v1.json) | `data.deliver.structured` (`schema=facebook_feed_v1`) | Integrations |

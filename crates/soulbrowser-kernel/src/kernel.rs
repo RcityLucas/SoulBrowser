@@ -76,22 +76,35 @@ impl Kernel {
         };
         let router = Self::compose_router(shell_router, api_router, auth_policy);
 
-        self.start_http(router, runtime.websocket_url.clone(), options.port)
-            .await
+        self.start_http(
+            router,
+            runtime.websocket_url.clone(),
+            options.host,
+            options.port,
+        )
+        .await
     }
 
     async fn start_http(
         &self,
         router: Router,
         websocket_url: Option<String>,
+        host: IpAddr,
         port: u16,
     ) -> Result<()> {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let addr = SocketAddr::new(host, port);
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("failed to bind testing server on {}", addr))?;
-        info!("Testing console available at http://127.0.0.1:{}", port);
-        info!("Access from Windows: http://localhost:{}", port);
+        info!("Testing console available at http://{}:{}", addr.ip(), port);
+        if host.is_loopback() {
+            info!("Access from Windows: http://localhost:{}", port);
+        } else if host.is_unspecified() {
+            info!(
+                "Listening on all interfaces; try http://127.0.0.1:{} locally",
+                port
+            );
+        }
         if let Some(ws) = websocket_url.as_deref() {
             info!("Using external DevTools endpoint: {}", ws);
         } else {
@@ -158,8 +171,9 @@ impl Kernel {
 }
 
 /// Options accepted by the kernel Serve entrypoint.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ServeOptions {
+    pub host: IpAddr,
     pub port: u16,
     pub websocket_url: Option<String>,
     pub tenant: String,
@@ -169,6 +183,23 @@ pub struct ServeOptions {
     pub allow_ips: Vec<String>,
     pub disable_auth: bool,
     pub surface: ServeSurfacePreset,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            host: IpAddr::from([127, 0, 0, 1]),
+            port: 0,
+            websocket_url: None,
+            tenant: String::new(),
+            llm_cache_dir: None,
+            shared_session_override: None,
+            auth_tokens: Vec::new(),
+            allow_ips: Vec::new(),
+            disable_auth: false,
+            surface: ServeSurfacePreset::Console,
+        }
+    }
 }
 
 fn build_serve_auth_policy(options: &ServeOptions) -> Result<Option<Arc<GatewayPolicy>>> {

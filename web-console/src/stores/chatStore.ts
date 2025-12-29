@@ -22,6 +22,7 @@ export interface ExecutionSummary {
   stderr?: string;
   artifactPath?: string;
   steps: ExecutionSummaryStep[];
+  missingUserResult?: boolean;
 }
 
 export interface ChatMessage {

@@ -10,6 +10,7 @@ use tokio::sync::{RwLock, Semaphore};
 use crate::app_context::{create_context, AppContext};
 use crate::llm::LlmCachePool;
 use crate::perception_service::PerceptionService;
+use crate::sessions::SessionService;
 use crate::task_status::TaskStatusRegistry;
 use crate::Config;
 
@@ -82,6 +83,10 @@ impl ServeState {
 
     pub async fn task_status_registry(&self) -> Arc<TaskStatusRegistry> {
         self.app_context().await.task_status_registry()
+    }
+
+    pub async fn session_service(&self) -> Arc<SessionService> {
+        self.app_context().await.session_service()
     }
 
     pub async fn refresh_app_context(&self) -> Result<()> {

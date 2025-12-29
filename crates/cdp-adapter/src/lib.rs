@@ -67,6 +67,10 @@ pub mod error {
         CdpIo,
         #[error("policy denied")]
         PolicyDenied,
+        #[error("target element not found")]
+        TargetNotFound,
+        #[error("option not found")]
+        OptionNotFound,
         #[error("internal error")]
         Internal,
     }
@@ -334,6 +338,51 @@ fn windows_search_roots() -> Vec<PathBuf> {
     roots
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdapterMode {
+    Real,
+    Stub,
+}
+
+impl AdapterMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AdapterMode::Real => "real",
+            AdapterMode::Stub => "stub",
+        }
+    }
+
+    pub fn is_stub(&self) -> bool {
+        matches!(self, AdapterMode::Stub)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChromeMode {
+    Auto,
+    ForceReal,
+    ForceStub,
+}
+
+fn chrome_mode() -> ChromeMode {
+    match env::var("SOULBROWSER_USE_REAL_CHROME")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "yes" | "on" => ChromeMode::ForceReal,
+        "0" | "false" | "no" | "off" => ChromeMode::ForceStub,
+        _ => ChromeMode::Auto,
+    }
+}
+
+fn resolve_chrome_path(cfg: &CdpConfig) -> Option<PathBuf> {
+    if !cfg.executable.as_os_str().is_empty() && cfg.executable.exists() {
+        return Some(cfg.executable.clone());
+    }
+    detect_chrome_executable()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{chrome_executable_names, detect_chrome_executable};
@@ -408,6 +457,7 @@ pub mod adapter {
     use super::transport::{
         CdpTransport, ChromiumTransport, CommandTarget, NoopTransport, TransportEvent,
     };
+    use super::{chrome_mode, resolve_chrome_path, AdapterMode, ChromeMode};
     use async_trait::async_trait;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
@@ -421,7 +471,6 @@ pub mod adapter {
     use serde_json::{json, Number, Value};
     use soulbrowser_core_types::ExecRoute;
     use std::collections::HashSet;
-    use std::env;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::broadcast;
@@ -610,6 +659,7 @@ pub mod adapter {
         pub cfg: CdpConfig,
         pub bus: EventBus,
         pub registry: Arc<Registry>,
+        mode: AdapterMode,
         shutdown: CancellationToken,
         tasks: Mutex<Vec<JoinHandle<()>>>,
         transport: Arc<dyn CdpTransport>,
@@ -632,27 +682,50 @@ pub mod adapter {
 
     impl CdpAdapter {
         pub fn new(mut cfg: CdpConfig, bus: EventBus) -> Self {
-            if should_use_real_chrome() {
-                let detected = if cfg.executable.as_os_str().is_empty() {
-                    super::detect_chrome_executable()
-                } else if cfg.executable.exists() {
-                    Some(cfg.executable.clone())
-                } else {
-                    super::detect_chrome_executable()
-                };
-
-                cfg.executable = detected.unwrap_or_else(|| {
-                    panic!(
-                        "Chrome/Chromium executable not found. Install Google Chrome or set SOULBROWSER_CHROME to a valid path."
-                    )
-                });
+            let mode = chrome_mode();
+            let detected = resolve_chrome_path(&cfg);
+            let wants_stub = matches!(mode, ChromeMode::ForceStub);
+            let mut use_real = cfg.websocket_url.is_some() || matches!(mode, ChromeMode::ForceReal);
+            let mut stub_reason: Option<&'static str> = wants_stub.then_some("forced_stub_mode");
+            if !use_real && !wants_stub {
+                use_real = detected.is_some();
             }
 
-            let transport: Arc<dyn CdpTransport> = if should_use_real_chrome() {
+            if use_real && cfg.websocket_url.is_none() {
+                if let Some(path) = detected.clone() {
+                    cfg.executable = path;
+                } else {
+                    if matches!(mode, ChromeMode::ForceReal) {
+                        panic!(
+                            "Chrome/Chromium executable not found while SOULBROWSER_USE_REAL_CHROME=1"
+                        );
+                    }
+                    warn!(
+                        target: "cdp-adapter",
+                        "Chrome executable not found; falling back to stub transport"
+                    );
+                    use_real = false;
+                    stub_reason = Some("chrome_not_found");
+                }
+            }
+
+            let transport: Arc<dyn CdpTransport> = if use_real {
                 info!(target: "cdp-adapter", "using real Chromium transport");
                 Arc::new(ChromiumTransport::new(cfg.clone()))
             } else {
-                info!(target: "cdp-adapter", "using Noop transport (set SOULBROWSER_USE_REAL_CHROME=1 to enable real browser)");
+                info!(
+                    target: "cdp-adapter",
+                    "using Noop transport (set SOULBROWSER_USE_REAL_CHROME=1 to force real browser)"
+                );
+                let reason = stub_reason.unwrap_or("unknown");
+                warn!(
+                    target: "cdp-adapter",
+                    event = "cdp_adapter.stub_mode",
+                    mode = %AdapterMode::Stub.as_str(),
+                    reason,
+                    remediation = "Install Chrome/Chromium and set SOULBROWSER_USE_REAL_CHROME=1 with SOULBROWSER_CHROME=/path/to/chrome or pass --chrome-path/--ws-url",
+                    "CDP adapter initialized without a real browser; DOM automation will be disabled"
+                );
                 Arc::new(NoopTransport::default())
             };
             Self::with_transport(cfg, bus, transport)
@@ -665,11 +738,13 @@ pub mod adapter {
         ) -> Self {
             let (network_tap, _) = NetworkTapLight::with_config(NetworkTapConfig::default(), 512);
             let network_tap = Arc::new(network_tap);
+            let mode = transport.adapter_mode();
             Self {
                 browser_id: BrowserId::new(),
                 cfg,
                 bus,
                 registry: Arc::new(Registry::new()),
+                mode,
                 shutdown: CancellationToken::new(),
                 tasks: Mutex::new(Vec::new()),
                 transport,
@@ -685,6 +760,10 @@ pub mod adapter {
             }
         }
 
+        pub fn mode(&self) -> AdapterMode {
+            self.mode
+        }
+
         pub fn registry(&self) -> Arc<Registry> {
             Arc::clone(&self.registry)
         }
@@ -698,8 +777,29 @@ pub mod adapter {
             route: &ExecRoute,
         ) -> Result<ResolvedExecutionContext, AdapterError> {
             let page = self.resolve_page_for_route(route).await?;
-            let frame_selector = Some(route.frame.0.clone());
+            let frame_selector = Self::frame_selector_from_route(route);
             Ok(ResolvedExecutionContext::with_frame(page, frame_selector))
+        }
+
+        /// Extract a CSS frame selector from an execution route when available.
+        ///
+        /// Today ExecRoute::frame is primarily a logical identifier used by the
+        /// scheduler. Only values prefixed with `css=` are treated as real
+        /// selectors; everything else falls back to the document scope to avoid
+        /// generating invalid DOM queries (which previously caused timeouts for
+        /// every DOM action).
+        fn frame_selector_from_route(route: &ExecRoute) -> Option<String> {
+            let raw = route.frame.0.trim();
+            if raw.is_empty() {
+                return None;
+            }
+
+            let selector = raw.strip_prefix("css=")?.trim();
+            if selector.is_empty() {
+                None
+            } else {
+                Some(selector.to_string())
+            }
         }
 
         async fn resolve_page_for_route(&self, route: &ExecRoute) -> Result<PageId, AdapterError> {
@@ -1015,6 +1115,9 @@ pub mod adapter {
             self.sessions.clear();
             self.frames.clear();
             self.page_activity.clear();
+            self.route_pages.clear();
+            self.page_routes.clear();
+            self.pending_routes.clear();
 
             let message = if had_pages {
                 "cdp transport restarted; active pages were reset"
@@ -1532,16 +1635,6 @@ pub mod adapter {
         }
     }
 
-    fn should_use_real_chrome() -> bool {
-        matches!(
-            env::var("SOULBROWSER_USE_REAL_CHROME")
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    }
-
     #[derive(Debug, Deserialize)]
     struct TargetCreatedParams {
         #[serde(rename = "targetInfo")]
@@ -1742,33 +1835,43 @@ pub mod adapter {
             &self,
             page: PageId,
             selector: &str,
-            _deadline: std::time::Duration,
+            deadline: std::time::Duration,
         ) -> Result<(), AdapterError> {
             let ctx = ResolvedExecutionContext::for_page(page);
-            self.click_in_context(&ctx, selector, _deadline).await
+            self.click_in_context(&ctx, selector, deadline).await
         }
 
         async fn click_in_context(
             &self,
             ctx: &ResolvedExecutionContext,
             selector: &str,
-            _deadline: std::time::Duration,
+            deadline: std::time::Duration,
         ) -> Result<(), AdapterError> {
             self.wait_for_page_ready(ctx.page).await?;
-            let anchors = self
-                .query(
-                    ctx.page,
-                    QuerySpec {
-                        selector: selector.to_string(),
-                        scope: ctx.query_scope(),
-                    },
-                )
-                .await?;
+            let poll_interval = Duration::from_millis(100);
+            let deadline_instant = Instant::now() + deadline;
+            let anchor = loop {
+                let anchors = self
+                    .query(
+                        ctx.page,
+                        QuerySpec {
+                            selector: selector.to_string(),
+                            scope: ctx.query_scope(),
+                        },
+                    )
+                    .await?;
 
-            let anchor = anchors.first().cloned().ok_or_else(|| {
-                AdapterError::new(AdapterErrorKind::Internal)
-                    .with_hint(format!("click target not found for selector '{selector}'"))
-            })?;
+                if let Some(anchor) = anchors.first() {
+                    break anchor.clone();
+                }
+
+                if Instant::now() >= deadline_instant {
+                    return Err(AdapterError::new(AdapterErrorKind::TargetNotFound)
+                        .with_hint(format!("click target not found for selector '{selector}'")));
+                }
+
+                sleep(poll_interval).await;
+            };
 
             let press_payload = json!({
                 "type": "mousePressed",
@@ -1813,7 +1916,7 @@ pub mod adapter {
             ctx: &ResolvedExecutionContext,
             selector: &str,
             text: &str,
-            _deadline: std::time::Duration,
+            deadline: std::time::Duration,
         ) -> Result<(), AdapterError> {
             self.wait_for_page_ready(ctx.page).await?;
             let selector_literal = serde_json::to_string(&selector).map_err(|err| {
@@ -1821,55 +1924,55 @@ pub mod adapter {
             })?;
 
             let scope_expression = Self::scope_expression(&ctx.query_scope())?;
-
             let focus_expression = format!(
                 "(() => {{\n    const scope = {scope};\n    if (!scope) {{ return {{ status: 'not-found' }}; }}\n    const el = scope.querySelector({selector});\n    if (!el) {{ return {{ status: 'not-found' }}; }}\n    if (typeof el.focus === 'function') {{ el.focus(); }}\n    return {{ status: 'focused' }};\n}})()",
                 selector = selector_literal,
                 scope = scope_expression,
             );
 
-            let focus_response = self
-                .send_page_command(
-                    ctx.page,
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": focus_expression,
-                        "returnByValue": true,
-                    }),
-                )
-                .await?;
+            let focus_retry_interval = Duration::from_millis(100);
+            let focus_deadline = Instant::now() + deadline;
 
-            let status = focus_response
-                .get("result")
-                .and_then(|res| res.get("value"))
-                .and_then(|val| val.get("status"))
-                .and_then(|val| val.as_str())
-                .unwrap_or("unknown");
+            loop {
+                let focus_response = self
+                    .send_page_command(
+                        ctx.page,
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": focus_expression,
+                            "returnByValue": true,
+                        }),
+                    )
+                    .await?;
 
-            if status != "focused" {
-                return Err(AdapterError::new(AdapterErrorKind::Internal)
-                    .with_hint(format!("failed to focus element for selector '{selector}'")));
-            }
+                let status = focus_response
+                    .get("result")
+                    .and_then(|res| res.get("value"))
+                    .and_then(|val| val.get("status"))
+                    .and_then(|val| val.as_str())
+                    .unwrap_or("unknown");
 
-            for ch in text.chars() {
-                let text_str = ch.to_string();
-                let key = match ch {
-                    '\n' | '\r' => "Enter".to_string(),
-                    '\t' => "Tab".to_string(),
-                    _ => text_str.clone(),
-                };
-
-                self.send_page_command(
-                    ctx.page,
-                    "Input.dispatchKeyEvent",
-                    json!({
-                        "type": "char",
-                        "text": text_str,
-                        "unmodifiedText": text_str,
-                        "key": key,
-                    }),
-                )
-                .await?;
+                match status {
+                    "focused" => break,
+                    "not-found" => {
+                        if Instant::now() >= focus_deadline {
+                            return Err(AdapterError::new(AdapterErrorKind::TargetNotFound)
+                                .with_hint(format!(
+                                    "selector '{}' not found before deadline",
+                                    selector
+                                )));
+                        }
+                        sleep(focus_retry_interval).await;
+                    }
+                    other => {
+                        return Err(AdapterError::new(AdapterErrorKind::Internal).with_hint(
+                            format!(
+                                "failed to focus element for selector '{}' (status: {})",
+                                selector, other
+                            ),
+                        ));
+                    }
+                }
             }
 
             self.send_page_command(ctx.page, "Input.insertText", json!({ "text": text }))
@@ -1881,7 +1984,7 @@ pub mod adapter {
             &self,
             page: PageId,
             spec: SelectSpec,
-            _deadline: std::time::Duration,
+            deadline: std::time::Duration,
         ) -> Result<(), AdapterError> {
             self.wait_for_page_ready(page).await?;
 
@@ -1894,28 +1997,42 @@ pub mod adapter {
             let selector_literal = serde_json::to_string(&selector).map_err(|err| {
                 AdapterError::new(AdapterErrorKind::Internal).with_hint(err.to_string())
             })?;
+            let selector_expression = format!(
+                "document.querySelector({selector})",
+                selector = selector_literal
+            );
 
-            let evaluate_response = self
-                .send_page_command(
-                    page,
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": format!("document.querySelector({selector})", selector = selector_literal),
-                        "objectGroup": "soulbrowser-select",
-                        "returnByValue": false,
-                    }),
-                )
-                .await?;
+            let poll_interval = Duration::from_millis(100);
+            let deadline_instant = Instant::now() + deadline;
 
-            let object_id = evaluate_response
-                .get("result")
-                .and_then(|res| res.get("objectId"))
-                .and_then(|val| val.as_str())
-                .ok_or_else(|| {
-                    AdapterError::new(AdapterErrorKind::Internal)
-                        .with_hint("selectOption target element not found")
-                })?
-                .to_string();
+            let object_id = loop {
+                let evaluate_response = self
+                    .send_page_command(
+                        page,
+                        "Runtime.evaluate",
+                        json!({
+                        "expression": selector_expression.clone(),
+                            "objectGroup": "soulbrowser-select",
+                            "returnByValue": false,
+                        }),
+                    )
+                    .await?;
+
+                if let Some(object_id) = evaluate_response
+                    .get("result")
+                    .and_then(|res| res.get("objectId"))
+                    .and_then(|val| val.as_str())
+                {
+                    break object_id.to_string();
+                }
+
+                if Instant::now() >= deadline_instant {
+                    return Err(AdapterError::new(AdapterErrorKind::TargetNotFound)
+                        .with_hint("selectOption target element not found"));
+                }
+
+                sleep(poll_interval).await;
+            };
 
             const SELECT_FN: &str = r#"
 function(targetValue, matchLabel) {
@@ -1979,9 +2096,9 @@ function(targetValue, matchLabel) {
 
             match status {
                 "selected" => Ok(()),
-                "not-found" => Err(AdapterError::new(AdapterErrorKind::Internal)
+                "not-found" => Err(AdapterError::new(AdapterErrorKind::TargetNotFound)
                     .with_hint("selectOption target element not found")),
-                "option-missing" => Err(AdapterError::new(AdapterErrorKind::Internal)
+                "option-missing" => Err(AdapterError::new(AdapterErrorKind::OptionNotFound)
                     .with_hint("selectOption option not found")),
                 other => Err(AdapterError::new(AdapterErrorKind::Internal)
                     .with_hint(format!("selectOption failed: {other}"))),

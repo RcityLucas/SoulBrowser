@@ -10,6 +10,9 @@ cargo fmt --check
 printf '\n==> cargo test\n'
 cargo test
 
+printf '\n==> planner custom tool lint\n'
+python3 scripts/ci/lint_plan_tools.py
+
 if command -v rg >/dev/null 2>&1; then
   printf '\n==> dead-file check\n'
   if ! rg --files | "$ROOT_DIR"/scripts/ci/check_dead_files.sh; then

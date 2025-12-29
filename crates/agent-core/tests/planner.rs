@@ -37,11 +37,35 @@ fn planner_falls_back_to_note_when_no_actions() {
     let request = build_request("Just think about automation safety");
 
     let outcome = planner.draft_plan(&request).expect("plan");
-    assert_eq!(outcome.plan.steps.len(), 1);
+    assert!(outcome.plan.steps.len() >= 3);
     assert!(matches!(
-        outcome.plan.steps[0].tool.kind,
-        AgentToolKind::Custom { .. }
+        outcome.plan.steps.first().map(|step| &step.tool.kind),
+        Some(AgentToolKind::Navigate { .. })
     ));
+    assert!(outcome.plan.steps.iter().any(|step| matches!(
+        step.tool.kind,
+        AgentToolKind::Custom { ref name, .. } if name == "data.extract-site"
+    )));
+    assert!(matches!(
+        outcome.plan.steps.last().map(|step| &step.tool.kind),
+        Some(AgentToolKind::Custom { name, .. }) if name == "agent.note"
+    ));
+}
+
+#[test]
+fn scaffolder_emits_structured_pipeline_for_required_output() {
+    let planner = RuleBasedPlanner::new(PlannerConfig::default());
+    let mut request = build_request("Summarize latest revenue numbers");
+    request
+        .intent
+        .required_outputs
+        .push(agent_core::RequestedOutput::new("market_info_v1.json"));
+
+    let outcome = planner.draft_plan(&request).expect("plan");
+    assert!(outcome.plan.steps.iter().any(|step| matches!(
+        step.tool.kind,
+        AgentToolKind::Custom { ref name, .. } if name == "data.deliver.structured"
+    )));
 }
 
 #[test]

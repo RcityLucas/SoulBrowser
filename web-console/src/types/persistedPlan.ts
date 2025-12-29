@@ -10,6 +10,7 @@ export interface PersistedPlanRecord {
   summary: string[];
   constraints: string[];
   current_url?: string | null;
+  session_id?: string | null;
   planner: string;
   llm_provider?: string | null;
   llm_model?: string | null;

@@ -11,7 +11,7 @@ export interface WebSocketMessage<T = any> {
 
 // Client → Server Messages
 export type ClientMessage =
-  | { type: 'ping'; payload: {} }
+  | { type: 'ping'; payload: Record<string, never> }
   | { type: 'chat_message'; payload: ChatMessagePayload }
   | { type: 'task_start'; payload: { taskId: string } }
   | { type: 'task_pause'; payload: { taskId: string } }
@@ -24,7 +24,7 @@ export type ClientMessage =
 
 // Server → Client Messages
 export type ServerMessage =
-  | { type: 'pong'; payload: {} }
+  | { type: 'pong'; payload: Record<string, never> }
   | { type: 'connected'; payload: ConnectionInfo }
   | { type: 'task_created'; payload: import('./task').Task }
   | { type: 'task_updated'; payload: import('./task').TaskUpdate }

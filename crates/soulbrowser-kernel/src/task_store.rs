@@ -46,6 +46,8 @@ pub struct PersistedPlanRecord {
     pub summary: Vec<String>,
     pub constraints: Vec<String>,
     pub current_url: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default = "default_planner")]
     pub planner: String,
     pub llm_provider: Option<String>,
@@ -72,6 +74,7 @@ impl PersistedPlanRecord {
         source: PlanSource,
         origin: PlanOriginMetadata,
         context_snapshot: Option<Value>,
+        session_id: Option<&str>,
     ) -> Result<Self> {
         let mut plan_json =
             serde_json::to_value(&session.plan).with_context(|| "serializing agent plan")?;
@@ -103,6 +106,7 @@ impl PersistedPlanRecord {
             summary: session.summarize_steps(),
             constraints,
             current_url,
+            session_id: session_id.map(|s| s.to_string()),
             planner: origin.planner,
             llm_provider: origin.llm_provider,
             llm_model: origin.llm_model,
@@ -122,6 +126,7 @@ pub struct PlanSummary {
     pub planner: Option<String>,
     pub llm_provider: Option<String>,
     pub llm_model: Option<String>,
+    pub session_id: Option<String>,
 }
 
 /// Simple filesystem-backed store for task plans.
@@ -216,6 +221,7 @@ impl TaskPlanStore {
                     planner: Some(record.planner.clone()),
                     llm_provider: record.llm_provider.clone(),
                     llm_model: record.llm_model.clone(),
+                    session_id: record.session_id.clone(),
                 }),
                 Err(err) => {
                     tracing::warn!(?err, path = %path.display(), "failed to read task plan file");

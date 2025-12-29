@@ -39,5 +39,5 @@ fn replan_includes_failure_reason() {
     assert!(replanned
         .explanations
         .iter()
-        .any(|item| item.contains(failure_reason)));
+        .any(|item: &String| item.contains(failure_reason)));
 }

@@ -39,8 +39,7 @@ futures = "0.3"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 tower = { version = "0.4", features = ["util"] }
 clap = { version = "4.4", features = ["derive"] }
-openssl = { version = "0.10", features = ["vendored"] }
- l6-observe = { path = "../l6-observe" }
+l6-observe = { path = "../l6-observe" }
  l6-timeline = { path = "../l6-timeline" }
  l6-privacy = { path = "../l6-privacy" }
  l7-adapter = { path = "../l7-adapter" }
@@ -96,3 +95,6 @@ soulbase = [
     "dep:soulbase-storage",
     "dep:soulbase-tools",
 ]
+
+[dev-dependencies]
+serial_test = "2.0"

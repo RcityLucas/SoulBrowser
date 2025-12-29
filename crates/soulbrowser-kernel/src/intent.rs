@@ -1,4 +1,4 @@
-use agent_core::{AgentRequest, RequestedOutput};
+use agent_core::{AgentIntentKind, AgentRequest, RequestedOutput};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -14,6 +14,12 @@ pub fn enrich_request_with_intent(request: &mut AgentRequest, prompt: &str) {
     if trimmed.is_empty() {
         return;
     }
+    let intent_kind = classify_intent_kind(trimmed);
+    request.intent.intent_kind = intent_kind;
+    request.metadata.insert(
+        "intent_kind".to_string(),
+        Value::String(intent_kind.as_str().to_string()),
+    );
     request
         .intent
         .primary_goal
@@ -88,6 +94,23 @@ fn contains_cjk(input: &str) -> bool {
     input
         .chars()
         .any(|ch| matches!(ch, '\u{4E00}'..='\u{9FFF}'))
+}
+
+const INFORMATIONAL_HINTS: &[&str] = &[
+    "查询", "总结", "对比", "行情", "分析", "research", "compare", "analysis", "weather", "report",
+];
+
+fn classify_intent_kind(prompt: &str) -> AgentIntentKind {
+    let lower = prompt.to_ascii_lowercase();
+    if INFORMATIONAL_HINTS.iter().any(|hint| {
+        let trimmed = hint.trim();
+        !trimmed.is_empty()
+            && (prompt.contains(trimmed) || lower.contains(&trimmed.to_ascii_lowercase()))
+    }) {
+        AgentIntentKind::Informational
+    } else {
+        AgentIntentKind::Operational
+    }
 }
 
 fn apply_configured_intent(request: &mut AgentRequest, prompt: &str) {
@@ -190,7 +213,12 @@ fn intent_config_path() -> Option<PathBuf> {
     if default.exists() {
         Some(default)
     } else {
-        None
+        let fallback = Path::new("config/defaults/intent_config.yaml").to_path_buf();
+        if fallback.exists() {
+            Some(fallback)
+        } else {
+            None
+        }
     }
 }
 
@@ -362,5 +390,25 @@ intents:
 
         env::remove_var("SOULBROWSER_INTENT_CONFIG");
         reset_intent_cache_for_tests();
+    }
+
+    #[test]
+    fn classify_sets_informational_for_queries() {
+        let mut request = AgentRequest::new(TaskId::new(), "查询深圳天气");
+        enrich_request_with_intent(&mut request, "请查询深圳天气并总结");
+        assert_eq!(request.intent.intent_kind, AgentIntentKind::Informational);
+        let kind_meta = request
+            .metadata
+            .get("intent_kind")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(kind_meta, "informational");
+    }
+
+    #[test]
+    fn classify_defaults_to_operational() {
+        let mut request = AgentRequest::new(TaskId::new(), "登录账户");
+        enrich_request_with_intent(&mut request, "请登录账户并修改密码");
+        assert_eq!(request.intent.intent_kind, AgentIntentKind::Operational);
     }
 }

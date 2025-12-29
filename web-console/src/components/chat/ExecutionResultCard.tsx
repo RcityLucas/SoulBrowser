@@ -30,7 +30,9 @@ export default function ExecutionResultCard({ results }: Props) {
                 </Tag>
               )}
             </div>
-            {item.data && <div className={styles.resultBody}>{renderValue(item.data)}</div>}
+            {item.data !== undefined && item.data !== null && (
+              <div className={styles.resultBody}>{renderValue(item.data)}</div>
+            )}
           </List.Item>
         )}
       />

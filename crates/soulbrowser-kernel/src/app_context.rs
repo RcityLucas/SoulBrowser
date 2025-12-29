@@ -23,6 +23,7 @@ use crate::{
     integration::{default_provider, IntegrationProvider},
     plugin_registry::PluginRegistry,
     self_heal::SelfHealRegistry,
+    sessions::SessionService,
     storage::StorageManager,
     task_status::TaskStatusRegistry,
     tools::BrowserToolManager,
@@ -78,6 +79,7 @@ pub struct AppContext {
     l0_handles: L0Handles,
     plugin_registry: Arc<PluginRegistry>,
     task_status_registry: Arc<TaskStatusRegistry>,
+    session_service: Arc<SessionService>,
     memory_center: Arc<MemoryCenter>,
     self_heal_registry: Arc<SelfHealRegistry>,
     background_tasks: Vec<JoinHandle<()>>,
@@ -130,6 +132,8 @@ impl AppContext {
         let storage = integration
             .create_storage_manager(storage_path.clone())
             .await?;
+        let session_service = Arc::new(SessionService::new(tenant_id.clone(), storage.clone()));
+        session_service.hydrate().await;
 
         // Initialize auth components
         let auth_manager = integration
@@ -306,6 +310,7 @@ impl AppContext {
 
         let plugin_registry = Arc::new(PluginRegistry::load_default());
         let task_status_registry = Arc::new(TaskStatusRegistry::new(200));
+        task_status_registry.add_stream_observer(session_service.clone());
         let memory_center = Arc::new(match &storage_path {
             Some(path) => {
                 let mut persist_path = path.clone();
@@ -350,6 +355,7 @@ impl AppContext {
             l0_handles,
             plugin_registry,
             task_status_registry,
+            session_service,
             memory_center,
             self_heal_registry,
             background_tasks,
@@ -397,6 +403,10 @@ impl AppContext {
 
     pub fn task_status_registry(&self) -> Arc<TaskStatusRegistry> {
         self.task_status_registry.clone()
+    }
+
+    pub fn session_service(&self) -> Arc<SessionService> {
+        self.session_service.clone()
     }
 
     pub fn memory_center(&self) -> Arc<MemoryCenter> {

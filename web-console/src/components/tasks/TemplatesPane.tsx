@@ -264,7 +264,7 @@ export default function TemplatesPane({
     } finally {
       setEditLoading(false);
     }
-  }, [editForm, editingRecord, onTemplateUpdated]);
+  }, [editForm, editingRecord, fetchStats, onTemplateUpdated]);
 
   return (
     <div className={styles.templatesSection}>

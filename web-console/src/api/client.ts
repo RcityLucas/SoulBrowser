@@ -9,10 +9,12 @@ import { soulbrowserAPI, resolveServeToken } from '@/api/soulbrowser';
 
 class ApiClient {
   private client: AxiosInstance;
+  private baseUrl?: string;
 
   constructor() {
+    this.baseUrl = deriveApiBaseUrl();
     this.client = axios.create({
-      baseURL: deriveApiBaseUrl(),
+      baseURL: this.baseUrl,
       timeout: 30000,
       headers: {
         'Content-Type': 'application/json',
@@ -22,7 +24,7 @@ class ApiClient {
     // Request interceptor
     this.client.interceptors.request.use(
       (config) => {
-        const baseURL = deriveApiBaseUrl();
+        const baseURL = this.baseUrl ?? deriveApiBaseUrl();
         if (baseURL) {
           config.baseURL = baseURL;
         }
@@ -55,7 +57,8 @@ class ApiClient {
   }
 
   setBaseUrl(baseURL: string) {
-    this.client.defaults.baseURL = deriveApiBaseUrl(baseURL);
+    this.baseUrl = deriveApiBaseUrl(baseURL);
+    this.client.defaults.baseURL = this.baseUrl;
   }
 
   // Task APIs

@@ -40,6 +40,8 @@ fi
 # 配置参数
 BACKEND_PORT="${BACKEND_PORT:-8791}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+BACKEND_HOST="${BACKEND_HOST:-}"
+SERVE_TOKEN="${SERVE_TOKEN:-soulbrowser-dev-token}"
 WS_URL="${SOULBROWSER_WS_URL:-}"
 
 echo ""
@@ -47,9 +49,22 @@ echo -e "${BLUE}配置:${NC}"
 echo -e "  后端端口: ${GREEN}$BACKEND_PORT${NC}"
 echo -e "  前端端口: ${GREEN}$FRONTEND_PORT${NC}"
 
-# 检查是否在 WSL 环境
+IS_WSL=0
 if grep -qi microsoft /proc/version 2>/dev/null; then
+    IS_WSL=1
+fi
+
+if [ -z "$BACKEND_HOST" ]; then
+    if [ "$IS_WSL" -eq 1 ]; then
+        BACKEND_HOST="0.0.0.0"
+    else
+        BACKEND_HOST="127.0.0.1"
+    fi
+fi
+
+if [ "$IS_WSL" -eq 1 ]; then
     echo -e "${YELLOW}⚠ 检测到 WSL 环境${NC}"
+    echo -e "  后端将监听 ${GREEN}$BACKEND_HOST${NC}，以便 Windows 浏览器访问"
 
     if [ -z "$WS_URL" ]; then
         echo ""
@@ -70,6 +85,12 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
     fi
 fi
 
+# 导出开发 token，便于前后端免配置互通
+export SOUL_SERVE_TOKEN="$SERVE_TOKEN"
+export SOUL_CONSOLE_TOKEN="$SERVE_TOKEN"
+export VITE_SERVE_TOKEN="$SERVE_TOKEN"
+export VITE_BACKEND_URL="${VITE_BACKEND_URL:-http://localhost:$BACKEND_PORT}"
+
 echo ""
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}   启动服务${NC}"
@@ -79,7 +100,7 @@ echo ""
 # 启动后端服务
 echo -e "${GREEN}▶ 启动后端服务...${NC}"
 
-BACKEND_CMD="$BINARY --metrics-port 0 serve --port $BACKEND_PORT"
+BACKEND_CMD="$BINARY --metrics-port 0 serve --disable-auth --host $BACKEND_HOST --port $BACKEND_PORT"
 if [ -n "$WS_URL" ]; then
     BACKEND_CMD="$BACKEND_CMD --ws-url $WS_URL"
 fi
@@ -111,47 +132,27 @@ done
 
 # 启动前端服务
 echo ""
-echo -e "${GREEN}▶ 启动前端服务...${NC}"
-
-cd web-console
-
-# 检查依赖
-if [ ! -d "node_modules" ]; then
-    echo -e "${YELLOW}安装前端依赖...${NC}"
-    npm install
-fi
-
-# 启动前端（前台运行）
-echo -e "${GREEN}✓ 前端服务启动中...${NC}"
+echo -e "${GREEN}✓ 后端已在 ${BLUE}http://$BACKEND_HOST:$BACKEND_PORT${GREEN} 运行${NC}"
 echo ""
 echo -e "${BLUE}========================================${NC}"
-echo -e "${GREEN}   🎉 启动成功！${NC}"
+echo -e "${GREEN}   🎉 后端就绪！${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
-echo -e "${GREEN}访问地址:${NC}"
-echo -e "  前端: ${BLUE}http://localhost:$FRONTEND_PORT${NC}"
-echo -e "  后端: ${BLUE}http://localhost:$BACKEND_PORT${NC}"
+echo -e "${YELLOW}下一步:${NC}"
+echo -e "  1. 另开终端: ${GREEN}cd web-console && npm install && npm run dev${NC}"
+echo -e "  2. 浏览器打开 ${BLUE}http://localhost:$FRONTEND_PORT${NC}"
+echo -e "  3. 如需指定 token/端口，设置 SERVE_TOKEN/BACKEND_PORT 等环境变量后重跑本脚本"
 echo ""
-echo -e "${YELLOW}提示:${NC}"
-echo -e "  • 按 ${GREEN}Ctrl+C${NC} 停止服务"
-echo -e "  • 后端日志: ${GREEN}tail -f /tmp/soulbrowser_backend.log${NC}"
-echo ""
-echo -e "${BLUE}========================================${NC}"
-echo ""
+echo -e "${YELLOW}按 Ctrl+C 可关闭后端，日志见 ${GREEN}/tmp/soulbrowser_backend.log${NC}"
 
-# 清理函数
 cleanup() {
     echo ""
-    echo -e "${YELLOW}正在停止服务...${NC}"
+    echo -e "${YELLOW}正在停止后端...${NC}"
     kill $BACKEND_PID 2>/dev/null || true
-    echo -e "${GREEN}✓ 服务已停止${NC}"
+    echo -e "${GREEN}✓ 后端已停止${NC}"
     exit 0
 }
 
 trap cleanup SIGINT SIGTERM
 
-# 启动前端开发服务器
-npm run dev
-
-# 如果前端退出，清理后端
-cleanup
+wait $BACKEND_PID

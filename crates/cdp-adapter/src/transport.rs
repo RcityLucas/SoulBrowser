@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::CdpConfig;
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::util::extract_ws_url;
+use crate::AdapterMode;
 
 #[derive(Clone, Debug)]
 pub struct TransportEvent {
@@ -48,6 +49,10 @@ pub trait CdpTransport: Send + Sync {
         method: &str,
         params: Value,
     ) -> Result<Value, AdapterError>;
+
+    fn adapter_mode(&self) -> AdapterMode {
+        AdapterMode::Real
+    }
 }
 
 #[derive(Default)]
@@ -71,6 +76,10 @@ impl CdpTransport for NoopTransport {
     ) -> Result<Value, AdapterError> {
         Err(AdapterError::new(AdapterErrorKind::Internal)
             .with_hint(format!("transport not available for method {method}")))
+    }
+
+    fn adapter_mode(&self) -> AdapterMode {
+        AdapterMode::Stub
     }
 }
 

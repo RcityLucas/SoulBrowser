@@ -126,7 +126,11 @@
               "text": "",
               "title": "交付解析结果",
               "url": "",
-              "value": ""
+              "value": "",
+              "schema": "github_repos_v1",
+              "artifact_label": "structured.github_repos_v1",
+              "filename": "github_repos_v1.json",
+              "source_step_id": "llm-step-3"
             }
           }
         },

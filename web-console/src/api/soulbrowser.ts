@@ -3,6 +3,12 @@
  */
 
 import axios, { AxiosInstance } from 'axios';
+import type {
+  CreateSessionRequest,
+  SessionRecord,
+  SessionShareContext,
+  SessionSnapshot,
+} from '@/types';
 
 export interface PerceiveRequest {
   url: string;
@@ -79,6 +85,9 @@ export interface ChatRequest {
   capture_context?: boolean;
   context_timeout_secs?: number;
   context_screenshot?: boolean;
+  session_id?: string;
+  profile_id?: string;
+  profile_label?: string;
 }
 
 export interface ChatResponse {
@@ -87,6 +96,7 @@ export interface ChatResponse {
   flow?: any;
   artifacts?: any;
   context?: ContextSnapshot;
+  session_id?: string;
   stdout?: string;
   stderr?: string;
 }
@@ -100,6 +110,7 @@ export interface TaskSummary {
   planner?: string | null;
   llm_provider?: string | null;
   llm_model?: string | null;
+  session_id?: string | null;
 }
 
 export interface PersistedPlanRecord {
@@ -114,6 +125,7 @@ export interface PersistedPlanRecord {
   summary: string[];
   constraints: string[];
   current_url?: string | null;
+  session_id?: string | null;
   planner: string;
   llm_provider?: string | null;
   llm_model?: string | null;
@@ -137,6 +149,8 @@ export interface TaskStatusSnapshot {
   context_snapshot?: ContextSnapshot;
   annotations?: TaskAnnotation[];
   agent_history?: AgentHistoryEntry[];
+  user_results?: TaskUserResult[];
+  missing_user_result?: boolean;
   watchdog_events?: WatchdogEvent[];
   judge_verdict?: TaskJudgeVerdict | null;
   self_heal_events?: SelfHealEvent[];
@@ -199,6 +213,26 @@ export interface TaskJudgeVerdict {
   recorded_at: string;
 }
 
+interface SessionListResponse {
+  success: boolean;
+  sessions: SessionRecord[];
+}
+
+interface SessionCreateResponse {
+  success: boolean;
+  session: SessionRecord;
+}
+
+interface SessionDetailResponseApi {
+  success: boolean;
+  snapshot: SessionSnapshot;
+}
+
+interface SessionShareResponse {
+  success: boolean;
+  share: SessionShareContext;
+}
+
 export interface TaskDispatchSummary {
   action_id: string;
   status: string;
@@ -212,24 +246,6 @@ export interface TaskDispatchSummary {
   error?: string | null;
   output?: Record<string, unknown> | null;
   recorded_at: string;
-}
-
-export interface PersistedPlanRecord {
-  version: number;
-  task_id: string;
-  prompt: string;
-  created_at: string;
-  source: string;
-  plan: Record<string, unknown>;
-  flow: Record<string, unknown>;
-  explanations: string[];
-  summary: string[];
-  constraints: string[];
-  current_url?: string | null;
-  planner: string;
-  llm_provider?: string | null;
-  llm_model?: string | null;
-  context_snapshot?: ContextSnapshot | null;
 }
 
 export interface TaskDetailResponse {
@@ -328,6 +344,15 @@ export interface TaskAnnotation {
   severity?: string | null;
   kind?: string | null;
   created_at: string;
+}
+
+export interface TaskUserResult {
+  step_id: string;
+  step_title: string;
+  kind: string;
+  schema?: string | null;
+  content?: unknown;
+  artifact_path?: string | null;
 }
 
 export interface CreateTaskAnnotationRequest {
@@ -1063,6 +1088,55 @@ class SoulBrowserAPI {
       task_id: response.data.task_id,
       stream_path: response.data.stream_path,
     };
+  }
+
+  async listSessions(): Promise<SessionRecord[]> {
+    const response = await this.client.get<SessionListResponse>('/api/sessions');
+    return response.data.sessions;
+  }
+
+  async createSession(payload?: CreateSessionRequest): Promise<SessionRecord> {
+    const response = await this.client.post<SessionCreateResponse>(
+      '/api/sessions',
+      payload ?? {}
+    );
+    return response.data.session;
+  }
+
+  async getSessionSnapshot(sessionId: string): Promise<SessionSnapshot> {
+    const response = await this.client.get<SessionDetailResponseApi>(
+      `/api/sessions/${sessionId}`
+    );
+    return response.data.snapshot;
+  }
+
+  async issueSessionShare(sessionId: string): Promise<SessionShareContext> {
+    const response = await this.client.post<SessionShareResponse>(
+      `/api/sessions/${sessionId}/share`
+    );
+    return response.data.share;
+  }
+
+  async revokeSessionShare(sessionId: string): Promise<SessionShareContext> {
+    const response = await this.client.delete<SessionShareResponse>(
+      `/api/sessions/${sessionId}/share`
+    );
+    return response.data.share;
+  }
+
+  openSessionStream(sessionId: string, shareToken?: string): EventSource {
+    const base = this.baseURL || window.location.origin;
+    const url = new URL(base);
+    url.pathname = `/api/sessions/${sessionId}/live`;
+    url.search = '';
+    if (shareToken) {
+      url.searchParams.set('share', shareToken);
+    }
+    const token = resolveServeToken();
+    if (token) {
+      url.searchParams.set('token', token);
+    }
+    return new EventSource(url.toString());
   }
 
   /**

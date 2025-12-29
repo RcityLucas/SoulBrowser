@@ -25,6 +25,7 @@
 - ✅ **LLM 缓存分区**：Serve CLI `--llm-cache-dir` 支持多模型/多租户前缀，命名空间标签（tenant + provider + model）会通过 `soul_llm_cache_events_total{namespace,event}` 暴露命中/未命中/错误指标，方便 Grafana/Prometheus 观察缓存质量。 
 - ✅ **执行指标**：`execute_plan` 现会为每个步骤写回等待/执行耗时与重试次数，`TaskStatusRegistry` 推送 `AgentHistoryEntry`（含 tool_kind / wait_ms / run_ms）且 Web Console 展示细节，同时通过 `soul_execution_step_latency_ms`、`soul_execution_step_attempts_total` 暴露 Prometheus 指标。 
 - ✅ **SSE 优化**：`TaskStatusRegistry` 发送批量事件（观察、Overlay 等）时只持有一次锁并一次广播，降低高并发下的锁争用，History buffer 仍支持 `Last-Event-ID` 重放。 
+- ✅ **搜索页兜底**：执行器支持 URL/DOM 双校验以及 `data.extract-site` 结果校验，若观察阶段仍停留在 Baidu 首页会立即失败并触发 replan/retry，并在计划步骤元数据中记录 `expected_url` 供后续遥测追踪。 
 
 ## 5. Task Center & 存储
 - ✅ **Plan/Artifact 生命周期**：`TaskPlanStore` 在 Serve 启动时依据 `SOUL_PLAN_TTL_DAYS` 清理过期计划；`soulbrowser-output/tenants/<tenant>/executions/<task_id>` 目录也会根据 `SOUL_OUTPUT_TTL_DAYS` 自动移除旧的执行快照，避免输出目录无限增长。后续仍可补充压缩/归档策略与异步下载。 

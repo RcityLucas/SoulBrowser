@@ -1,0 +1,32 @@
+# Declarative stage + strategy mapping for the planner.
+# Tenants can override via SOUL_PLANNER_STAGE_CONFIG.
+defaults:
+  stages:
+    - navigate: [context_url, preferred_site, search]
+    - act: [auto]
+    - observe: [extract_site, plugin_observer]
+    - parse: [generic_parser, llm_summary]
+    - deliver: [structured, agent_note]
+
+intents:
+  informational:
+    stages:
+      - navigate: [context_url, preferred_site, search]
+      - act: [auto]
+      - observe: [extract_site, api_observer]
+      - parse: [generic_parser, llm_summary]
+      - deliver: [structured, agent_note]
+  weather:
+    stages:
+      - navigate: [search]
+      - act: [auto]
+      - observe: [extract_site]
+      - parse: [weather_parser, generic_parser]
+      - deliver: [structured, agent_note]
+  summarize_current_page:
+    stages:
+      - navigate: [context_url]
+      - act: [auto]
+      - observe: [extract_site]
+      - parse: [llm_summary]
+      - deliver: [agent_note]

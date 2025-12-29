@@ -20,6 +20,7 @@ mod memory;
 mod perception;
 mod plugins;
 mod self_heal;
+mod sessions;
 mod tasks;
 mod ws;
 
@@ -29,6 +30,7 @@ use memory::router as memory_routes;
 use perception::router as perception_routes;
 use plugins::router as plugin_routes;
 use self_heal::router as self_heal_routes;
+use sessions::router as session_routes;
 use tasks::router as task_routes;
 
 use super::state::ServeState;
@@ -114,6 +116,7 @@ pub struct ServeRouterModules {
     pub plugins: bool,
     pub self_heal: bool,
     pub admin: bool,
+    pub sessions: bool,
 }
 
 impl ServeRouterModules {
@@ -126,6 +129,7 @@ impl ServeRouterModules {
             plugins: true,
             self_heal: true,
             admin: true,
+            sessions: true,
         }
     }
 
@@ -142,6 +146,7 @@ impl ServeRouterModules {
             plugins: false,
             self_heal: false,
             admin: false,
+            sessions: true,
         }
     }
 
@@ -154,6 +159,7 @@ impl ServeRouterModules {
             plugins: false,
             self_heal: false,
             admin: false,
+            sessions: false,
         }
     }
 
@@ -192,6 +198,11 @@ impl ServeRouterModules {
         self
     }
 
+    pub const fn with_sessions(mut self, enabled: bool) -> Self {
+        self.sessions = enabled;
+        self
+    }
+
     fn apply(self, mut router: Router<ServeState>) -> Router<ServeState> {
         if self.perception {
             router = router.merge(perception_routes());
@@ -201,6 +212,9 @@ impl ServeRouterModules {
         }
         if self.tasks {
             router = router.merge(task_routes());
+        }
+        if self.sessions {
+            router = router.merge(session_routes());
         }
         if self.memory {
             router = router.merge(memory_routes());

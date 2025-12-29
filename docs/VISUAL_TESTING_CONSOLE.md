@@ -50,6 +50,7 @@ Notes:
 - `--metrics-port 0` disables the default Prometheus binding to avoid permission issues.
 - If you prefer building in debug mode, replace `./target/release/soulbrowser` with `./target/debug/soulbrowser`.
 - The server prints the URL of the console once it starts (default `http://127.0.0.1:8787`).
+- When the backend runs inside WSL but you open the console from Windows, add `--host 0.0.0.0` (or any reachable address) so the HTTP server listens on all interfaces and Windows can reach the API, including the `/api/sessions` endpoints.
 
 ## 4. Using the Web Console
 

@@ -45,6 +45,7 @@ export interface TaskPlanMeta {
   rationale?: string[];
   risk_assessment?: string[];
   vendor_context?: Record<string, unknown>;
+  overlays?: any[];
 }
 
 export interface TaskPlanStep {

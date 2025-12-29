@@ -31,7 +31,16 @@ pub fn validate_structured_output(schema: &str, value: &Value) -> Result<()> {
         "twitter_feed_v1" => validate_twitter_feed(value),
         "facebook_feed_v1" => validate_facebook_feed(value),
         "hackernews_feed_v1" => validate_hackernews_feed(value),
+        "weather_report_v1" => validate_weather_report(value),
         _ => Ok(()),
+    }
+}
+
+/// Generate a short human readable summary for structured payloads when possible.
+pub fn summarize_structured_output(schema: &str, value: &Value) -> Option<String> {
+    match canonical_schema_id(schema).as_str() {
+        "weather_report_v1" => summarize_weather_report(value),
+        _ => None,
     }
 }
 
@@ -106,6 +115,74 @@ fn validate_news_brief(value: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_weather_report(value: &Value) -> Result<()> {
+    let city = value
+        .get("city")
+        .and_then(Value::as_str)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("weather_report_v1 requires 'city'"))?;
+    if city.is_empty() {
+        bail!("weather_report_v1 requires 'city'");
+    }
+
+    let condition = value
+        .get("condition")
+        .and_then(Value::as_str)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("weather_report_v1 requires 'condition'"))?;
+    if condition.is_empty() {
+        bail!("weather_report_v1 requires 'condition'");
+    }
+
+    let high = value
+        .get("temperature_high_c")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow!("weather_report_v1 requires 'temperature_high_c'"))?;
+    let low = value
+        .get("temperature_low_c")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow!("weather_report_v1 requires 'temperature_low_c'"))?;
+
+    if high < low {
+        bail!("temperature_high_c must be >= temperature_low_c");
+    }
+
+    Ok(())
+}
+
+fn summarize_weather_report(value: &Value) -> Option<String> {
+    let city = value
+        .get("city")
+        .and_then(Value::as_str)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
+    let condition = value
+        .get("condition")
+        .and_then(Value::as_str)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
+    let high = value.get("temperature_high_c").and_then(Value::as_f64)?;
+    let low = value.get("temperature_low_c").and_then(Value::as_f64)?;
+
+    Some(format!(
+        "{}: {}, {}°C-{}°C",
+        city,
+        condition,
+        format_temp(low),
+        format_temp(high)
+    ))
+}
+
+fn format_temp(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{:.0}", value)
+    } else {
+        format!("{:.1}", value)
+    }
 }
 
 fn validate_github_repos(value: &Value) -> Result<()> {
@@ -476,5 +553,30 @@ mod tests {
             ]
         });
         assert!(validate_structured_output("hackernews_feed_v1", &value).is_err());
+    }
+
+    #[test]
+    fn validates_weather_report_schema() {
+        let value = json!({
+            "schema": "weather_report_v1",
+            "city": "北京",
+            "condition": "晴",
+            "temperature_high_c": 6.0,
+            "temperature_low_c": 0.0
+        });
+        validate_structured_output("weather_report_v1", &value).expect("valid weather schema");
+    }
+
+    #[test]
+    fn summarizes_weather_payload() {
+        let value = json!({
+            "schema": "weather_report_v1",
+            "city": "Beijing",
+            "condition": "Sunny",
+            "temperature_high_c": 6.0,
+            "temperature_low_c": 0.0
+        });
+        let summary = summarize_structured_output("weather_report_v1", &value).expect("summary");
+        assert_eq!(summary, "Beijing: Sunny, 0°C-6°C");
     }
 }

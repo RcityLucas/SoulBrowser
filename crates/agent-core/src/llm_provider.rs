@@ -107,6 +107,7 @@ fn mock_plan(
         rationale: explanations.clone(),
         risk_assessment: vec!["Low risk mock plan".to_string()],
         vendor_context: Default::default(),
+        overlays: Vec::new(),
     };
 
     PlannerOutcome { plan, explanations }

@@ -42,6 +42,29 @@ intents:
       captcha: require_manual_captcha
       blank_page: auto_retry
 
+  fetch_weather:
+    triggers:
+      - "天气"
+      - "weather"
+      - "天气预报"
+      - "百度天气"
+      - "天气怎么样"
+      - "今天天气"
+      - "天气查询"
+    primary_goal: "查询目标城市的最新天气并返回可读摘要"
+    primary_sites:
+      - "https://www.baidu.com"
+      - "https://weather.com"
+    output:
+      schema: weather_report_v1.json
+      include_screenshot: false
+      description: "{city, condition, temperature_high_c, temperature_low_c}"
+    preferred_language: zh-CN
+    blockers:
+      consent_gate: accept_google_consent
+      captcha: require_manual_captcha
+      blank_page: auto_retry
+
   collect_example_products:
     triggers:
       - "example.com"

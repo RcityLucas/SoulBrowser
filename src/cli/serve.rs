@@ -1,4 +1,5 @@
 use std::env;
+use std::net::IpAddr;
 use std::str::FromStr;
 
 use anyhow::Result;
@@ -12,6 +13,10 @@ pub struct ServeArgs {
     /// Port for the testing server
     #[arg(long, default_value_t = 8787)]
     pub port: u16,
+
+    /// Address to bind the testing server (use 0.0.0.0 to expose outside WSL)
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: IpAddr,
 
     /// Attach to an existing Chrome DevTools websocket (optional)
     #[arg(long)]
@@ -50,6 +55,7 @@ pub async fn cmd_serve(args: ServeArgs, _metrics_port: u16, config: Config) -> R
     let surface = resolve_surface(&args, &config);
     let options = ServeOptions {
         port: args.port,
+        host: args.host,
         websocket_url: args.ws_url.clone(),
         tenant: args.tenant.clone(),
         llm_cache_dir: args.llm_cache_dir.clone(),
