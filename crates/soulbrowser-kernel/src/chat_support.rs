@@ -684,6 +684,11 @@ pub fn sync_agent_execution_history(handle: &TaskStatusHandle, report: &FlowExec
         }
     }
 
+    let evidence = execution_artifacts_from_report(report);
+    if !evidence.is_empty() {
+        handle.push_evidence(&evidence);
+    }
+
     if report.success {
         handle.mark_success();
     } else {

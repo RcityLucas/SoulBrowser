@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{collections::HashMap, env, fmt, sync::Arc, time::Duration};
 
 use agent_core::{
     requires_weather_pipeline, weather_query_text, weather_search_url, AgentContext, AgentLocator,
@@ -9,6 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cdp_adapter::AdapterMode;
+use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use soulbrowser_core_types::{
     ActionId, ExecRoute, FrameId, PageId, RoutePrefer, RoutingHint, SessionId, TaskId, ToolCall,
@@ -26,10 +27,17 @@ use crate::{
     app_context::AppContext,
     block_detect::detect_block_reason,
     metrics,
+    task_status::TaskStatusHandle,
 };
 
 const WEATHER_GUARDRAIL_MESSAGE: &str =
     "weather pipeline is still rendering Baidu home; search results never loaded";
+
+static PREVIEW_CAPTURE_ENABLED: Lazy<bool> =
+    Lazy::new(|| match env::var("SOULBROWSER_LIVE_PREVIEW") {
+        Ok(value) => matches!(value.trim(), "1" | "true" | "TRUE" | "True"),
+        Err(_) => true,
+    });
 
 /// Execution options for running an agent plan.
 #[derive(Clone, Debug)]
@@ -112,6 +120,7 @@ pub async fn execute_plan(
     request: &AgentRequest,
     plan: &AgentPlan,
     options: FlowExecutionOptions,
+    status_handle: Option<&TaskStatusHandle>,
 ) -> Result<FlowExecutionReport> {
     if plan_requires_dom_actions(plan) {
         if let Some(AdapterMode::Stub) = context.tool_manager().adapter_mode() {
@@ -143,6 +152,7 @@ pub async fn execute_plan(
             &routing_hint,
             &options,
             &mut runtime_state,
+            status_handle,
         )
         .await;
         runtime_state.absorb_step_result(step, &report);
@@ -202,6 +212,7 @@ async fn execute_step<D: Dispatcher + ?Sized>(
     routing_hint: &Option<RoutingHint>,
     options: &FlowExecutionOptions,
     runtime_state: &mut FlowRuntimeState,
+    status_handle: Option<&TaskStatusHandle>,
 ) -> StepExecutionReport {
     if is_note_step(step) {
         return execute_note_step(task_id, step);
@@ -287,6 +298,44 @@ async fn execute_step<D: Dispatcher + ?Sized>(
                         artifacts,
                         error,
                     });
+                    if let Some(handle) = status_handle {
+                        let dispatch_index = step_dispatches.len().saturating_sub(1);
+                        if let Some(record) = step_dispatches.get(dispatch_index) {
+                            let evidences =
+                                dispatch_artifact_values(&step.id, dispatch_index, record);
+                            if !evidences.is_empty() {
+                                handle.push_evidence(&evidences);
+                            }
+                        }
+                    }
+                    if !failed
+                        && preview_capture_enabled()
+                        && spec.label == "action"
+                        && should_capture_preview_for_tool(&spec.tool)
+                    {
+                        if let Some(preview_dispatch) = capture_preview_frame(
+                            dispatcher,
+                            &task_id,
+                            &step.id,
+                            &output.route,
+                            options,
+                        )
+                        .await
+                        {
+                            let dispatch_index = step_dispatches.len();
+                            if let Some(handle) = status_handle {
+                                let preview_values = dispatch_artifact_values(
+                                    &step.id,
+                                    dispatch_index,
+                                    &preview_dispatch,
+                                );
+                                if !preview_values.is_empty() {
+                                    handle.push_evidence(&preview_values);
+                                }
+                            }
+                            step_dispatches.push(preview_dispatch);
+                        }
+                    }
                     if failed {
                         if should_attempt_url_fallback(spec, step) {
                             if let Some(dispatch) = attempt_url_navigation_fallback(
@@ -439,6 +488,85 @@ async fn dispatch_once<D: Dispatcher + ?Sized>(
         .map_err(|err| anyhow!("scheduler output channel closed: {}", err))?;
 
     Ok((action_id, output))
+}
+
+fn preview_capture_enabled() -> bool {
+    *PREVIEW_CAPTURE_ENABLED
+}
+
+fn should_capture_preview_for_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "navigate-to-url"
+            | "click"
+            | "type-text"
+            | "select-option"
+            | "scroll-page"
+            | "weather.search"
+    )
+}
+
+fn preview_routing_hint(route: &ExecRoute) -> RoutingHint {
+    RoutingHint {
+        session: Some(route.session.clone()),
+        page: Some(route.page.clone()),
+        frame: Some(route.frame.clone()),
+        prefer: Some(RoutePrefer::Focused),
+    }
+}
+
+async fn capture_preview_frame<D: Dispatcher + ?Sized>(
+    dispatcher: &D,
+    task_id: &TaskId,
+    step_id: &str,
+    route: &ExecRoute,
+    options: &FlowExecutionOptions,
+) -> Option<DispatchRecord> {
+    let call_options = CallOptions {
+        timeout: Duration::from_secs(10),
+        priority: options.priority,
+        interruptible: true,
+        retry: RetryOpt {
+            max: 0,
+            backoff: Duration::from_millis(200),
+        },
+    };
+
+    let tool_call = ToolCall {
+        call_id: Some(format!("{}::preview", step_id)),
+        task_id: Some(task_id.clone()),
+        tool: "take-screenshot".to_string(),
+        payload: json!({}),
+    };
+
+    let request = DispatchRequest {
+        tool_call,
+        options: call_options,
+        routing_hint: Some(preview_routing_hint(route)),
+    };
+
+    match dispatch_once(dispatcher, request).await {
+        Ok((action_id, output)) => {
+            let (wait_ms, run_ms) = timeline_metrics(&output.timeline);
+            let (normalized_output, artifacts) =
+                normalize_dispatch_output("preview", output.output.clone());
+            let error = output.error.map(|err| err.to_string());
+            Some(DispatchRecord {
+                label: "preview".to_string(),
+                action_id: action_id.0.clone(),
+                route: output.route,
+                wait_ms,
+                run_ms,
+                output: normalized_output,
+                artifacts,
+                error,
+            })
+        }
+        Err(err) => {
+            debug!(?err, "preview screenshot capture failed");
+            None
+        }
+    }
 }
 
 fn timeline_metrics(timeline: &DispatchTimeline) -> (u64, u64) {
@@ -641,35 +769,45 @@ fn normalize_dispatch_output(
         return (None, artifacts);
     };
 
-    if let Some(obj) = value.as_object_mut() {
-        if let Some(bytes_value) = obj.remove("bytes") {
-            if let Some(bytes) = extract_bytes(bytes_value) {
-                let encoded = BASE64.encode(&bytes);
-                let content_type = obj
-                    .get("content_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
-                let filename = obj
-                    .get("filename")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+    collect_artifacts(label, &mut value, &mut artifacts);
+    (Some(value), artifacts)
+}
 
-                obj.insert("bytes_base64".to_string(), Value::String(encoded.clone()));
-                obj.insert("byte_len".to_string(), Value::from(bytes.len() as u64));
+fn collect_artifacts(label: &str, value: &mut Value, artifacts: &mut Vec<RunArtifact>) {
+    let Value::Object(obj) = value else {
+        return;
+    };
 
-                artifacts.push(RunArtifact {
-                    label: label.to_string(),
-                    content_type,
-                    data_base64: encoded,
-                    byte_len: bytes.len(),
-                    filename,
-                });
-            }
+    if let Some(bytes_value) = obj.remove("bytes") {
+        if let Some(bytes) = extract_bytes(bytes_value) {
+            let encoded = BASE64.encode(&bytes);
+            let content_type = obj
+                .get("content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let filename = obj
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            obj.insert("bytes_base64".to_string(), Value::String(encoded.clone()));
+            obj.insert("byte_len".to_string(), Value::from(bytes.len() as u64));
+
+            artifacts.push(RunArtifact {
+                label: label.to_string(),
+                content_type,
+                data_base64: encoded,
+                byte_len: bytes.len(),
+                filename,
+            });
         }
     }
 
-    (Some(value), artifacts)
+    // Scheduler dispatches wrap the actual tool payload under `output`, so recurse into it.
+    if let Some(inner) = obj.get_mut("output") {
+        collect_artifacts(label, inner, artifacts);
+    }
 }
 
 fn extract_bytes(value: Value) -> Option<Vec<u8>> {
@@ -693,6 +831,35 @@ fn aggregate_dispatch_totals(dispatches: &[DispatchRecord]) -> (u64, u64) {
         .fold((0u64, 0u64), |(wait_acc, run_acc), dispatch| {
             (wait_acc + dispatch.wait_ms, run_acc + dispatch.run_ms)
         })
+}
+
+fn dispatch_artifact_values(
+    step_id: &str,
+    dispatch_index: usize,
+    dispatch: &DispatchRecord,
+) -> Vec<Value> {
+    dispatch
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "step_id": step_id,
+                "dispatch_label": dispatch.label,
+                "dispatch_index": dispatch_index,
+                "action_id": dispatch.action_id,
+                "route": {
+                    "session": dispatch.route.session.0,
+                    "page": dispatch.route.page.0,
+                    "frame": dispatch.route.frame.0,
+                },
+                "label": artifact.label,
+                "content_type": artifact.content_type,
+                "byte_len": artifact.byte_len,
+                "data_base64": artifact.data_base64,
+                "filename": artifact.filename,
+            })
+        })
+        .collect()
 }
 
 fn collect_user_results(steps: &[StepExecutionReport]) -> Vec<UserResult> {

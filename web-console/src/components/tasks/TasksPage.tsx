@@ -19,6 +19,7 @@ import {
   PauseCircleOutlined,
   CloseCircleOutlined,
   ReloadOutlined,
+  EyeOutlined,
 } from '@ant-design/icons';
 import { useTasks } from '@/hooks/useTasks';
 import { formatTime, formatDuration } from '@/utils/format';
@@ -299,6 +300,14 @@ export default function TasksPage() {
               重试
             </Button>
           ) : null}
+          <Button
+            type="link"
+            size="small"
+            icon={<EyeOutlined />}
+            onClick={() => navigate(`/tasks/${record.id}`)}
+          >
+            实时预览
+          </Button>
           <Button type="link" size="small" onClick={() => handleViewDetail(record.id)}>
             查看详情
           </Button>

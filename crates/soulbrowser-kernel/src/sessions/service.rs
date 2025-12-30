@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -520,8 +520,7 @@ fn compose_absolute(origin: &str, session_id: &str, token: &str) -> String {
 }
 
 fn timestamp_to_datetime(millis: i64) -> DateTime<Utc> {
-    NaiveDateTime::from_timestamp_millis(millis)
-        .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+    DateTime::<Utc>::from_timestamp_millis(millis)
         .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
 }
 

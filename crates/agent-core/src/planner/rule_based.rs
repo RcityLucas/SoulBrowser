@@ -1003,7 +1003,16 @@ fn canonical_url_for_request(request: &AgentRequest) -> String {
 }
 
 fn infer_url_from_goal(goal: &str) -> String {
+    if let Some(explicit) = extract_first_url(goal) {
+        return explicit;
+    }
+
     let lowered = goal.to_ascii_lowercase();
+
+    if lowered.contains("baidu") || goal.contains("百度") {
+        return "https://www.baidu.com".to_string();
+    }
+
     let encoded = encode_query(goal);
     if lowered.contains("github") || lowered.contains("repo") || goal.contains("仓库") {
         return format!("https://github.com/search?q={encoded}");

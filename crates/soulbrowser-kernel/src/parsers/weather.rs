@@ -103,7 +103,9 @@ fn gather_observation_text(observation: &Value) -> String {
         chunks.push(sample);
     }
 
-    if let Some(description) = text_from_candidates(observation, &["description", "data.description"]) {
+    if let Some(description) =
+        text_from_candidates(observation, &["description", "data.description"])
+    {
         chunks.push(description);
     }
 
@@ -113,7 +115,10 @@ fn gather_observation_text(observation: &Value) -> String {
         }
     }
 
-    for paragraph in collect_entries(observation, "paragraphs").into_iter().take(4) {
+    for paragraph in collect_entries(observation, "paragraphs")
+        .into_iter()
+        .take(4)
+    {
         if let Some(text) = paragraph.as_str() {
             chunks.push(text.to_string());
         }
@@ -126,7 +131,10 @@ fn gather_observation_text(observation: &Value) -> String {
         chunks.push(hero);
     }
 
-    for entry in collect_entries(observation, "key_values").into_iter().take(10) {
+    for entry in collect_entries(observation, "key_values")
+        .into_iter()
+        .take(10)
+    {
         let label = entry
             .get("label")
             .and_then(Value::as_str)

@@ -263,6 +263,7 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
             &exec_request,
             &current_session.plan,
             exec_options,
+            None,
         )
         .await?;
 

@@ -214,6 +214,18 @@ export default function ChatPage() {
         }
       }
 
+      if (!sessionIdForRequest) {
+        try {
+          const session = await soulbrowserAPI.createSession();
+          sessionIdForRequest = session.id;
+          setSessions((prev) => [session, ...prev.filter((item) => item.id !== session.id)]);
+          applySessionSelection(session.id);
+        } catch (err) {
+          console.error(err);
+          message.error('创建实时会话失败');
+        }
+      }
+
       try {
         const defaultPlanner = import.meta.env.VITE_DEFAULT_PLANNER ?? 'llm';
         const plannerPayload: Record<string, unknown> = {

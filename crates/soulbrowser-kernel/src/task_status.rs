@@ -723,6 +723,7 @@ impl TaskStatusHandle {
         if artifacts.is_empty() {
             return;
         }
+        tracing::debug!(task = %self.task_id.0, count = artifacts.len(), "push_evidence");
         if self.with_record(|record| {
             record.recent_evidence.extend(artifacts.iter().cloned());
             if record.recent_evidence.len() > MAX_RECENT_EVIDENCE {

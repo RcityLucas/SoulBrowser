@@ -582,6 +582,7 @@ async fn serve_chat_handler(
             &exec_request,
             &current_session.plan,
             exec_options,
+            Some(&handle),
         )
         .await
         {

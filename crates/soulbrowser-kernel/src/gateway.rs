@@ -441,7 +441,7 @@ fn spawn_gateway_execution(context: Arc<AppContext>, request: AgentRequest, plan
     spawn(async move {
         let task_id = request.task_id.clone();
         let task_label = task_id.0.clone();
-        match execute_plan(context, &request, &plan, opts).await {
+        match execute_plan(context, &request, &plan, opts, None).await {
             Ok(report) => {
                 info!(task = %task_label, success = report.success, "Gateway plan executed");
             }
