@@ -115,10 +115,17 @@ pub async fn collect_events(
 fn describe_raw_event(event: &RawEvent) -> String {
     match event {
         RawEvent::PageLifecycle {
-            page, frame, phase, ..
+            page,
+            frame,
+            opener,
+            phase,
+            ..
         } => {
             let frame_str = frame.map(|f| format!(" frame={:?}", f)).unwrap_or_default();
-            format!("page {:?} phase={}{}", page, phase, frame_str)
+            let opener_str = opener
+                .map(|p| format!(" opener={:?}", p))
+                .unwrap_or_default();
+            format!("page {:?} phase={}{}{}", page, phase, frame_str, opener_str)
         }
         RawEvent::PageNavigated { page, url, .. } => {
             format!("page {:?} navigated -> {}", page, url)

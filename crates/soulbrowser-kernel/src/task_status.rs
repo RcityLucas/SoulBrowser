@@ -14,7 +14,12 @@ use tokio::{runtime::Handle, sync::broadcast};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::agent::executor::SearchContext;
+use crate::visualization::build_plan_overlays;
+use agent_core::AgentPlan;
+
 use crate::judge::JudgeVerdict;
+use crate::manual_override::{ManualOverrideSnapshot, ManualRouteContext};
 use crate::metrics::record_watchdog_event;
 use crate::self_heal::SelfHealEvent;
 use crate::watchdogs::{analyze_observation, WatchdogEvent};
@@ -97,6 +102,16 @@ pub struct AgentHistoryEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_goal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_context: Option<SearchContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
@@ -137,6 +152,8 @@ pub struct TaskStatusSnapshot {
     pub observation_history: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_snapshot: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_state: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub annotations: Vec<TaskAnnotation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -153,6 +170,8 @@ pub struct TaskStatusSnapshot {
     pub self_heal_events: Vec<SelfHealEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<TaskAlert>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_override: Option<ManualOverrideSnapshot>,
 }
 
 struct TaskStatusRecord {
@@ -173,6 +192,7 @@ struct TaskStatusRecord {
     recent_evidence: Vec<Value>,
     observation_history: Vec<Value>,
     context_snapshot: Option<Value>,
+    message_state: Option<Value>,
     annotations: Vec<TaskAnnotation>,
     agent_history: Vec<AgentHistoryEntry>,
     user_results: Vec<TaskUserResult>,
@@ -181,6 +201,7 @@ struct TaskStatusRecord {
     judge_verdict: Option<TaskJudgeVerdict>,
     self_heal_events: Vec<SelfHealEvent>,
     alerts: Vec<TaskAlert>,
+    manual_override: Option<crate::manual_override::ManualOverrideSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -217,6 +238,7 @@ impl TaskStatusRecord {
             recent_evidence: Vec::new(),
             observation_history: Vec::new(),
             context_snapshot: None,
+            message_state: None,
             annotations: Vec::new(),
             agent_history: Vec::new(),
             user_results: Vec::new(),
@@ -225,6 +247,7 @@ impl TaskStatusRecord {
             judge_verdict: None,
             self_heal_events: Vec::new(),
             alerts: Vec::new(),
+            manual_override: None,
         }
     }
 
@@ -248,6 +271,7 @@ impl TaskStatusRecord {
             recent_evidence: self.recent_evidence.clone(),
             observation_history: self.observation_history.clone(),
             context_snapshot: self.context_snapshot.clone(),
+            message_state: self.message_state.clone(),
             annotations: self.annotations.clone(),
             agent_history: self.agent_history.clone(),
             user_results: self.user_results.clone(),
@@ -256,6 +280,7 @@ impl TaskStatusRecord {
             judge_verdict: self.judge_verdict.clone(),
             self_heal_events: self.self_heal_events.clone(),
             alerts: self.alerts.clone(),
+            manual_override: self.manual_override.clone(),
         }
     }
 
@@ -310,6 +335,17 @@ impl TaskStatusRegistry {
         TaskStatusHandle {
             registry: Arc::clone(self),
             task_id,
+        }
+    }
+
+    pub fn handle(self: &Arc<Self>, task_id: TaskId) -> Option<TaskStatusHandle> {
+        if self.records.contains_key(&task_id.0) {
+            Some(TaskStatusHandle {
+                registry: Arc::clone(self),
+                task_id,
+            })
+        } else {
+            None
         }
     }
 
@@ -382,6 +418,16 @@ impl TaskStatusRegistry {
         let entry = self.records.get(task_id)?;
         let record = entry.value().lock();
         record.observation_history.last().cloned()
+    }
+
+    pub fn latest_route_context(&self, task_id: &str) -> Option<ManualRouteContext> {
+        let entry = self.records.get(task_id)?;
+        let record = entry.value().lock();
+        record
+            .observation_history
+            .iter()
+            .rev()
+            .find_map(route_context_from_artifact)
     }
 
     pub fn add_annotation(&self, task_id: &str, annotation: TaskAnnotation) -> bool {
@@ -476,6 +522,14 @@ impl TaskStatusRegistry {
 
     fn emit_context(&self, task_id: &str, snapshot: Value) {
         self.push_stream_events(task_id, vec![TaskStreamEvent::context(snapshot)]);
+    }
+
+    fn emit_message_state(&self, task_id: &str, state: Value) {
+        self.push_stream_events(task_id, vec![TaskStreamEvent::message_state(state)]);
+    }
+
+    fn emit_manual_override(&self, task_id: &str, snapshot: ManualOverrideSnapshot) {
+        self.push_stream_events(task_id, vec![TaskStreamEvent::manual_override(snapshot)]);
     }
 
     fn emit_observations(&self, task_id: &str, artifacts: &[Value]) {
@@ -629,10 +683,18 @@ impl TaskStatusRegistry {
     }
 }
 
-#[derive(Clone)]
 pub struct TaskStatusHandle {
     registry: Arc<TaskStatusRegistry>,
     task_id: TaskId,
+}
+
+impl Clone for TaskStatusHandle {
+    fn clone(&self) -> Self {
+        Self {
+            registry: Arc::clone(&self.registry),
+            task_id: self.task_id.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -719,6 +781,44 @@ impl TaskStatusHandle {
         }
     }
 
+    pub fn set_message_state(&self, state: Option<Value>) {
+        let state_clone = state.clone();
+        if self.with_record(|record| {
+            record.message_state = state_clone.clone();
+            record.touch();
+        }) {
+            self.registry.emit_status(&self.task_id.0);
+            if let Some(value) = state_clone {
+                self.registry.emit_message_state(&self.task_id.0, value);
+            }
+        }
+    }
+
+    pub fn update_manual_override(&self, snapshot: ManualOverrideSnapshot) {
+        if self.with_record(|record| {
+            record.manual_override = Some(snapshot.clone());
+            record.touch();
+        }) {
+            self.registry.emit_status(&self.task_id.0);
+            self.registry
+                .emit_manual_override(&self.task_id.0, snapshot);
+        }
+    }
+
+    pub fn clear_manual_override(&self) {
+        let mut changed = false;
+        if self.with_record(|record| {
+            if record.manual_override.is_some() {
+                record.manual_override = None;
+                record.touch();
+                changed = true;
+            }
+        }) && changed
+        {
+            self.registry.emit_status(&self.task_id.0);
+        }
+    }
+
     pub fn push_evidence(&self, artifacts: &[Value]) {
         if artifacts.is_empty() {
             return;
@@ -793,6 +893,11 @@ impl TaskStatusHandle {
         }
         self.registry
             .emit_execution_overlays(&self.task_id.0, &overlays);
+    }
+
+    pub fn update_plan_timeline(&self, plan: &AgentPlan) {
+        let overlays = build_plan_overlays(plan);
+        self.set_plan_overlays(overlays);
     }
 
     pub fn mark_running(&self) {
@@ -960,6 +1065,9 @@ pub enum TaskStreamEvent {
     Context {
         context: Value,
     },
+    MessageState {
+        state: Value,
+    },
     Observation {
         #[serde(flatten)]
         observation: ObservationPayload,
@@ -985,6 +1093,9 @@ pub enum TaskStreamEvent {
     Alert {
         alert: TaskAlert,
     },
+    ManualOverride {
+        state: ManualOverrideSnapshot,
+    },
 }
 
 impl TaskStreamEvent {
@@ -994,6 +1105,7 @@ impl TaskStreamEvent {
             TaskStreamEvent::Status { .. } => "status",
             TaskStreamEvent::Log { .. } => "log",
             TaskStreamEvent::Context { .. } => "context",
+            TaskStreamEvent::MessageState { .. } => "message_state",
             TaskStreamEvent::Observation { .. } => "observation",
             TaskStreamEvent::Overlay { .. } => "overlay",
             TaskStreamEvent::Annotation { .. } => "annotation",
@@ -1002,6 +1114,7 @@ impl TaskStreamEvent {
             TaskStreamEvent::Judge { .. } => "judge",
             TaskStreamEvent::SelfHeal { .. } => "self_heal",
             TaskStreamEvent::Alert { .. } => "alert",
+            TaskStreamEvent::ManualOverride { .. } => "manual_override",
         }
     }
 }
@@ -1069,6 +1182,10 @@ impl TaskStreamEvent {
         TaskStreamEvent::Context { context: value }
     }
 
+    pub fn message_state(value: Value) -> Self {
+        TaskStreamEvent::MessageState { state: value }
+    }
+
     pub fn observation(observation: ObservationPayload) -> Self {
         TaskStreamEvent::Observation { observation }
     }
@@ -1099,6 +1216,10 @@ impl TaskStreamEvent {
 
     pub fn alert(alert: TaskAlert) -> Self {
         TaskStreamEvent::Alert { alert }
+    }
+
+    pub fn manual_override(state: ManualOverrideSnapshot) -> Self {
+        TaskStreamEvent::ManualOverride { state }
     }
 }
 
@@ -1187,6 +1308,24 @@ pub fn observation_payload_from_artifact(task_id: &str, artifact: Value) -> Obse
         recorded_at,
         artifact,
     }
+}
+
+fn route_context_from_artifact(value: &Value) -> Option<ManualRouteContext> {
+    let route = value.get("route")?;
+    let session = route.get("session")?.as_str()?.to_string();
+    let page = route
+        .get("page")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let frame = route
+        .get("frame")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    Some(ManualRouteContext {
+        session,
+        page,
+        frame,
+    })
 }
 
 fn extract_recorded_at(value: &Value) -> DateTime<Utc> {

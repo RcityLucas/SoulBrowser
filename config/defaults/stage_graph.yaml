@@ -5,15 +5,19 @@ defaults:
     - navigate: [context_url, preferred_site, search]
     - act: [auto]
     - observe: [extract_site, plugin_observer]
+    - validate: [target_guardrail]
+    - evaluate: [auto_evaluate]
     - parse: [generic_parser, llm_summary]
     - deliver: [structured, agent_note]
 
 intents:
   informational:
     stages:
-      - navigate: [context_url, preferred_site, search]
+      - navigate: [search, context_url, preferred_site]
       - act: [auto]
       - observe: [extract_site, api_observer]
+      - validate: [target_guardrail]
+      - evaluate: [auto_evaluate]
       - parse: [generic_parser, llm_summary]
       - deliver: [structured, agent_note]
   weather:
@@ -21,6 +25,7 @@ intents:
       - navigate: [search]
       - act: [auto]
       - observe: [extract_site]
+      - evaluate: [auto_evaluate]
       - parse: [weather_parser, generic_parser]
       - deliver: [structured, agent_note]
   summarize_current_page:
@@ -28,5 +33,22 @@ intents:
       - navigate: [context_url]
       - act: [auto]
       - observe: [extract_site]
+      - evaluate: [auto_evaluate]
       - parse: [llm_summary]
       - deliver: [agent_note]
+  market_quote_lookup:
+    stages:
+      - navigate: [context_url, preferred_site, search]
+      - act: [auto]
+      - observe: [extract_site]
+      - validate: [target_guardrail]
+      - parse: [generic_parser, llm_summary]
+      - deliver: [structured, agent_note]
+  search_market_info:
+    stages:
+      - navigate: [context_url, preferred_site, search]
+      - act: [auto]
+      - observe: [extract_site]
+      - validate: [target_guardrail]
+      - parse: [generic_parser, llm_summary]
+      - deliver: [structured, agent_note]

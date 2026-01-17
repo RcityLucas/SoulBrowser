@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::agent_loop::{AgentHistoryEntry, AgentOutput, BrowserStateSummary};
 use crate::errors::AgentError;
 use crate::model::AgentRequest;
 use crate::plan::{AgentPlan, AgentPlanMeta, AgentPlanStep, AgentTool, AgentToolKind, WaitMode};
@@ -19,6 +20,33 @@ pub trait LlmProvider: Send + Sync {
         previous_plan: &AgentPlan,
         error_summary: &str,
     ) -> Result<PlannerOutcome, AgentError>;
+
+    /// Decide next action(s) based on current browser state (agent loop mode).
+    ///
+    /// This method is called at each step of the agent loop to determine
+    /// what action(s) to take based on the current browser state and history.
+    ///
+    /// # Arguments
+    /// * `request` - The original agent request with goal and context
+    /// * `state` - Current browser state summary with indexed elements
+    /// * `history` - History of previous steps and their results
+    ///
+    /// # Returns
+    /// An AgentOutput containing the LLM's thinking, evaluation, memory,
+    /// next goal, and list of actions to execute.
+    async fn decide(
+        &self,
+        request: &AgentRequest,
+        state: &BrowserStateSummary,
+        history: &[AgentHistoryEntry],
+    ) -> Result<AgentOutput, AgentError> {
+        // Default implementation returns an error indicating the provider
+        // doesn't support agent loop mode.
+        let _ = (request, state, history);
+        Err(AgentError::invalid_request(
+            "This LLM provider does not support agent loop mode (decide method not implemented)",
+        ))
+    }
 }
 
 /// Deterministic provider used for tests and offline development.
@@ -44,6 +72,80 @@ impl LlmProvider for MockLlmProvider {
             request,
             Some((previous_plan, error_summary)),
         ))
+    }
+
+    async fn decide(
+        &self,
+        request: &AgentRequest,
+        state: &BrowserStateSummary,
+        history: &[AgentHistoryEntry],
+    ) -> Result<AgentOutput, AgentError> {
+        ensure_goal(request)?;
+
+        use crate::agent_loop::{AgentAction, AgentActionParams, AgentActionType};
+
+        // Mock implementation: if we've taken 3+ steps, signal done
+        if history.len() >= 3 {
+            return Ok(AgentOutput {
+                thinking: format!(
+                    "Mock thinking: After {} steps on {}, task should be complete.",
+                    history.len(),
+                    state.url
+                ),
+                evaluation_previous_goal: Some("Previous step completed successfully".to_string()),
+                memory: Some(format!("Completed {} steps", history.len())),
+                next_goal: "Signal task completion".to_string(),
+                actions: vec![AgentAction {
+                    action_type: AgentActionType::Done,
+                    element_index: None,
+                    params: AgentActionParams {
+                        done_success: Some(true),
+                        done_text: Some(format!(
+                            "Mock task completed after {} steps",
+                            history.len()
+                        )),
+                        ..Default::default()
+                    },
+                }],
+            });
+        }
+
+        // Otherwise, return a mock action based on element availability
+        let action = if state.element_count > 0 {
+            AgentAction {
+                action_type: AgentActionType::Click,
+                element_index: Some(0),
+                params: AgentActionParams::default(),
+            }
+        } else {
+            AgentAction {
+                action_type: AgentActionType::Wait,
+                element_index: None,
+                params: AgentActionParams {
+                    ms: Some(1000),
+                    ..Default::default()
+                },
+            }
+        };
+
+        Ok(AgentOutput {
+            thinking: format!(
+                "Mock thinking: Analyzing page at {} with {} elements.",
+                state.url, state.element_count
+            ),
+            evaluation_previous_goal: if history.is_empty() {
+                None
+            } else {
+                Some("Previous action completed".to_string())
+            },
+            memory: Some(format!(
+                "Step {} of task: {}",
+                history.len() + 1,
+                request.goal
+            )),
+            next_goal: format!("Continue task execution (step {})", history.len() + 1),
+            actions: vec![action],
+        })
     }
 }
 

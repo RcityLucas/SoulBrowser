@@ -4,6 +4,7 @@
 //! data structures and traits that the higher layers will wire against while the concrete
 //! implementation is filled in milestone by milestone.
 
+use serde::{Deserialize, Serialize};
 use std::{env, path::PathBuf};
 use tokio::sync::broadcast;
 use which::which;
@@ -134,6 +135,7 @@ pub mod events {
             page: PageId,
             frame: Option<FrameId>,
             parent: Option<FrameId>,
+            opener: Option<PageId>,
             phase: String,
             ts: u64,
         },
@@ -194,6 +196,7 @@ pub mod config {
         pub retry_backoff_ms: u64,
         pub websocket_url: Option<String>,
         pub heartbeat_interval_ms: u64,
+        pub remote_debugging_addr: Option<String>,
     }
 
     impl Default for CdpConfig {
@@ -201,12 +204,34 @@ pub mod config {
             Self {
                 executable: default_chrome_path(),
                 user_data_dir: default_profile_dir(),
-                headless: true,
+                headless: resolve_headless_default(),
                 default_deadline_ms: 30_000,
                 retry_backoff_ms: 250,
                 websocket_url: None,
                 heartbeat_interval_ms: 15_000,
+                remote_debugging_addr: resolve_debugger_bind_addr(),
             }
+        }
+    }
+
+    fn resolve_headless_default() -> bool {
+        // Check SOUL_HEADLESS env var: "0", "false", "no", "off" means headful
+        match env::var("SOUL_HEADLESS") {
+            Ok(value) => {
+                let lower = value.to_ascii_lowercase();
+                !matches!(lower.as_str(), "0" | "false" | "no" | "off")
+            }
+            Err(_) => true, // Default to headless if not specified
+        }
+    }
+
+    fn resolve_debugger_bind_addr() -> Option<String> {
+        match env::var("SOUL_MANUAL_TAKEOVER_BIND_ADDR") {
+            Ok(value) => {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            Err(_) => None,
         }
     }
 
@@ -222,6 +247,13 @@ pub mod config {
         let default = Path::new("./.soulbrowser-profile");
         default.into()
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebuggerEndpoint {
+    pub ws_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspect_url: Option<String>,
 }
 
 fn detect_chrome_executable() -> Option<PathBuf> {
@@ -457,7 +489,7 @@ pub mod adapter {
     use super::transport::{
         CdpTransport, ChromiumTransport, CommandTarget, NoopTransport, TransportEvent,
     };
-    use super::{chrome_mode, resolve_chrome_path, AdapterMode, ChromeMode};
+    use super::{chrome_mode, resolve_chrome_path, AdapterMode, ChromeMode, DebuggerEndpoint};
     use async_trait::async_trait;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
@@ -768,6 +800,13 @@ pub mod adapter {
             Arc::clone(&self.registry)
         }
 
+        pub async fn debugger_endpoint(&self, page: PageId) -> Option<DebuggerEndpoint> {
+            let context = self.registry.get(&page)?;
+            let target_id = context.target_id.as_ref()?;
+            let base = self.transport.debugger_base().await?;
+            Some(base.endpoint_for_target(target_id))
+        }
+
         pub fn cancel_token(&self) -> CancellationToken {
             self.shutdown.clone()
         }
@@ -907,6 +946,15 @@ pub mod adapter {
         }
 
         pub async fn start(self: Arc<Self>) -> Result<(), AdapterError> {
+            // Check if already started (idempotent)
+            {
+                let guard = self.tasks.lock().await;
+                if !guard.is_empty() {
+                    // Already started, nothing to do
+                    return Ok(());
+                }
+            }
+
             {
                 let mut maintenance = self.tap_maintenance.lock().await;
                 if maintenance.is_none() {
@@ -1106,7 +1154,7 @@ pub mod adapter {
             let had_pages = !existing_pages.is_empty();
 
             for page in existing_pages {
-                self.emit_page_event(page, None, None, "closed", timestamp_now());
+                self.emit_page_event(page, None, None, None, "closed", timestamp_now());
                 self.schedule_tap_disable(page);
                 self.registry.remove_page(&page);
             }
@@ -1212,7 +1260,11 @@ pub mod adapter {
                 self.registry.set_recent_url(&page_id, url);
             }
 
-            self.emit_page_event(page_id, None, None, "opened", timestamp_now());
+            let opener = payload
+                .target_info
+                .opener_id
+                .and_then(|opener_id| self.targets.get(&opener_id).map(|entry| *entry.value()));
+            self.emit_page_event(page_id, None, None, opener, "opened", timestamp_now());
             Ok(())
         }
 
@@ -1227,7 +1279,7 @@ pub mod adapter {
                 self.page_activity.remove(&page);
                 self.registry.remove_page(&page);
                 self.schedule_tap_disable(page);
-                self.emit_page_event(page, None, None, "closed", timestamp_now());
+                self.emit_page_event(page, None, None, None, "closed", timestamp_now());
             }
             Ok(())
         }
@@ -1247,7 +1299,7 @@ pub mod adapter {
                 self.sessions.insert(payload.session_id.clone(), page);
                 self.registry
                     .set_cdp_session(&page, payload.session_id.clone());
-                self.emit_page_event(page, None, None, "focus", timestamp_now());
+                self.emit_page_event(page, None, None, None, "focus", timestamp_now());
             }
 
             Ok(())
@@ -1279,7 +1331,7 @@ pub mod adapter {
                     .timestamp
                     .map(|t| (t * 1_000.0) as u64)
                     .unwrap_or_else(timestamp_now);
-                self.emit_page_event(page_id, frame_id, None, &phase, ts);
+                self.emit_page_event(page_id, frame_id, None, None, &phase, ts);
             }
 
             Ok(())
@@ -1308,6 +1360,7 @@ pub mod adapter {
                     page,
                     Some(frame_id),
                     parent,
+                    None,
                     "frame_attached",
                     timestamp_now(),
                 );
@@ -1326,6 +1379,7 @@ pub mod adapter {
                 self.emit_page_event(
                     entry.page,
                     Some(entry.frame),
+                    None,
                     None,
                     "frame_detached",
                     timestamp_now(),
@@ -1428,6 +1482,7 @@ pub mod adapter {
             page: PageId,
             frame: Option<FrameId>,
             parent: Option<FrameId>,
+            opener: Option<PageId>,
             phase: &str,
             ts: u64,
         ) {
@@ -1436,6 +1491,7 @@ pub mod adapter {
                 page,
                 frame,
                 parent,
+                opener,
                 phase: phase.to_string(),
                 ts,
             });
@@ -1602,6 +1658,26 @@ pub mod adapter {
             self.bus.subscribe()
         }
 
+        pub async fn dispatch_mouse_event(
+            &self,
+            page: PageId,
+            payload: Value,
+        ) -> Result<(), AdapterError> {
+            self.send_page_command(page, "Input.dispatchMouseEvent", payload)
+                .await
+                .map(|_| ())
+        }
+
+        pub async fn insert_text_event(
+            &self,
+            page: PageId,
+            text: &str,
+        ) -> Result<(), AdapterError> {
+            self.send_page_command(page, "Input.insertText", json!({ "text": text }))
+                .await
+                .map(|_| ())
+        }
+
         async fn ensure_initial_page(&self) -> Result<(), AdapterError> {
             if self
                 .registry
@@ -1674,6 +1750,8 @@ pub mod adapter {
         #[serde(rename = "type")]
         target_type: String,
         url: Option<String>,
+        #[serde(rename = "openerId")]
+        opener_id: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -2396,20 +2474,17 @@ function(targetValue, matchLabel) {
                 )
                 .await;
             let mut params = serde_json::Map::new();
-            let whitelist = config
+            // Note: The CDP parameter is "computedStyles", not "computedStyleWhitelist"
+            let computed_styles = config
                 .computed_style_whitelist
                 .into_iter()
                 .map(Value::String)
                 .collect::<Vec<Value>>();
-            params.insert("computedStyleWhitelist".into(), Value::Array(whitelist));
-            if config.include_event_listeners {
-                params.insert("includeEventListeners".into(), Value::Bool(true));
-            }
+            params.insert("computedStyles".into(), Value::Array(computed_styles));
+            // Note: includePaintOrder and includeDOMRects are valid CDP parameters
+            // includeEventListeners and includeUserAgentShadowTree are not valid for captureSnapshot
             if config.include_paint_order {
                 params.insert("includePaintOrder".into(), Value::Bool(true));
-            }
-            if config.include_user_agent_shadow_tree {
-                params.insert("includeUserAgentShadowTree".into(), Value::Bool(true));
             }
 
             let response = self

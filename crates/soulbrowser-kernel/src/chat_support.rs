@@ -1,4 +1,4 @@
-use std::{env, fmt, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, env, fmt, path::Path, sync::Arc, time::Duration};
 
 use agent_core::{AgentContext, AgentRequest, LlmProvider, MockLlmProvider};
 use anyhow::{anyhow, Context, Result};
@@ -8,14 +8,16 @@ use serde_json::{json, Value};
 use soulbrowser_core_types::TaskId;
 use tokio::fs;
 use tokio::time::timeout;
-use tracing::{instrument, warn};
+use tracing::{info, instrument, warn};
 
-use crate::agent::executor::UserResult;
+use crate::agent::executor::{ExecutionMemoryEntry, UserResult};
+use crate::agent::message_manager::MessageManager;
 use crate::agent::{ChatRunner, ChatSessionOutput, FlowExecutionReport, StepExecutionStatus};
 use crate::console_fixture::PerceptionExecResult;
 use crate::llm::{
     anthropic::{ClaudeConfig, ClaudeLlmProvider},
     openai::{OpenAiConfig, OpenAiLlmProvider},
+    zhipu::{ZhipuConfig, ZhipuLlmProvider},
     LlmPlanCache,
 };
 use crate::perception_service::{PerceptionJob, PerceptionOutput};
@@ -25,6 +27,7 @@ use crate::task_status::{
     AgentHistoryEntry, AgentHistoryStatus, TaskStatusHandle, TaskStatusRegistry,
     TaskStatusSnapshot, TaskUserResult,
 };
+use crate::tool_registry::ToolRegistry;
 use crate::visualization::execution_artifacts_from_report;
 use soulbrowser_state_center::StateEvent;
 
@@ -55,6 +58,9 @@ impl PlannerSelection {
 pub enum LlmProviderSelection {
     OpenAi,
     Anthropic,
+    ZhiPu,
+    DeepSeek,
+    Gemini,
     Mock,
 }
 
@@ -68,7 +74,10 @@ impl LlmProviderSelection {
     pub fn from_str_case(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "openai" => Some(Self::OpenAi),
-            "anthropic" => Some(Self::Anthropic),
+            "anthropic" | "claude" => Some(Self::Anthropic),
+            "zhipu" | "glm" | "chatglm" => Some(Self::ZhiPu),
+            "deepseek" => Some(Self::DeepSeek),
+            "gemini" | "google" => Some(Self::Gemini),
             "mock" => Some(Self::Mock),
             _ => None,
         }
@@ -78,6 +87,9 @@ impl LlmProviderSelection {
         match self {
             LlmProviderSelection::OpenAi => "openai",
             LlmProviderSelection::Anthropic => "anthropic",
+            LlmProviderSelection::ZhiPu => "zhipu",
+            LlmProviderSelection::DeepSeek => "deepseek",
+            LlmProviderSelection::Gemini => "gemini",
             LlmProviderSelection::Mock => "mock",
         }
     }
@@ -89,15 +101,39 @@ pub struct LlmProviderConfig {
     pub api_base: Option<String>,
     pub temperature: Option<f32>,
     pub api_key: Option<String>,
+    pub backup_api_key: Option<String>,
     pub max_output_tokens: Option<u32>,
+    /// Provider-specific API keys from config file
+    pub openai_api_key: Option<String>,
+    pub zhipu_api_key: Option<String>,
+    pub anthropic_api_key: Option<String>,
+    pub deepseek_api_key: Option<String>,
+    pub gemini_api_key: Option<String>,
+    /// Provider-specific API base URLs from config file
+    pub openai_api_base: Option<String>,
+    pub zhipu_api_base: Option<String>,
+    pub anthropic_api_base: Option<String>,
+    pub deepseek_api_base: Option<String>,
+    pub gemini_api_base: Option<String>,
+    /// Provider-specific models from config file
+    pub openai_model: Option<String>,
+    pub zhipu_model: Option<String>,
+    pub anthropic_model: Option<String>,
+    pub deepseek_model: Option<String>,
+    pub gemini_model: Option<String>,
 }
 
 const OPENAI_KEY_ENV_VARS: &[&str] = &["SOULBROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"];
+const OPENAI_BACKUP_KEY_ENV_VARS: &[&str] =
+    &["SOULBROWSER_OPENAI_BACKUP_KEY", "OPENAI_BACKUP_API_KEY"];
 const ANTHROPIC_KEY_ENV_VARS: &[&str] = &[
     "SOULBROWSER_CLAUDE_API_KEY",
     "CLAUDE_API_KEY",
     "ANTHROPIC_API_KEY",
 ];
+const ZHIPU_KEY_ENV_VARS: &[&str] = &["SOULBROWSER_ZHIPU_API_KEY", "ZHIPU_API_KEY", "GLM_API_KEY"];
+const DEEPSEEK_KEY_ENV_VARS: &[&str] = &["SOULBROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"];
+const GEMINI_KEY_ENV_VARS: &[&str] = &["SOULBROWSER_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"];
 
 #[derive(Clone)]
 pub struct ChatRunnerBuild {
@@ -105,6 +141,7 @@ pub struct ChatRunnerBuild {
     pub planner_used: PlannerSelection,
     pub provider_used: Option<LlmProviderSelection>,
     pub fallback_reason: Option<String>,
+    pub llm_backend: Option<Arc<dyn LlmProvider>>,
 }
 
 pub fn build_chat_runner(
@@ -120,29 +157,62 @@ pub fn build_chat_runner(
             planner_used: PlannerSelection::Rule,
             provider_used: None,
             fallback_reason: None,
+            llm_backend: None,
         }),
         PlannerSelection::Llm => {
-            if let Some(choice) = resolve_provider_selection(provider) {
+            if let Some(choice) = resolve_provider_selection(provider, &config) {
+                // Try primary provider first
                 match build_llm_provider(choice, &config) {
                     Ok(llm) => Ok(ChatRunnerBuild {
-                        runner: ChatRunner::default().with_llm_backend(llm, cache),
+                        runner: ChatRunner::default().with_llm_backend(Arc::clone(&llm), cache),
                         planner_used: PlannerSelection::Llm,
                         provider_used: Some(choice),
                         fallback_reason: None,
+                        llm_backend: Some(llm),
                     }),
                     Err(err) => {
                         if choice != LlmProviderSelection::Mock
                             && err.downcast_ref::<MissingApiKeyError>().is_some()
                         {
+                            // Try fallback providers (ZhiPu, Claude, etc.)
+                            let fallbacks = get_fallback_providers(choice, &config);
+                            for fallback_provider in fallbacks {
+                                match build_llm_provider(fallback_provider, &config) {
+                                    Ok(llm) => {
+                                        warn!(
+                                            primary = ?choice,
+                                            fallback = ?fallback_provider,
+                                            "Primary LLM provider unavailable; using fallback provider"
+                                        );
+                                        return Ok(ChatRunnerBuild {
+                                            runner: ChatRunner::default()
+                                                .with_llm_backend(Arc::clone(&llm), cache),
+                                            planner_used: PlannerSelection::Llm,
+                                            provider_used: Some(fallback_provider),
+                                            fallback_reason: Some(format!(
+                                                "Primary provider {} unavailable: {}; using {}",
+                                                choice.label(),
+                                                err,
+                                                fallback_provider.label()
+                                            )),
+                                            llm_backend: Some(llm),
+                                        });
+                                    }
+                                    Err(_) => continue,
+                                }
+                            }
+
+                            // No fallback providers available, fall back to rule-based
                             warn!(
                                 provider = ?choice,
-                                "LLM provider missing API key; falling back to rule-based planner"
+                                "LLM provider missing API key and no fallback available; falling back to rule-based planner"
                             );
                             Ok(ChatRunnerBuild {
                                 runner: ChatRunner::default(),
                                 planner_used: PlannerSelection::Rule,
                                 provider_used: None,
                                 fallback_reason: Some(format!("LLM planner disabled: {}", err)),
+                                llm_backend: None,
                             })
                         } else {
                             Err(err)
@@ -160,6 +230,7 @@ pub fn build_chat_runner(
                     fallback_reason: Some(
                         "LLM planner disabled: no provider configured".to_string(),
                     ),
+                    llm_backend: None,
                 })
             }
         }
@@ -204,40 +275,166 @@ fn build_llm_provider(
     match selection {
         LlmProviderSelection::OpenAi => build_openai_provider(config),
         LlmProviderSelection::Anthropic => build_anthropic_provider(config),
+        LlmProviderSelection::ZhiPu => build_zhipu_provider(config),
+        LlmProviderSelection::DeepSeek => build_deepseek_provider(config),
+        LlmProviderSelection::Gemini => build_gemini_provider(config),
         LlmProviderSelection::Mock => Ok(Arc::new(MockLlmProvider::default())),
     }
 }
 
 fn resolve_provider_selection(
     requested: Option<LlmProviderSelection>,
+    config: &LlmProviderConfig,
 ) -> Option<LlmProviderSelection> {
     match requested {
         Some(selection) => Some(selection),
         None => {
-            if env_secret_available(OPENAI_KEY_ENV_VARS) {
+            // Auto-detect available provider in priority order: DeepSeek > OpenAI > ZhiPu > Anthropic
+            // Check both config file keys (validated through sanitize_secret) and environment variables
+            if config_key_valid(&config.deepseek_api_key)
+                || env_secret_available(DEEPSEEK_KEY_ENV_VARS)
+            {
+                info!(
+                    "Auto-selected DeepSeek provider (config_key={}, env_key={})",
+                    config_key_valid(&config.deepseek_api_key),
+                    env_secret_available(DEEPSEEK_KEY_ENV_VARS)
+                );
+                Some(LlmProviderSelection::DeepSeek)
+            } else if config_key_valid(&config.openai_api_key)
+                || env_secret_available(OPENAI_KEY_ENV_VARS)
+            {
+                info!(
+                    "Auto-selected OpenAI provider (config_key={}, env_key={})",
+                    config_key_valid(&config.openai_api_key),
+                    env_secret_available(OPENAI_KEY_ENV_VARS)
+                );
                 Some(LlmProviderSelection::OpenAi)
-            } else if env_secret_available(ANTHROPIC_KEY_ENV_VARS) {
+            } else if config_key_valid(&config.zhipu_api_key)
+                || env_secret_available(ZHIPU_KEY_ENV_VARS)
+            {
+                info!(
+                    "Auto-selected ZhiPu provider (config_key={}, env_key={})",
+                    config_key_valid(&config.zhipu_api_key),
+                    env_secret_available(ZHIPU_KEY_ENV_VARS)
+                );
+                Some(LlmProviderSelection::ZhiPu)
+            } else if config_key_valid(&config.anthropic_api_key)
+                || env_secret_available(ANTHROPIC_KEY_ENV_VARS)
+            {
+                info!(
+                    "Auto-selected Anthropic provider (config_key={}, env_key={})",
+                    config_key_valid(&config.anthropic_api_key),
+                    env_secret_available(ANTHROPIC_KEY_ENV_VARS)
+                );
                 Some(LlmProviderSelection::Anthropic)
+            } else if config_key_valid(&config.gemini_api_key)
+                || env_secret_available(GEMINI_KEY_ENV_VARS)
+            {
+                info!(
+                    "Auto-selected Gemini provider (config_key={}, env_key={})",
+                    config_key_valid(&config.gemini_api_key),
+                    env_secret_available(GEMINI_KEY_ENV_VARS)
+                );
+                Some(LlmProviderSelection::Gemini)
             } else {
+                warn!("No LLM provider configured - deepseek={:?}, openai={:?}, zhipu={:?}, anthropic={:?}, gemini={:?}",
+                    config.deepseek_api_key.as_ref().map(|k| format!("{}...", &k[..k.len().min(8)])),
+                    config.openai_api_key.as_ref().map(|k| format!("{}...", &k[..k.len().min(8)])),
+                    config.zhipu_api_key.as_ref().map(|k| format!("{}...", &k[..k.len().min(8)])),
+                    config.anthropic_api_key.as_ref().map(|k| format!("{}...", &k[..k.len().min(8)])),
+                    config.gemini_api_key.as_ref().map(|k| format!("{}...", &k[..k.len().min(8)])));
                 None
             }
         }
     }
 }
 
+/// Check if a config API key is valid (non-empty after sanitization)
+fn config_key_valid(key: &Option<String>) -> bool {
+    key.as_ref().and_then(|k| sanitize_secret(k)).is_some()
+}
+
+/// Returns a list of fallback providers to try when the primary provider fails.
+/// Order: DeepSeek -> OpenAI -> ZhiPu -> Anthropic (Claude)
+/// Checks both config-based API keys and environment variables.
+fn get_fallback_providers(
+    primary: LlmProviderSelection,
+    config: &LlmProviderConfig,
+) -> Vec<LlmProviderSelection> {
+    let mut fallbacks = Vec::new();
+
+    // Check DeepSeek
+    if primary != LlmProviderSelection::DeepSeek
+        && (config_key_valid(&config.deepseek_api_key)
+            || env_secret_available(DEEPSEEK_KEY_ENV_VARS))
+    {
+        fallbacks.push(LlmProviderSelection::DeepSeek);
+    }
+
+    // Check OpenAI
+    if primary != LlmProviderSelection::OpenAi
+        && (config_key_valid(&config.openai_api_key) || env_secret_available(OPENAI_KEY_ENV_VARS))
+    {
+        fallbacks.push(LlmProviderSelection::OpenAi);
+    }
+
+    // Check ZhiPu
+    if primary != LlmProviderSelection::ZhiPu
+        && (config_key_valid(&config.zhipu_api_key) || env_secret_available(ZHIPU_KEY_ENV_VARS))
+    {
+        fallbacks.push(LlmProviderSelection::ZhiPu);
+    }
+
+    // Check Anthropic
+    if primary != LlmProviderSelection::Anthropic
+        && (config_key_valid(&config.anthropic_api_key)
+            || env_secret_available(ANTHROPIC_KEY_ENV_VARS))
+    {
+        fallbacks.push(LlmProviderSelection::Anthropic);
+    }
+
+    // Check Gemini
+    if primary != LlmProviderSelection::Gemini
+        && (config_key_valid(&config.gemini_api_key)
+            || env_secret_available(GEMINI_KEY_ENV_VARS))
+    {
+        fallbacks.push(LlmProviderSelection::Gemini);
+    }
+
+    fallbacks
+}
+
 fn build_openai_provider(config: &LlmProviderConfig) -> Result<Arc<dyn LlmProvider>> {
-    let api_key = resolve_api_key(&config.api_key, OPENAI_KEY_ENV_VARS)?;
+    // Priority: openai_api_key (from config) > api_key (legacy) > env vars
+    let api_key_source = config.openai_api_key.as_ref().or(config.api_key.as_ref());
+    let primary = resolve_api_key(&api_key_source.cloned(), OPENAI_KEY_ENV_VARS)?;
+    let mut api_keys = vec![primary];
+    if let Some(backup) =
+        resolve_optional_api_key(&config.backup_api_key, OPENAI_BACKUP_KEY_ENV_VARS)
+    {
+        if !backup.is_empty()
+            && api_keys
+                .iter()
+                .all(|existing| !existing.eq_ignore_ascii_case(&backup))
+        {
+            api_keys.push(backup);
+        }
+    }
+    // Priority: openai_model (provider-specific) > model (request) > default
     let model = config
-        .model
+        .openai_model
         .clone()
+        .or_else(|| config.model.clone())
         .unwrap_or_else(|| "gpt-4o-mini".to_string());
+    // Priority: openai_api_base (provider-specific) > api_base (request) > default
     let api_base = config
-        .api_base
+        .openai_api_base
         .clone()
+        .or_else(|| config.api_base.clone())
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
     let temperature = config.temperature.unwrap_or(0.2);
     let provider = OpenAiLlmProvider::new(OpenAiConfig {
-        api_key,
+        api_keys,
         model,
         api_base,
         temperature,
@@ -248,14 +445,23 @@ fn build_openai_provider(config: &LlmProviderConfig) -> Result<Arc<dyn LlmProvid
 }
 
 fn build_anthropic_provider(config: &LlmProviderConfig) -> Result<Arc<dyn LlmProvider>> {
-    let api_key = resolve_api_key(&config.api_key, ANTHROPIC_KEY_ENV_VARS)?;
+    // Priority: anthropic_api_key (from config) > api_key (legacy) > env vars
+    let api_key_source = config
+        .anthropic_api_key
+        .as_ref()
+        .or(config.api_key.as_ref());
+    let api_key = resolve_api_key(&api_key_source.cloned(), ANTHROPIC_KEY_ENV_VARS)?;
+    // Priority: anthropic_model (provider-specific) > model (request) > default
     let model = config
-        .model
+        .anthropic_model
         .clone()
+        .or_else(|| config.model.clone())
         .unwrap_or_else(|| "claude-3-5-sonnet-20240620".to_string());
+    // Priority: anthropic_api_base (provider-specific) > api_base (request) > default
     let api_base = config
-        .api_base
+        .anthropic_api_base
         .clone()
+        .or_else(|| config.api_base.clone())
         .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
     let temperature = config.temperature.unwrap_or(0.2);
     let max_tokens = config.max_output_tokens.unwrap_or(2_000);
@@ -271,6 +477,103 @@ fn build_anthropic_provider(config: &LlmProviderConfig) -> Result<Arc<dyn LlmPro
     Ok(Arc::new(provider))
 }
 
+fn build_zhipu_provider(config: &LlmProviderConfig) -> Result<Arc<dyn LlmProvider>> {
+    // Priority: zhipu_api_key (from config) > api_key (legacy) > env vars
+    let api_key_source = config.zhipu_api_key.as_ref().or(config.api_key.as_ref());
+    let api_key = resolve_api_key(&api_key_source.cloned(), ZHIPU_KEY_ENV_VARS)?;
+    // Priority: zhipu_model (provider-specific) > model (request) > default
+    let model = config
+        .zhipu_model
+        .clone()
+        .or_else(|| config.model.clone())
+        .unwrap_or_else(|| "glm-4-flash".to_string());
+    // Priority: zhipu_api_base (provider-specific) > api_base (request) > default
+    let api_base = config
+        .zhipu_api_base
+        .clone()
+        .or_else(|| config.api_base.clone())
+        .unwrap_or_else(|| "https://open.bigmodel.cn/api/paas/v4".to_string());
+    let temperature = config.temperature.unwrap_or(0.2);
+    let provider = ZhipuLlmProvider::new(ZhipuConfig {
+        api_key,
+        model,
+        api_base,
+        temperature,
+        timeout: Duration::from_secs(60),
+    })
+    .map_err(|err| anyhow!("failed to configure ZhiPu provider: {err}"))?;
+    Ok(Arc::new(provider))
+}
+
+fn build_deepseek_provider(config: &LlmProviderConfig) -> Result<Arc<dyn LlmProvider>> {
+    // Priority: deepseek_api_key (from config) > api_key (legacy) > env vars
+    let api_key_source = config.deepseek_api_key.as_ref().or(config.api_key.as_ref());
+    let api_key = resolve_api_key(&api_key_source.cloned(), DEEPSEEK_KEY_ENV_VARS)?;
+    // Priority: deepseek_model (provider-specific) > model (request) > default
+    let model = config
+        .deepseek_model
+        .clone()
+        .or_else(|| config.model.clone())
+        .unwrap_or_else(|| "deepseek-chat".to_string());
+    // Priority: deepseek_api_base (provider-specific) > api_base (request) > default
+    let api_base = config
+        .deepseek_api_base
+        .clone()
+        .or_else(|| config.api_base.clone())
+        .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
+    let temperature = config.temperature.unwrap_or(0.2);
+    info!(
+        model = %model,
+        api_base = %api_base,
+        "Building DeepSeek provider"
+    );
+    // DeepSeek uses OpenAI-compatible API
+    let provider = OpenAiLlmProvider::new(OpenAiConfig {
+        api_keys: vec![api_key],
+        model,
+        api_base,
+        temperature,
+        timeout: Duration::from_secs(60),
+    })
+    .map_err(|err| anyhow!("failed to configure DeepSeek provider: {err}"))?;
+    Ok(Arc::new(provider))
+}
+
+fn build_gemini_provider(config: &LlmProviderConfig) -> Result<Arc<dyn LlmProvider>> {
+    // Priority: gemini_api_key (from config) > api_key (legacy) > env vars
+    let api_key_source = config.gemini_api_key.as_ref().or(config.api_key.as_ref());
+    let api_key = resolve_api_key(&api_key_source.cloned(), GEMINI_KEY_ENV_VARS)?;
+    // Priority: gemini_model (provider-specific) > model (request) > default
+    let model = config
+        .gemini_model
+        .clone()
+        .or_else(|| config.model.clone())
+        .unwrap_or_else(|| "gemini-2.0-flash".to_string());
+    // Priority: gemini_api_base (provider-specific) > api_base (request) > default
+    // Gemini has an OpenAI-compatible endpoint
+    let api_base = config
+        .gemini_api_base
+        .clone()
+        .or_else(|| config.api_base.clone())
+        .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta/openai".to_string());
+    let temperature = config.temperature.unwrap_or(0.2);
+    info!(
+        model = %model,
+        api_base = %api_base,
+        "Building Gemini provider"
+    );
+    // Gemini uses OpenAI-compatible API
+    let provider = OpenAiLlmProvider::new(OpenAiConfig {
+        api_keys: vec![api_key],
+        model,
+        api_base,
+        temperature,
+        timeout: Duration::from_secs(60),
+    })
+    .map_err(|err| anyhow!("failed to configure Gemini provider: {err}"))?;
+    Ok(Arc::new(provider))
+}
+
 fn resolve_api_key(
     source: &Option<String>,
     env_keys: &'static [&'static str],
@@ -279,20 +582,29 @@ fn resolve_api_key(
         return Ok(value);
     }
     for key in env_keys {
-        if let Some(value) = env::var(key).ok().and_then(|raw| sanitize_secret(&raw)) {
+        if let Some(value) = env_secret_value(key) {
             return Ok(value);
         }
     }
     Err(MissingApiKeyError::new(env_keys))
 }
 
+fn resolve_optional_api_key(
+    source: &Option<String>,
+    env_keys: &'static [&'static str],
+) -> Option<String> {
+    if let Some(value) = source.as_ref().and_then(|raw| sanitize_secret(raw)) {
+        return Some(value);
+    }
+    env_keys.iter().find_map(|key| env_secret_value(key))
+}
+
 fn env_secret_available(env_keys: &[&str]) -> bool {
-    env_keys.iter().any(|key| {
-        env::var(key)
-            .ok()
-            .and_then(|value| sanitize_secret(&value))
-            .is_some()
-    })
+    env_keys.iter().any(|key| env_secret_value(key).is_some())
+}
+
+fn env_secret_value(key: &str) -> Option<String> {
+    env::var(key).ok().and_then(|value| sanitize_secret(&value))
 }
 
 #[derive(Debug)]
@@ -382,9 +694,14 @@ mod tests {
             &[
                 ("SOULBROWSER_OPENAI_API_KEY", Some("…")),
                 ("SOULBROWSER_CLAUDE_API_KEY", None),
+                ("SOULBROWSER_DEEPSEEK_API_KEY", None),
+                ("DEEPSEEK_API_KEY", None),
             ],
             || {
-                assert_eq!(resolve_provider_selection(None), None);
+                assert_eq!(
+                    resolve_provider_selection(None, &LlmProviderConfig::default()),
+                    None
+                );
             },
         );
     }
@@ -395,8 +712,34 @@ mod tests {
             &[("SOULBROWSER_OPENAI_API_KEY", Some("sk-example-key"))],
             || {
                 assert_eq!(
-                    resolve_provider_selection(Some(LlmProviderSelection::Mock)),
+                    resolve_provider_selection(
+                        Some(LlmProviderSelection::Mock),
+                        &LlmProviderConfig::default()
+                    ),
                     Some(LlmProviderSelection::Mock)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn provider_selection_prefers_deepseek_from_config() {
+        with_env_vars(
+            &[
+                ("SOULBROWSER_OPENAI_API_KEY", None),
+                ("OPENAI_API_KEY", None),
+                ("SOULBROWSER_DEEPSEEK_API_KEY", None),
+                ("DEEPSEEK_API_KEY", None),
+            ],
+            || {
+                let config = LlmProviderConfig {
+                    deepseek_api_key: Some("sk-deepseek-test".to_string()),
+                    openai_api_key: Some("sk-openai-test".to_string()),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    resolve_provider_selection(None, &config),
+                    Some(LlmProviderSelection::DeepSeek)
                 );
             },
         );
@@ -434,10 +777,12 @@ mod tests {
             &[
                 ("SOULBROWSER_OPENAI_API_KEY", None),
                 ("OPENAI_API_KEY", Some("sk-generic")),
+                ("SOULBROWSER_DEEPSEEK_API_KEY", None),
+                ("DEEPSEEK_API_KEY", None),
             ],
             || {
                 assert_eq!(
-                    resolve_provider_selection(None),
+                    resolve_provider_selection(None, &LlmProviderConfig::default()),
                     Some(LlmProviderSelection::OpenAi)
                 );
             },
@@ -459,6 +804,40 @@ pub fn propagate_browser_state_metadata(request: &mut AgentRequest, snapshot: Op
             .metadata
             .insert("browser_context".to_string(), state.clone());
     }
+}
+
+pub fn apply_tool_registry_prompt(
+    request: &mut AgentRequest,
+    registry: &ToolRegistry,
+    max_entries: usize,
+) {
+    if let Some(prompt) = registry.prompt_for_llm(max_entries) {
+        request
+            .metadata
+            .insert("tool_registry_prompt".to_string(), Value::String(prompt));
+    }
+}
+
+pub fn apply_message_manager_metadata(request: &mut AgentRequest, manager: &MessageManager) {
+    request.metadata.insert(
+        "agent_task_prompt".to_string(),
+        Value::String(manager.task_prompt()),
+    );
+    if let Some(history) = manager.agent_history_prompt() {
+        request
+            .metadata
+            .insert("agent_history_prompt".to_string(), Value::String(history));
+    } else {
+        request.metadata.remove("agent_history_prompt");
+    }
+}
+
+fn agent_state_field(state: &Option<Value>, key: &str) -> Option<String> {
+    state
+        .as_ref()
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
 }
 
 pub fn apply_perception_metadata(context: &mut AgentContext, snapshot: &PerceptionExecResult) {
@@ -597,6 +976,27 @@ pub fn latest_obstruction_kind(
         })
 }
 
+pub fn failed_step_context(report: &FlowExecutionReport) -> (Option<String>, Option<String>) {
+    report
+        .steps
+        .iter()
+        .rev()
+        .find(|step| matches!(step.status, StepExecutionStatus::Failed))
+        .map(|step| (step.observation_summary.clone(), step.blocker_kind.clone()))
+        .unwrap_or((None, None))
+}
+
+pub fn guardrail_requires_replan(report: &FlowExecutionReport) -> bool {
+    report
+        .steps
+        .iter()
+        .rev()
+        .find(|step| matches!(step.status, StepExecutionStatus::Failed))
+        .and_then(|step| step.blocker_kind.as_deref())
+        .map(|kind| matches!(kind, "page_not_found" | "url_mismatch"))
+        .unwrap_or(false)
+}
+
 pub fn agent_history_prompt(
     registry: &Arc<TaskStatusRegistry>,
     task_id: &TaskId,
@@ -652,12 +1052,27 @@ pub fn build_telemetry_payload(snapshot: &TaskStatusSnapshot) -> Option<Value> {
 }
 
 pub fn sync_agent_execution_history(handle: &TaskStatusHandle, report: &FlowExecutionReport) {
+    let memory_lookup: HashMap<&str, &ExecutionMemoryEntry> = report
+        .memory_log
+        .iter()
+        .map(|entry| (entry.step_id.as_str(), entry))
+        .collect();
     for (index, step) in report.steps.iter().enumerate() {
         handle.step_started(index, &step.title);
         let status = match step.status {
             StepExecutionStatus::Success => AgentHistoryStatus::Success,
             StepExecutionStatus::Failed => AgentHistoryStatus::Failed,
         };
+        let memory_entry = memory_lookup.get(step.step_id.as_str());
+        let thinking = agent_state_field(&step.agent_state, "thinking")
+            .or_else(|| memory_entry.and_then(|entry| entry.thinking.clone()));
+        let evaluation = agent_state_field(&step.agent_state, "evaluation")
+            .or_else(|| memory_entry.and_then(|entry| entry.evaluation.clone()));
+        let memory = agent_state_field(&step.agent_state, "memory")
+            .or_else(|| memory_entry.and_then(|entry| entry.memory.clone()));
+        let next_goal = agent_state_field(&step.agent_state, "next_goal")
+            .or_else(|| memory_entry.and_then(|entry| entry.next_goal.clone()));
+        let search_context = memory_entry.and_then(|entry| entry.search_context.clone());
         let timeline_entry = AgentHistoryEntry {
             timestamp: Utc::now(),
             step_index: index,
@@ -666,9 +1081,14 @@ pub fn sync_agent_execution_history(handle: &TaskStatusHandle, report: &FlowExec
             status,
             attempts: step.attempts,
             message: step.error.clone(),
-            observation_summary: None,
-            obstruction: None,
+            observation_summary: step.observation_summary.clone(),
+            obstruction: step.blocker_kind.clone(),
             structured_summary: None,
+            thinking,
+            evaluation,
+            memory,
+            next_goal,
+            search_context,
             wait_ms: Some(step.total_wait_ms),
             run_ms: Some(step.total_run_ms),
             tool_kind: Some(step.tool_kind.clone()),
@@ -725,6 +1145,9 @@ pub fn flow_execution_report_payload(report: &FlowExecutionReport) -> Value {
                 "error": step.error,
                 "total_wait_ms": step.total_wait_ms,
                 "total_run_ms": step.total_run_ms,
+                "observation_summary": step.observation_summary,
+                "blocker_kind": step.blocker_kind,
+                "agent_state": step.agent_state,
                 "dispatches": step.dispatches.iter().map(|dispatch| {
                     json!({
                         "label": dispatch.label,
@@ -742,6 +1165,17 @@ pub fn flow_execution_report_payload(report: &FlowExecutionReport) -> Value {
                 }).collect::<Vec<_>>()
             })
         }).collect::<Vec<_>>(),
+        "memory_log": report
+            .memory_log
+            .iter()
+            .map(|entry| json!(entry))
+            .collect::<Vec<_>>(),
+        "judge_verdict": report.judge_verdict.as_ref().map(|verdict| {
+            json!({
+                "passed": verdict.passed,
+                "reason": verdict.reason,
+            })
+        }),
         "user_results": report.user_results.iter().map(|result| {
             json!({
                 "step_id": result.step_id,
@@ -783,6 +1217,7 @@ pub async fn persist_execution_outputs(
     execution_reports: &[FlowExecutionReport],
     state_events: Option<Vec<StateEvent>>,
     telemetry_payload: Option<Value>,
+    message_state: Option<Value>,
 ) -> Result<Vec<Value>> {
     let task_dir = output_dir.join("tasks").join(&task_id.0);
     fs::create_dir_all(&task_dir)
@@ -819,6 +1254,13 @@ pub async fn persist_execution_outputs(
         fs::write(&telemetry_path, serde_json::to_vec_pretty(&payload)?)
             .await
             .with_context(|| format!("failed to write telemetry {}", telemetry_path.display()))?;
+    }
+
+    if let Some(state) = message_state {
+        let state_path = task_dir.join("message_state.json");
+        fs::write(&state_path, serde_json::to_vec_pretty(&state)?)
+            .await
+            .with_context(|| format!("failed to write message state {}", state_path.display()))?;
     }
 
     let mut artifacts = Vec::new();

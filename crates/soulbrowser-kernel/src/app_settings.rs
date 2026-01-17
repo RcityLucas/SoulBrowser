@@ -25,8 +25,30 @@ pub struct Config {
 pub struct SoulConfig {
     pub enabled: bool,
     pub model: String,
+    /// Legacy single API key field (for backwards compatibility)
     pub api_key: Option<String>,
     pub prompts_dir: Option<PathBuf>,
+    /// Provider-specific API keys
+    #[serde(default)]
+    pub providers: ProvidersConfig,
+}
+
+/// Configuration for multiple LLM providers
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ProvidersConfig {
+    pub openai: Option<ProviderConfig>,
+    pub zhipu: Option<ProviderConfig>,
+    pub anthropic: Option<ProviderConfig>,
+    pub deepseek: Option<ProviderConfig>,
+    pub gemini: Option<ProviderConfig>,
+}
+
+/// Configuration for a single LLM provider
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProviderConfig {
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub api_base: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -66,6 +88,7 @@ impl Default for Config {
                 model: "gpt-4".to_string(),
                 api_key: None,
                 prompts_dir: None,
+                providers: ProvidersConfig::default(),
             },
             recording: RecordingConfigOptions {
                 screenshots: true,

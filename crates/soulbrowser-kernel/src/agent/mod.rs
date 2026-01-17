@@ -1,8 +1,14 @@
+pub mod agent_loop_executor;
 pub mod executor;
+mod guardrails;
+pub mod message_manager;
 mod stage_context;
 pub mod strategies;
 
-pub use stage_context::{ContextResolver, StageContext};
+pub use agent_loop_executor::{
+    execute_agent_loop, AgentLoopExecutionOptions, AgentLoopExecutionReport, AgentLoopStepReport,
+};
+pub use stage_context::{AutoActTuning, ContextResolver, StageContext};
 
 use agent_core::planner::{classify_step, plan_contains_stage, PlanStageGraph, PlanStageKind};
 use agent_core::{
@@ -24,6 +30,7 @@ use std::{collections::HashMap, fmt, sync::Arc};
 use tracing::{debug, warn};
 use url::{form_urlencoded, Url};
 
+use crate::agent::guardrails::{derive_guardrail_domains, derive_guardrail_keywords};
 use crate::agent::strategies::{
     materialize_step, stage_label, stage_overlay, StrategyInput, StrategyRegistry,
 };
@@ -38,7 +45,6 @@ pub use executor::{execute_plan, FlowExecutionOptions, FlowExecutionReport, Step
 #[derive(Clone)]
 pub struct ChatRunner {
     planner: PlannerStrategy,
-    rule_fallback: RuleBasedPlanner,
     flow_options: PlanToFlowOptions,
     strict_plan_validation: bool,
 }
@@ -55,14 +61,17 @@ impl fmt::Debug for ChatRunner {
 #[derive(Clone)]
 enum PlannerStrategy {
     Rule(RuleBasedPlanner),
-    Llm(LlmPlanner),
+    Llm {
+        planner: LlmPlanner,
+        fallback: RuleBasedPlanner,
+    },
 }
 
 impl fmt::Debug for PlannerStrategy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlannerStrategy::Rule(_) => f.write_str("PlannerStrategy::Rule"),
-            PlannerStrategy::Llm(planner) => f
+            PlannerStrategy::Llm { planner, .. } => f
                 .debug_struct("PlannerStrategy::Llm")
                 .field("cache", &planner.cache.is_some())
                 .finish(),
@@ -73,8 +82,23 @@ impl fmt::Debug for PlannerStrategy {
 impl PlannerStrategy {
     async fn plan(&self, request: &AgentRequest) -> Result<PlannerOutcome, AgentError> {
         match self {
-            PlannerStrategy::Rule(planner) => planner.draft_plan(request),
-            PlannerStrategy::Llm(planner) => planner.plan(request).await,
+            PlannerStrategy::Rule(planner) => {
+                let mut outcome = planner.draft_plan(request)?;
+                annotate_plan_origin(&mut outcome.plan, "rule");
+                Ok(outcome)
+            }
+            PlannerStrategy::Llm { planner, fallback } => match planner.plan(request).await {
+                Ok(mut outcome) => {
+                    annotate_plan_origin(&mut outcome.plan, "llm");
+                    Ok(outcome)
+                }
+                Err(err) => {
+                    warn!("LLM planner failed; falling back to rule plan: {}", err);
+                    let mut outcome = fallback.draft_plan(request)?;
+                    annotate_plan_origin(&mut outcome.plan, "rule_fallback");
+                    Ok(outcome)
+                }
+            },
         }
     }
 
@@ -85,14 +109,36 @@ impl PlannerStrategy {
         failure_summary: &str,
     ) -> Result<PlannerOutcome, AgentError> {
         match self {
-            PlannerStrategy::Rule(planner) => planner.draft_plan(request),
-            PlannerStrategy::Llm(planner) => {
-                planner
+            PlannerStrategy::Rule(planner) => {
+                let mut outcome = planner.draft_plan(request)?;
+                annotate_plan_origin(&mut outcome.plan, "rule");
+                Ok(outcome)
+            }
+            PlannerStrategy::Llm { planner, fallback } => {
+                match planner
                     .replan(request, previous_plan, failure_summary)
                     .await
+                {
+                    Ok(mut outcome) => {
+                        annotate_plan_origin(&mut outcome.plan, "llm");
+                        Ok(outcome)
+                    }
+                    Err(err) => {
+                        warn!("LLM replanner failed; falling back to rule plan: {}", err);
+                        let mut outcome = fallback.draft_plan(request)?;
+                        annotate_plan_origin(&mut outcome.plan, "rule_fallback");
+                        Ok(outcome)
+                    }
+                }
             }
         }
     }
+}
+
+fn annotate_plan_origin(plan: &mut AgentPlan, kind: &str) {
+    plan.meta
+        .vendor_context
+        .insert("planner_kind".to_string(), Value::String(kind.to_string()));
 }
 
 struct LlmPlanner {
@@ -168,8 +214,7 @@ impl ChatRunner {
         let strict_plan_validation = config.strict_plan_validation;
         let rule = RuleBasedPlanner::new(config);
         Self {
-            planner: PlannerStrategy::Rule(rule.clone()),
-            rule_fallback: rule,
+            planner: PlannerStrategy::Rule(rule),
             flow_options,
             strict_plan_validation,
         }
@@ -184,7 +229,14 @@ impl ChatRunner {
         provider: Arc<dyn LlmProvider>,
         cache: Option<Arc<LlmPlanCache>>,
     ) -> Self {
-        self.planner = PlannerStrategy::Llm(LlmPlanner::new(provider, cache));
+        let fallback = match &self.planner {
+            PlannerStrategy::Rule(rule) => rule.clone(),
+            PlannerStrategy::Llm { fallback, .. } => fallback.clone(),
+        };
+        self.planner = PlannerStrategy::Llm {
+            planner: LlmPlanner::new(provider, cache),
+            fallback,
+        };
         self
     }
 
@@ -209,11 +261,11 @@ impl ChatRunner {
         ensure_prompt(&request)?;
         ensure_conversation(&mut request);
 
-        let outcome_result = match self.planner.plan(&request).await {
-            Ok(plan) => Ok(plan),
-            Err(err) => self.try_rule_fallback(err, &request),
-        };
-        let outcome = outcome_result.map_err(|err| anyhow!("planner failed: {}", err))?;
+        let outcome = self
+            .planner
+            .plan(&request)
+            .await
+            .map_err(|err| anyhow!("planner failed: {}", err))?;
         self.finalize_with_schema_retry(&request, outcome).await
     }
 
@@ -227,28 +279,14 @@ impl ChatRunner {
         ensure_prompt(&request)?;
         ensure_conversation(&mut request);
 
-        let outcome_result = match self
+        let outcome = self
             .planner
             .replan(&request, previous_plan, failure_summary)
             .await
-        {
-            Ok(plan) => Ok(plan),
-            Err(err) => self.try_rule_fallback(err, &request),
-        };
-        let outcome = outcome_result.map_err(|err| anyhow!("planner failed: {}", err))?;
-        self.finalize_with_schema_retry(&request, outcome).await
-    }
-
-    fn try_rule_fallback(
-        &self,
-        err: AgentError,
-        request: &AgentRequest,
-    ) -> Result<PlannerOutcome, AgentError> {
-        if matches!(self.planner, PlannerStrategy::Llm(_)) && is_llm_rate_limit(&err) {
-            warn!("LLM planner rate limited; falling back to rule-based plan");
-            return self.rule_fallback.draft_plan(request);
-        }
-        Err(err)
+            .map_err(|err| anyhow!("planner failed: {}", err))?;
+        let mut session = self.finalize_with_schema_retry(&request, outcome).await?;
+        append_plan_repair_note(&mut session.plan, failure_summary);
+        Ok(session)
     }
 
     async fn finalize_with_schema_retry(
@@ -291,7 +329,7 @@ impl ChatRunner {
             attach_repair_metadata(&mut outcome.plan, &repair_report);
             if let Some(summary) = repair_summary(&repair_report) {
                 outcome.explanations.push(summary.clone());
-                if matches!(self.planner, PlannerStrategy::Llm(_)) {
+                if matches!(self.planner, PlannerStrategy::Llm { .. }) {
                     outcome
                         .plan
                         .meta
@@ -368,7 +406,22 @@ fn cache_key_for_request(request: &AgentRequest) -> Option<String> {
 const OBSERVATION_CANONICAL: &str = "data.extract-site";
 const GENERIC_PARSE_CANONICAL: &str = "data.parse.generic";
 const DELIVER_CANONICAL: &str = "data.deliver.structured";
+pub(super) const PLUGIN_CUSTOM_ALIAS_CASES: &[(&str, &str)] = &[
+    ("plugin.extract-site", OBSERVATION_CANONICAL),
+    ("plugin.data-parse-metal-price", "data.parse.metal_price"),
+    ("plugin.data-deliver-structured", DELIVER_CANONICAL),
+    ("plugin.data-validate-target", "data.validate-target"),
+    (
+        "plugin.data-validate-metal-price",
+        "data.validate.metal_price",
+    ),
+    ("plugin.data-parse.generic", GENERIC_PARSE_CANONICAL),
+    ("plugin.browser.search", "browser.search"),
+    ("plugin.close-modal", "browser.close-modal"),
+    ("plugin.send-esc", "browser.send-esc"),
+];
 pub(crate) const EXPECTED_URL_METADATA_KEY: &str = "expected_url";
+pub(crate) const SKIP_CLICK_VALIDATION_METADATA_KEY: &str = "skip_click_validation";
 static PLAN_STAGE_GRAPH: OnceCell<PlanStageGraph> = OnceCell::new();
 
 #[cfg(test)]
@@ -378,13 +431,6 @@ fn normalize_custom_tools(plan: &mut AgentPlan) -> usize {
 
 fn stage_graph() -> &'static PlanStageGraph {
     PLAN_STAGE_GRAPH.get_or_init(|| PlanStageGraph::load_from_env_or_default().unwrap_or_default())
-}
-
-fn is_llm_rate_limit(err: &AgentError) -> bool {
-    matches!(
-        err,
-        AgentError::InvalidRequest(message) if message.to_ascii_lowercase().contains("rate limit")
-    )
 }
 
 fn normalize_custom_tools_with_handler<F>(plan: &mut AgentPlan, mut on_change: F) -> usize
@@ -490,6 +536,8 @@ struct StageAuditor<'a> {
     context: StageContext,
     ledger: &'a mut PlanRepairLedger,
     registry: StrategyRegistry,
+    force_deterministic: bool,
+    stage_timeline: Vec<Value>,
 }
 
 enum StageOutcome {
@@ -505,6 +553,7 @@ impl<'a> StageAuditor<'a> {
         request: &'a AgentRequest,
         context: StageContext,
         ledger: &'a mut PlanRepairLedger,
+        force_deterministic: bool,
     ) -> Self {
         Self {
             plan,
@@ -512,23 +561,119 @@ impl<'a> StageAuditor<'a> {
             context,
             ledger,
             registry: StrategyRegistry::builtin(),
+            force_deterministic,
+            stage_timeline: Vec::new(),
         }
     }
 
     fn audit(&mut self) {
+        self.record_guardrail_overlay();
         let stage_plan = stage_graph().plan_for_request(self.request);
-        self.align_search_observations();
+        if self.force_deterministic {
+            self.reset_plan_for_deterministic();
+        } else {
+            self.retarget_blocked_search_engines();
+            self.align_search_observations();
+        }
         for chain in stage_plan.stages.iter() {
-            let outcome = if plan_contains_stage(self.plan, chain.stage) {
+            let outcome = if self.stage_already_satisfied(chain.stage) {
                 StageOutcome::AlreadyPresent
             } else {
                 self.try_chain(chain)
             };
             self.emit_stage_status(chain.stage, outcome);
         }
+        if !self.force_deterministic {
+            self.retarget_blocked_search_engines();
+        }
+        self.persist_stage_timeline();
+    }
+
+    fn reset_plan_for_deterministic(&mut self) {
+        if self.plan.steps.is_empty() {
+            return;
+        }
+        self.plan.steps.clear();
+        self.ledger
+            .record_note("LLM plan overridden by deterministic informational pipeline");
+        let mut overlay = stage_overlay(
+            PlanStageKind::Navigate,
+            "deterministic_plan",
+            "reset",
+            "♻️ 使用固定阶段图重建计划",
+        );
+        if let Some(obj) = overlay.as_object_mut() {
+            obj.insert(
+                "reason".to_string(),
+                Value::String("informational_intent".to_string()),
+            );
+        }
+        self.ledger.record_overlay(overlay);
+    }
+
+    fn record_guardrail_overlay(&mut self) {
+        if self.context.guardrail_keywords.is_empty() {
+            return;
+        }
+        let keywords = self.context.guardrail_keywords.clone();
+        let count = keywords.len();
+        let preview = keywords
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let detail = format!("注入 {} 个 Guardrail 关键词：{}", count, preview);
+        let overlay = json!({
+            "kind": "guardrail_keywords",
+            "title": "🎯 Guardrail 关键词注入",
+            "detail": detail,
+            "message": detail,
+            "badge": {
+                "label": "Guardrail",
+                "value": count,
+                "tone": "info",
+            },
+            "keywords": keywords.clone(),
+            "domains": self.context.guardrail_domains.clone(),
+        });
+        self.ledger.record_overlay(overlay);
+        self.plan.meta.vendor_context.insert(
+            "guardrail_keywords".to_string(),
+            json!({
+                "keywords": keywords,
+                "count": count,
+                "domains": self.context.guardrail_domains.clone(),
+                "emitted": false,
+            }),
+        );
+    }
+
+    fn stage_already_satisfied(&self, stage: PlanStageKind) -> bool {
+        match stage {
+            PlanStageKind::Navigate => {
+                if self.should_prioritize_search_navigation() && !plan_has_browser_search(self.plan)
+                {
+                    return false;
+                }
+                plan_has_navigate_step(self.plan)
+            }
+            PlanStageKind::Act => plan_has_auto_act(self.plan),
+            PlanStageKind::Observe => plan_has_extract_site(self.plan),
+            PlanStageKind::Validate => plan_has_target_validation(self.plan),
+            PlanStageKind::Parse => plan_has_parse_step(self.plan),
+            PlanStageKind::Deliver => plan_has_deliver_stage(self.plan),
+            _ => plan_contains_stage(self.plan, stage),
+        }
     }
 
     fn try_chain(&mut self, chain: &agent_core::planner::StageStrategyChain) -> StageOutcome {
+        if chain.stage == PlanStageKind::Navigate && self.should_prioritize_search_navigation() {
+            if let Some(outcome) = self.try_specific_strategy(chain.stage, "search") {
+                return outcome;
+            }
+        }
+
         for strategy_id in &chain.strategies {
             let Some(strategy) = self.registry.get(strategy_id) else {
                 continue;
@@ -559,6 +704,46 @@ impl<'a> StageAuditor<'a> {
         }
     }
 
+    fn try_specific_strategy(
+        &mut self,
+        stage: PlanStageKind,
+        strategy_id: &str,
+    ) -> Option<StageOutcome> {
+        let Some(strategy) = self.registry.get(strategy_id) else {
+            return None;
+        };
+        let input = StrategyInput {
+            plan: self.plan,
+            request: self.request,
+            context: &self.context,
+        };
+        let application = strategy.apply(&input);
+        match application {
+            Some(result) => {
+                record_strategy_usage(stage.as_str(), strategy_id, "applied");
+                self.apply_result(stage, strategy.id(), result);
+                Some(StageOutcome::StrategyApplied(strategy.id().to_string()))
+            }
+            None => {
+                record_strategy_usage(stage.as_str(), strategy_id, "skipped");
+                None
+            }
+        }
+    }
+
+    fn should_prioritize_search_navigation(&self) -> bool {
+        if requires_weather_pipeline(self.request) {
+            return false;
+        }
+        if self.context.guardrail_keyword_count > 0 {
+            return true;
+        }
+        if self.context.preferred_sites.is_empty() && !self.context.search_terms.is_empty() {
+            return true;
+        }
+        false
+    }
+
     fn emit_stage_status(&mut self, stage: PlanStageKind, outcome: StageOutcome) {
         let label = stage_label(stage);
         let (strategy, status, detail) = match outcome {
@@ -583,8 +768,19 @@ impl<'a> StageAuditor<'a> {
                 format!("⚠️ 仍缺少{}阶段，请检查任务提示", label),
             ),
         };
-        self.ledger
-            .record_overlay(stage_overlay(stage, strategy, status, detail));
+        self.ledger.record_overlay(stage_overlay(
+            stage,
+            strategy.clone(),
+            status.clone(),
+            detail.clone(),
+        ));
+        self.stage_timeline.push(json!({
+            "stage": stage.as_str(),
+            "label": label,
+            "status": status,
+            "strategy": strategy,
+            "detail": detail,
+        }));
     }
 
     fn apply_result(
@@ -617,13 +813,20 @@ impl<'a> StageAuditor<'a> {
         if let Some(overlay) = application.overlay {
             self.ledger.record_overlay(overlay);
         }
+        if !application.vendor_context.is_empty() {
+            for (key, value) in application.vendor_context {
+                self.plan.meta.vendor_context.insert(key, value);
+            }
+        }
     }
 
     fn synthesize_placeholder(&mut self, stage: PlanStageKind) -> bool {
         match stage {
             PlanStageKind::Navigate => self.insert_placeholder_navigate(),
             PlanStageKind::Observe => self.insert_placeholder_observe(),
+            PlanStageKind::Validate => self.insert_placeholder_validate(),
             PlanStageKind::Act => self.insert_placeholder_act(),
+            PlanStageKind::Evaluate => self.insert_placeholder_evaluate(),
             PlanStageKind::Parse => self.insert_placeholder_parse(),
             PlanStageKind::Deliver => self.insert_placeholder_deliver(),
         }
@@ -655,6 +858,38 @@ impl<'a> StageAuditor<'a> {
         ));
         let insert_index = insertion_index(self.plan, PlanStageKind::Act);
         self.plan.steps.insert(insert_index, step);
+        true
+    }
+
+    fn insert_placeholder_evaluate(&mut self) -> bool {
+        let mut step = AgentPlanStep {
+            id: unique_step_id(self.plan, "placeholder-evaluate"),
+            title: "评估页面状态".to_string(),
+            detail: "Fallback evaluate stage via agent.evaluate".to_string(),
+            tool: AgentTool {
+                kind: AgentToolKind::Custom {
+                    name: "agent.evaluate".to_string(),
+                    payload: json!({
+                        "message": "评估当前页面状态",
+                    }),
+                },
+                wait: WaitMode::None,
+                timeout_ms: Some(1_000),
+            },
+            validations: Vec::new(),
+            requires_approval: false,
+            metadata: HashMap::new(),
+        };
+        let insert_index = insertion_index(self.plan, PlanStageKind::Evaluate);
+        self.ledger
+            .mark_step(&mut step, "Placeholder agent.evaluate inserted");
+        self.plan.steps.insert(insert_index, step);
+        self.ledger.record_overlay(stage_overlay(
+            PlanStageKind::Evaluate,
+            "placeholder",
+            "placeholder_step",
+            "🧐 自动补齐评估阶段",
+        ));
         true
     }
 
@@ -732,6 +967,50 @@ impl<'a> StageAuditor<'a> {
             "placeholder",
             "placeholder_step",
             "📸 自动补齐观察阶段",
+        ));
+        self.plan.steps.insert(insert_index, step);
+        true
+    }
+
+    fn insert_placeholder_validate(&mut self) -> bool {
+        let Some((_, observation_id)) = previous_observation_step(self.plan, self.plan.steps.len())
+        else {
+            return false;
+        };
+        let keywords = derive_guardrail_keywords(self.request);
+        let allowed_domains = derive_guardrail_domains(self.request);
+        if keywords.is_empty() && allowed_domains.is_empty() {
+            return false;
+        }
+        let mut step = AgentPlanStep {
+            id: unique_step_id(self.plan, "placeholder-validate"),
+            title: "验证目标页面".to_string(),
+            detail: "Placeholder target validation".to_string(),
+            tool: AgentTool {
+                kind: AgentToolKind::Custom {
+                    name: "data.validate-target".to_string(),
+                    payload: json!({
+                        "source_step_id": observation_id,
+                        "keywords": keywords,
+                        "allowed_domains": allowed_domains,
+                        "expected_status": 200,
+                    }),
+                },
+                wait: WaitMode::None,
+                timeout_ms: Some(3_000),
+            },
+            validations: Vec::new(),
+            requires_approval: false,
+            metadata: HashMap::new(),
+        };
+        let insert_index = insertion_index(self.plan, PlanStageKind::Validate);
+        self.ledger
+            .mark_step(&mut step, "Placeholder validation inserted");
+        self.ledger.record_overlay(stage_overlay(
+            PlanStageKind::Validate,
+            "placeholder",
+            "placeholder_step",
+            "🛡️ 自动补齐校验阶段",
         ));
         self.plan.steps.insert(insert_index, step);
         true
@@ -843,6 +1122,193 @@ impl<'a> StageAuditor<'a> {
             self.ledger.record_overlay(overlay);
         }
     }
+
+    fn retarget_blocked_search_engines(&mut self) {
+        let fallback_url = self.context.fallback_search_url();
+        if fallback_url.is_empty() || is_blocked_search_engine(&fallback_url) {
+            return;
+        }
+        let mut rewrote_navigation = false;
+        let fallback_condition = build_url_wait_condition(&fallback_url);
+        for step in self.plan.steps.iter_mut() {
+            match &mut step.tool.kind {
+                AgentToolKind::Navigate { url } => {
+                    if !is_blocked_search_engine(url) {
+                        continue;
+                    }
+                    let previous = url.clone();
+                    *url = fallback_url.clone();
+                    if step.detail.trim().is_empty() {
+                        step.detail = format!("打开搜索结果：{}", self.context.search_seed());
+                    }
+                    step.metadata.insert(
+                        EXPECTED_URL_METADATA_KEY.to_string(),
+                        Value::String(fallback_url.clone()),
+                    );
+                    self.ledger.mark_step(
+                        step,
+                        format!(
+                            "Search engine '{previous}' replaced with fallback '{fallback}'",
+                            fallback = fallback_url
+                        ),
+                    );
+                    rewrote_navigation = true;
+                }
+                AgentToolKind::Wait { condition } => {
+                    if wait_condition_targets_blocked_search(condition) {
+                        *condition = fallback_condition.clone();
+                        self.ledger
+                            .record_note(format!("Wait condition retargeted to {}", fallback_url));
+                    }
+                }
+                AgentToolKind::Custom { name, payload }
+                    if name.eq_ignore_ascii_case("wait-for-condition") =>
+                {
+                    if wait_for_condition_payload_targets_blocked_search(payload) {
+                        if retarget_wait_for_condition_payload(payload, &fallback_condition) {
+                            self.ledger.record_note(format!(
+                                "wait-for-condition retargeted to {}",
+                                fallback_url
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if rewrote_navigation {
+            let mut overlay = stage_overlay(
+                PlanStageKind::Navigate,
+                "search_engine_fallback",
+                "adjust",
+                "🔍 搜索引擎不可用，改用备用入口",
+            );
+            if let Some(obj) = overlay.as_object_mut() {
+                obj.insert(
+                    "seed".to_string(),
+                    Value::String(self.context.search_seed()),
+                );
+            }
+            self.ledger.record_overlay(overlay);
+        }
+    }
+
+    fn persist_stage_timeline(&mut self) {
+        if self.stage_timeline.is_empty() {
+            return;
+        }
+        self.plan.meta.vendor_context.insert(
+            "stage_timeline".to_string(),
+            json!({
+                "stages": self.stage_timeline,
+                "deterministic": self.force_deterministic,
+            }),
+        );
+    }
+}
+
+fn is_blocked_search_engine(url: &str) -> bool {
+    let lowered = url.to_ascii_lowercase();
+    lowered.contains("google.") || lowered.contains("bing.")
+}
+
+fn wait_condition_targets_blocked_search(condition: &AgentWaitCondition) -> bool {
+    match condition {
+        AgentWaitCondition::UrlMatches(pattern) | AgentWaitCondition::UrlEquals(pattern) => {
+            is_blocked_search_engine(pattern)
+        }
+        _ => false,
+    }
+}
+
+fn wait_for_condition_payload_targets_blocked_search(payload: &Value) -> bool {
+    if let Some(blocked) = payload
+        .as_object()
+        .and_then(|obj| obj.get("expect"))
+        .and_then(Value::as_object)
+        .map(|expect| {
+            expect
+                .get("url_pattern")
+                .and_then(Value::as_str)
+                .map(is_blocked_search_engine)
+                .unwrap_or(false)
+                || expect
+                    .get("url_equals")
+                    .and_then(Value::as_str)
+                    .map(is_blocked_search_engine)
+                    .unwrap_or(false)
+        })
+    {
+        if blocked {
+            return true;
+        }
+    }
+
+    let serialized = payload.to_string().to_ascii_lowercase();
+    serialized.contains("google.") || serialized.contains("bing.")
+}
+
+fn retarget_wait_for_condition_payload(
+    payload: &mut Value,
+    condition: &AgentWaitCondition,
+) -> bool {
+    if payload.as_object().is_none() {
+        *payload = Value::Object(Map::new());
+    }
+    let map = payload
+        .as_object_mut()
+        .expect("payload should be object after normalization");
+    let expect = map
+        .entry("expect".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .expect("expect should be object");
+    match condition {
+        AgentWaitCondition::UrlMatches(pattern) => {
+            expect.insert("url_pattern".to_string(), Value::String(pattern.clone()));
+            expect.remove("url_equals");
+            true
+        }
+        AgentWaitCondition::UrlEquals(url) => {
+            expect.insert("url_equals".to_string(), Value::String(url.clone()));
+            expect.remove("url_pattern");
+            true
+        }
+        _ => false,
+    }
+}
+
+fn retarget_wait_tools(
+    plan: &mut AgentPlan,
+    context: &StageContext,
+    ledger: &mut PlanRepairLedger,
+) {
+    let fallback_url = context.fallback_search_url();
+    if fallback_url.is_empty() || is_blocked_search_engine(&fallback_url) {
+        return;
+    }
+    let fallback_condition = build_url_wait_condition(&fallback_url);
+    for step in plan.steps.iter_mut() {
+        match &mut step.tool.kind {
+            AgentToolKind::Wait { condition } => {
+                if wait_condition_targets_blocked_search(condition) {
+                    *condition = fallback_condition.clone();
+                    ledger.record_note(format!("Wait condition retargeted to {}", fallback_url));
+                }
+            }
+            AgentToolKind::Custom { name, payload }
+                if name.eq_ignore_ascii_case("wait-for-condition") =>
+            {
+                if wait_for_condition_payload_targets_blocked_search(payload)
+                    && retarget_wait_for_condition_payload(payload, &fallback_condition)
+                {
+                    ledger
+                        .record_note(format!("wait-for-condition retargeted to {}", fallback_url));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn ensure_observe_validations(step: &mut AgentPlanStep, url: &str, ledger: &mut PlanRepairLedger) {
@@ -884,8 +1350,22 @@ fn insertion_index(plan: &AgentPlan, stage: PlanStageKind) -> usize {
             .or_else(|| last_stage_index(plan, PlanStageKind::Navigate))
             .map(|idx| idx + 1)
             .unwrap_or(plan.steps.len()),
-        PlanStageKind::Act => plan.steps.len(),
-        PlanStageKind::Parse => last_stage_index(plan, PlanStageKind::Observe)
+        PlanStageKind::Validate => last_stage_index(plan, PlanStageKind::Observe)
+            .or_else(|| last_stage_index(plan, PlanStageKind::Act))
+            .or_else(|| last_stage_index(plan, PlanStageKind::Navigate))
+            .map(|idx| idx + 1)
+            .unwrap_or(plan.steps.len()),
+        PlanStageKind::Act => browser_search_index(plan)
+            .or_else(|| last_stage_index(plan, PlanStageKind::Navigate))
+            .map(|idx| idx + 1)
+            .unwrap_or(plan.steps.len()),
+        PlanStageKind::Evaluate => last_stage_index(plan, PlanStageKind::Observe)
+            .or_else(|| last_stage_index(plan, PlanStageKind::Act))
+            .map(|idx| idx + 1)
+            .unwrap_or(plan.steps.len()),
+        PlanStageKind::Parse => last_stage_index(plan, PlanStageKind::Validate)
+            .or_else(|| last_stage_index(plan, PlanStageKind::Evaluate))
+            .or_else(|| last_stage_index(plan, PlanStageKind::Observe))
             .or_else(|| last_stage_index(plan, PlanStageKind::Act))
             .map(|idx| idx + 1)
             .unwrap_or(plan.steps.len()),
@@ -900,6 +1380,18 @@ fn last_stage_index(plan: &AgentPlan, stage: PlanStageKind) -> Option<usize> {
         .rev()
         .find(|(_, step)| classify_step(step).contains(&stage))
         .map(|(idx, _)| idx)
+}
+
+fn browser_search_index(plan: &AgentPlan) -> Option<usize> {
+    plan.steps
+        .iter()
+        .enumerate()
+        .find_map(|(idx, step)| match &step.tool.kind {
+            AgentToolKind::Custom { name, .. } if name.eq_ignore_ascii_case("browser.search") => {
+                Some(idx)
+            }
+            _ => None,
+        })
 }
 
 fn mark_step_repaired(step: &mut AgentPlanStep, note: &str) {
@@ -955,6 +1447,32 @@ fn repair_summary(report: &PlanRepairReport) -> Option<String> {
     ))
 }
 
+fn append_plan_repair_note(plan: &mut AgentPlan, note: &str) {
+    let trimmed = note.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let entry = plan
+        .meta
+        .vendor_context
+        .entry("plan_repairs".to_string())
+        .or_insert_with(|| json!({ "count": 0, "notes": [] }));
+    if let Some(obj) = entry.as_object_mut() {
+        let notes_entry = obj
+            .entry("notes".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Value::Array(notes) = notes_entry {
+            notes.push(Value::String(trimmed.to_string()));
+        } else {
+            *notes_entry = Value::Array(vec![Value::String(trimmed.to_string())]);
+        }
+        obj.insert(
+            "last_failure_summary".to_string(),
+            Value::String(trimmed.to_string()),
+        );
+    }
+}
+
 fn shim_unsupported_custom_tools(plan: &mut AgentPlan, ledger: &mut PlanRepairLedger) -> usize {
     let mut updates = 0;
     for step in plan.steps.iter_mut() {
@@ -1003,25 +1521,34 @@ fn plugin_shim_name(name: &str) -> String {
 
 fn normalize_plan(plan: &mut AgentPlan, request: &AgentRequest) -> PlanRepairReport {
     let mut ledger = PlanRepairLedger::new(PLAN_REPAIR_NOTE_BUDGET);
-
     normalize_custom_tools_with_handler(plan, |step, note| {
         ledger.mark_step(step, note);
     });
     shim_unsupported_custom_tools(plan, &mut ledger);
     let stage_context = ContextResolver::new(request).build();
-    StageAuditor::new(plan, request, stage_context.clone(), &mut ledger).audit();
+    let force_deterministic = false;
+    StageAuditor::new(
+        plan,
+        request,
+        stage_context.clone(),
+        &mut ledger,
+        force_deterministic,
+    )
+    .audit();
     ensure_weather_macro_step(plan, request, &stage_context, &mut ledger);
     ensure_click_validations(plan, &stage_context, &mut ledger);
+    ensure_browser_search_payloads(plan, &stage_context, &mut ledger);
     ensure_structured_output_deliveries(plan, request, &mut ledger);
-    ensure_user_result_step(plan, request, &mut ledger);
     ensure_github_repo_usernames(plan, request, &mut ledger);
     remove_empty_navigate_steps(plan, &mut ledger);
     prune_weather_navigation(plan, request, &mut ledger);
     prune_weather_followup_steps(plan, &stage_context, &mut ledger);
+    retarget_wait_tools(plan, &stage_context, &mut ledger);
     auto_fill_deliver_schema(plan, &mut ledger);
     auto_fill_deliver_metadata(plan, &mut ledger);
     auto_insert_generic_parse(plan, &mut ledger);
     auto_insert_weather_parse(plan, request, &mut ledger);
+    ensure_user_result_step(plan, request, &mut ledger);
 
     let report = ledger.into_report();
     record_auto_repair_events("plan_normalize", report.total_repairs as u64);
@@ -1075,7 +1602,7 @@ fn ensure_user_result_step(
     if !needs_result {
         return 0;
     }
-    if plan_has_deliver_step(plan) || plan_has_note_step(plan) {
+    if plan_has_note_step(plan) {
         return 0;
     }
 
@@ -1630,6 +2157,8 @@ fn auto_insert_weather_parse(
 
     let mut found_deliver = false;
     for step in plan.steps.iter_mut() {
+        #[cfg(test)]
+        let _step_id_dbg = step.id.clone();
         let Some(payload) = deliver_payload_map(step) else {
             continue;
         };
@@ -1802,33 +2331,62 @@ fn is_weather_schema(payload: &Map<String, Value>) -> bool {
         .unwrap_or(false)
 }
 
-fn plan_has_deliver_step(plan: &AgentPlan) -> bool {
+/// Check if plan has a custom tool with the given name (case-insensitive)
+fn plan_has_custom_tool(plan: &AgentPlan, tool_name: &str) -> bool {
     plan.steps.iter().any(|step| {
         matches!(
             &step.tool.kind,
-            AgentToolKind::Custom { name, .. } if name.eq_ignore_ascii_case("data.deliver.structured")
+            AgentToolKind::Custom { name, .. } if name.eq_ignore_ascii_case(tool_name)
         )
     })
 }
 
+/// Check if plan has a custom tool matching a predicate
+fn plan_has_custom_tool_matching<F: Fn(&str) -> bool>(plan: &AgentPlan, predicate: F) -> bool {
+    plan.steps.iter().any(|step| {
+        matches!(
+            &step.tool.kind,
+            AgentToolKind::Custom { name, .. } if predicate(name)
+        )
+    })
+}
+
+fn plan_has_deliver_step(plan: &AgentPlan) -> bool {
+    plan_has_custom_tool(plan, "data.deliver.structured")
+}
+fn plan_has_auto_act(plan: &AgentPlan) -> bool {
+    plan.meta.vendor_context.contains_key("auto_act_engine")
+}
+fn plan_has_extract_site(plan: &AgentPlan) -> bool {
+    plan_has_custom_tool(plan, "data.extract-site")
+}
+fn plan_has_target_validation(plan: &AgentPlan) -> bool {
+    plan_has_custom_tool(plan, "data.validate-target")
+}
+fn plan_has_browser_search(plan: &AgentPlan) -> bool {
+    plan_has_custom_tool(plan, "browser.search")
+}
+fn plan_has_note_step(plan: &AgentPlan) -> bool {
+    plan_has_custom_tool(plan, "agent.note")
+}
+fn plan_has_weather_macro(plan: &AgentPlan) -> bool {
+    plan_has_custom_tool(plan, "weather.search")
+}
+fn plan_has_parse_step(plan: &AgentPlan) -> bool {
+    plan_has_custom_tool_matching(plan, |n| {
+        n.starts_with("data.parse.") || n.eq_ignore_ascii_case("market.quote.fetch")
+    })
+}
+fn plan_has_navigate_step(plan: &AgentPlan) -> bool {
+    plan.steps
+        .iter()
+        .any(|step| matches!(step.tool.kind, AgentToolKind::Navigate { .. }))
+}
+fn plan_has_deliver_stage(plan: &AgentPlan) -> bool {
+    plan_has_deliver_step(plan) || plan_has_note_step(plan)
+}
 fn plan_has_observation_step(plan: &AgentPlan) -> bool {
     plan.steps.iter().any(is_observation_step)
-}
-
-fn plan_has_note_step(plan: &AgentPlan) -> bool {
-    plan.steps.iter().any(|step| {
-        matches!(
-            &step.tool.kind,
-            AgentToolKind::Custom { name, .. } if name.eq_ignore_ascii_case("agent.note")
-        )
-    })
-}
-
-fn plan_has_weather_macro(plan: &AgentPlan) -> bool {
-    plan.steps.iter().any(|step| match &step.tool.kind {
-        AgentToolKind::Custom { name, .. } => name.eq_ignore_ascii_case("weather.search"),
-        _ => false,
-    })
 }
 
 fn validation_covers_navigation(validation: &AgentValidation) -> bool {
@@ -1850,11 +2408,26 @@ fn ensure_click_validations(
         let AgentToolKind::Click { .. } = &step.tool.kind else {
             continue;
         };
-        let (target_url, condition) = inferred_click_expectation(step)
+        if step
+            .metadata
+            .get(SKIP_CLICK_VALIDATION_METADATA_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let explicit_expectation = step
+            .metadata
+            .get(EXPECTED_URL_METADATA_KEY)
+            .and_then(Value::as_str)
+            .and_then(click_expectation_from_hint);
+        let (target_url, condition) = explicit_expectation
+            .or_else(|| inferred_click_expectation(step))
             .map(|expectation| match expectation {
                 ClickExpectation::Absolute(url) => {
-                    let condition = build_url_wait_condition(&url);
-                    (url, condition)
+                    let domain_only = domain_from_url(&url).unwrap_or(url.clone());
+                    let pattern = build_domain_match_pattern(&domain_only);
+                    (url, AgentWaitCondition::UrlMatches(pattern))
                 }
                 ClickExpectation::Domain(domain) => {
                     let pattern = build_domain_match_pattern(&domain);
@@ -1864,8 +2437,9 @@ fn ensure_click_validations(
             })
             .unwrap_or_else(|| {
                 let url = fallback_url.clone();
-                let condition = build_url_wait_condition(&url);
-                (url, condition)
+                let domain_only = domain_from_url(&url).unwrap_or(url.clone());
+                let pattern = build_domain_match_pattern(&domain_only);
+                (url, AgentWaitCondition::UrlMatches(pattern))
             });
         let description = format!("自动等待跳转至 {target_url}");
 
@@ -1886,10 +2460,12 @@ fn ensure_click_validations(
             });
         }
 
-        step.metadata.insert(
-            EXPECTED_URL_METADATA_KEY.to_string(),
-            Value::String(target_url.clone()),
-        );
+        if !step.metadata.contains_key(EXPECTED_URL_METADATA_KEY) {
+            step.metadata.insert(
+                EXPECTED_URL_METADATA_KEY.to_string(),
+                Value::String(target_url.clone()),
+            );
+        }
         ledger.mark_step(
             step,
             format!("Auto-added click validation targeting {target_url}"),
@@ -1905,6 +2481,60 @@ fn ensure_click_validations(
             obj.insert("step_id".to_string(), Value::String(step.id.clone()));
         }
         ledger.record_overlay(overlay);
+    }
+}
+
+fn ensure_browser_search_payloads(
+    plan: &mut AgentPlan,
+    context: &StageContext,
+    ledger: &mut PlanRepairLedger,
+) {
+    let fallback_query = context.search_seed();
+    let site_hint = context.preferred_sites.first().cloned();
+
+    for step in plan.steps.iter_mut() {
+        let AgentToolKind::Custom { name, payload } = &mut step.tool.kind else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("browser.search") {
+            continue;
+        }
+        let mut query_note: Option<String> = None;
+        let mut site_note: Option<String> = None;
+
+        if !payload.is_object() {
+            *payload = json!({});
+        }
+        {
+            let Some(obj) = payload.as_object_mut() else {
+                continue;
+            };
+            let missing_query = obj
+                .get("query")
+                .and_then(Value::as_str)
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(true);
+            if missing_query {
+                obj.insert("query".to_string(), Value::String(fallback_query.clone()));
+                query_note = Some(format!(
+                    "自动补全 browser.search 查询词：{}",
+                    fallback_query
+                ));
+            }
+            if obj.get("site").is_none() {
+                if let Some(site) = site_hint.clone() {
+                    obj.insert("site".to_string(), Value::String(site.clone()));
+                    site_note = Some(format!("为 browser.search 添加站点限定：{}", site));
+                }
+            }
+        }
+
+        if let Some(note) = query_note {
+            ledger.mark_step(step, note);
+        }
+        if let Some(note) = site_note {
+            ledger.mark_step(step, note);
+        }
     }
 }
 
@@ -1990,6 +2620,12 @@ fn build_domain_match_pattern(domain: &str) -> String {
     format!(r"^https?://[^/]*{escaped_domain}.*$")
 }
 
+fn domain_from_url(url: &str) -> Option<String> {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|host| host.to_string()))
+}
+
 fn normalize_domain_hint_to_url(domain: &str) -> String {
     let trimmed = domain.trim().trim_start_matches("*").trim_matches('/');
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -2005,6 +2641,19 @@ fn normalize_domain_hint_to_url(domain: &str) -> String {
 enum ClickExpectation {
     Absolute(String),
     Domain(String),
+}
+
+fn click_expectation_from_hint(hint: &str) -> Option<ClickExpectation> {
+    let trimmed = hint.trim();
+    if trimmed.is_empty() {
+        None
+    } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(ClickExpectation::Absolute(trimmed.to_string()))
+    } else if trimmed.starts_with("//") {
+        Some(ClickExpectation::Absolute(format!("https:{}", trimmed)))
+    } else {
+        Some(ClickExpectation::Domain(trimmed.to_string()))
+    }
 }
 
 fn inferred_click_expectation(step: &AgentPlanStep) -> Option<ClickExpectation> {
@@ -2263,16 +2912,36 @@ mod deliver_autofill_tests {
         plan.steps.push(deliver_step("llm-step-6"));
 
         let request = AgentRequest::new(task_id, "auto repair");
+        let context = ContextResolver::new(&request).build();
+        assert!(context.fallback_search_url().contains("baidu"));
         normalize_plan(&mut plan, &request);
 
+        let deliver_step = plan
+            .steps
+            .iter()
+            .find(|step| matches!(&step.tool.kind, AgentToolKind::Custom { name, .. } if name == "data.deliver.structured"))
+            .expect("deliver step present");
+        let payload = deliver_payload_ref(deliver_step).expect("deliver payload object");
+        assert_eq!(
+            payload.get("artifact_label").and_then(Value::as_str),
+            Some("structured.generic_observation_v1")
+        );
+        assert_eq!(
+            payload.get("filename").and_then(Value::as_str),
+            Some("generic_observation_v1.json")
+        );
+        let source_id = payload
+            .get("source_step_id")
+            .and_then(Value::as_str)
+            .expect("deliver linked to parse");
         let parse_step = plan
             .steps
             .iter()
-            .find(|step| matches!(&step.tool.kind, AgentToolKind::Custom { name, .. } if name == "data.parse.generic"))
-            .expect("parse step inserted");
+            .find(|step| step.id == source_id)
+            .expect("parse step exists for deliver");
         match &parse_step.tool.kind {
             AgentToolKind::Custom { name, payload } => {
-                assert_eq!(name, "data.parse.generic");
+                assert!(name.eq_ignore_ascii_case("data.parse.generic"));
                 let obj = payload.as_object().expect("parse payload should be object");
                 assert_eq!(
                     obj.get("schema").and_then(Value::as_str),
@@ -2285,30 +2954,6 @@ mod deliver_autofill_tests {
             }
             other => panic!("unexpected parse tool: {:?}", other),
         }
-
-        let deliver_step = plan
-            .steps
-            .iter()
-            .find(|step| matches!(&step.tool.kind, AgentToolKind::Custom { name, .. } if name == "data.deliver.structured"))
-            .expect("deliver step present");
-        let payload = match &deliver_step.tool.kind {
-            AgentToolKind::Custom { payload, .. } => payload
-                .as_object()
-                .expect("deliver payload should be object"),
-            _ => panic!("deliver step must be custom"),
-        };
-        assert_eq!(
-            payload.get("artifact_label").and_then(Value::as_str),
-            Some("structured.generic_observation_v1")
-        );
-        assert_eq!(
-            payload.get("filename").and_then(Value::as_str),
-            Some("generic_observation_v1.json")
-        );
-        assert_eq!(
-            payload.get("source_step_id").and_then(Value::as_str),
-            Some(parse_step.id.as_str())
-        );
     }
 
     #[test]
@@ -2318,12 +2963,13 @@ mod deliver_autofill_tests {
         plan.steps.push(observation_step("obs-1"));
 
         let request = AgentRequest::new(task_id, "告诉我结果");
+        let context = ContextResolver::new(&request).build();
+        assert!(context.fallback_search_url().contains("baidu"));
         normalize_plan(&mut plan, &request);
-
-        assert!(matches!(
-            plan.steps.last().map(|step| &step.tool.kind),
-            Some(AgentToolKind::Custom { name, .. }) if name == "agent.note"
-        ));
+        assert!(plan.steps.iter().any(|step| matches!(
+            &step.tool.kind,
+            AgentToolKind::Custom { name, .. } if name == "agent.note"
+        )));
     }
 
     #[test]
@@ -2339,10 +2985,16 @@ mod deliver_autofill_tests {
             .push("https://example.com".to_string());
         normalize_plan(&mut plan, &request);
 
-        assert!(matches!(
-            plan.steps.first().map(|step| &step.tool.kind),
-            Some(AgentToolKind::Navigate { .. })
-        ));
+        let first_kind = plan.steps.first().map(|step| &step.tool.kind);
+        assert!(
+            matches!(first_kind, Some(AgentToolKind::Navigate { .. }))
+                || matches!(
+                    first_kind,
+                    Some(AgentToolKind::Custom { name, .. }) if name == "browser.search"
+                ),
+            "expected navigate or browser.search at plan start, found {:?}",
+            first_kind
+        );
     }
 
     #[test]
@@ -2362,7 +3014,18 @@ mod deliver_autofill_tests {
                 );
                 assert!(url.contains("%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD"));
             }
-            other => panic!("expected navigate step, got {:?}", other),
+            Some(AgentToolKind::Custom { name, payload }) if name == "browser.search" => {
+                let query = payload
+                    .as_object()
+                    .and_then(|obj| obj.get("query"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                assert!(
+                    query.contains("人工智能新闻"),
+                    "search payload missing query {query}"
+                );
+            }
+            other => panic!("expected navigate/search step, got {:?}", other),
         }
     }
 
@@ -2503,13 +3166,14 @@ mod deliver_autofill_tests {
 
         assert!(plan.steps.iter().any(|step| match &step.tool.kind {
             AgentToolKind::Custom { name, payload }
-                if name.eq_ignore_ascii_case("data.parse.generic") =>
+                if name.eq_ignore_ascii_case("data.parse.weather") =>
             {
                 payload
                     .as_object()
-                    .and_then(|obj| obj.get("schema"))
+                    .and_then(|obj| obj.get("source_step_id"))
                     .and_then(Value::as_str)
-                    == Some("weather_report_v1")
+                    .map(|id| id.contains("obs-weather"))
+                    .unwrap_or(false)
             }
             _ => false,
         }));
@@ -2535,12 +3199,19 @@ mod deliver_autofill_tests {
 
         let report = normalize_plan(&mut plan, &request);
         assert!(report.total_repairs > 0);
-        assert!(
-            plan.steps
-                .iter()
-                .any(|step| matches!(step.tool.kind, AgentToolKind::Navigate { .. })),
-            "navigate stage missing"
-        );
+        let has_navigate = plan
+            .steps
+            .iter()
+            .any(|step| matches!(step.tool.kind, AgentToolKind::Navigate { .. }));
+        let has_search = plan.steps.iter().any(|step| {
+            matches!(
+                &step.tool.kind,
+                AgentToolKind::Custom { name, .. }
+                    if name.eq_ignore_ascii_case("browser.search")
+                        || name.eq_ignore_ascii_case("weather.search")
+            )
+        });
+        assert!(has_navigate || has_search, "navigate/search stage missing");
         assert!(plan.steps.iter().any(|step| {
             matches!(
                 &step.tool.kind,
@@ -2625,7 +3296,7 @@ mod deliver_autofill_tests {
             ));
         }
 
-        let request = AgentRequest::new(task_id, "天气");
+        let request = AgentRequest::new(task_id, "查询北京天气");
         normalize_plan(&mut plan, &request);
 
         let weather_delivers = plan
@@ -2758,25 +3429,31 @@ mod observe_stage_tests {
                 )
             })
             .expect("observation step present");
-        let type_idx = plan
-            .steps
-            .iter()
-            .position(|step| matches!(step.tool.kind, AgentToolKind::TypeText { .. }))
-            .expect("type_text step present");
-        let click_idx = plan
-            .steps
-            .iter()
-            .position(|step| matches!(step.tool.kind, AgentToolKind::Click { .. }))
-            .expect("click step present");
-
+        let mut act_indices = Vec::new();
+        for (idx, step) in plan.steps.iter().enumerate() {
+            let is_type = matches!(step.tool.kind, AgentToolKind::TypeText { .. });
+            let is_click = matches!(step.tool.kind, AgentToolKind::Click { .. });
+            let is_search = matches!(
+                &step.tool.kind,
+                AgentToolKind::Custom { ref name, .. }
+                    if name.eq_ignore_ascii_case("browser.search")
+                        || name.eq_ignore_ascii_case("browser.search.click-result")
+                        || name.eq_ignore_ascii_case("weather.search")
+            );
+            if is_type || is_click || is_search {
+                act_indices.push(idx);
+            }
+        }
         assert!(
-            observe_idx > type_idx,
-            "observation must occur after typing the query"
+            !act_indices.is_empty(),
+            "act stage must contain typing/click/search steps"
         );
-        assert!(
-            observe_idx > click_idx,
-            "observation must occur after submitting the search"
-        );
+        if let Some(last_act) = act_indices.into_iter().max() {
+            assert!(
+                observe_idx > last_act,
+                "observation must occur after the final act step"
+            );
+        }
     }
 
     #[test]
@@ -3076,6 +3753,9 @@ fn canonical_tool_name(name: &str) -> Option<&'static str> {
         return None;
     }
     let lowered = name.trim().to_ascii_lowercase();
+    if let Some(canonical) = plugin_custom_alias(&lowered) {
+        return Some(canonical);
+    }
     let canonical = match lowered.as_str() {
         // Observation aliases
         "observe" | "page.observe" | "page.capture" | "data.observe" => OBSERVATION_CANONICAL,
@@ -3100,6 +3780,12 @@ fn canonical_tool_name(name: &str) -> Option<&'static str> {
         _ => return None,
     };
     Some(canonical)
+}
+
+fn plugin_custom_alias(name: &str) -> Option<&'static str> {
+    PLUGIN_CUSTOM_ALIAS_CASES
+        .iter()
+        .find_map(|(alias, canonical)| (*alias == name).then_some(*canonical))
 }
 
 fn browser_tool_from_alias(name: &str, payload: &Value) -> Option<AgentToolKind> {
@@ -3147,6 +3833,10 @@ fn browser_tool_from_alias(name: &str, payload: &Value) -> Option<AgentToolKind>
         }
         "browser.scroll" => {
             let target = scroll_target_from_payload(payload)?;
+            Some(AgentToolKind::Scroll { target })
+        }
+        "plugin.auto-scroll" => {
+            let target = scroll_target_from_payload(payload).unwrap_or(AgentScrollTarget::Bottom);
             Some(AgentToolKind::Scroll { target })
         }
         "browser.wait" => {
@@ -3292,7 +3982,9 @@ fn wait_condition_from_payload(payload: &Value) -> Option<AgentWaitCondition> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{AgentContext, AgentLocator, AgentTool, AgentToolKind};
+    use agent_core::{
+        AgentContext, AgentLocator, AgentScrollTarget, AgentTool, AgentToolKind, AgentWaitCondition,
+    };
     use serde_json::{json, Value};
 
     #[test]
@@ -3488,6 +4180,173 @@ mod tests {
     }
 
     #[test]
+    fn plugin_custom_aliases_map_to_supported_tools() {
+        for (alias, canonical) in PLUGIN_CUSTOM_ALIAS_CASES {
+            assert_eq!(canonical_tool_name(alias), Some(*canonical));
+        }
+    }
+
+    #[test]
+    fn plugin_auto_scroll_alias_converts_to_scroll_action() {
+        let mut plan = AgentPlan::new(TaskId::new(), "plugin scroll");
+        plan.push_step(AgentPlanStep {
+            id: "scroll".into(),
+            title: "Auto scroll".into(),
+            detail: String::new(),
+            tool: AgentTool {
+                kind: AgentToolKind::Custom {
+                    name: "plugin.auto-scroll".into(),
+                    payload: json!({}),
+                },
+                wait: WaitMode::DomReady,
+                timeout_ms: None,
+            },
+            validations: Vec::new(),
+            requires_approval: false,
+            metadata: Default::default(),
+        });
+
+        let rewrites = normalize_custom_tools(&mut plan);
+        assert_eq!(rewrites, 1);
+        match &plan.steps[0].tool.kind {
+            AgentToolKind::Scroll { target } => {
+                assert!(matches!(target, AgentScrollTarget::Bottom));
+            }
+            _ => panic!("expected scroll action"),
+        }
+    }
+
+    #[test]
+    fn retargets_blocked_google_search_to_fallback_engine() {
+        let mut plan = AgentPlan::new(TaskId::new(), "search fallback");
+        plan.push_step(AgentPlanStep::new(
+            "llm-step-1",
+            "Google search",
+            AgentTool {
+                kind: AgentToolKind::Navigate {
+                    url: "https://www.google.com/search?q=白银".into(),
+                },
+                wait: WaitMode::DomReady,
+                timeout_ms: Some(30_000),
+            },
+        ));
+        plan.push_step(AgentPlanStep::new(
+            "llm-step-2",
+            "Wait for google",
+            AgentTool {
+                kind: AgentToolKind::Wait {
+                    condition: AgentWaitCondition::UrlEquals(
+                        "https://www.google.com/search?q=白银".into(),
+                    ),
+                },
+                wait: WaitMode::DomReady,
+                timeout_ms: Some(30_000),
+            },
+        ));
+
+        let mut request = AgentRequest::new(TaskId::new(), "查询白银价格");
+        request.metadata.insert(
+            "search_base_url".to_string(),
+            Value::String("https://www.baidu.com/s?wd=".to_string()),
+        );
+        normalize_plan(&mut plan, &request);
+
+        let navigate_step = plan
+            .steps
+            .iter()
+            .find(|step| step.id == "llm-step-1")
+            .expect("navigate step missing");
+        let fallback_url = match &navigate_step.tool.kind {
+            AgentToolKind::Navigate { url } => url.clone(),
+            _ => panic!("expected navigate tool"),
+        };
+        assert!(fallback_url.contains("baidu.com"));
+
+        let wait_step = plan
+            .steps
+            .iter()
+            .find(|step| step.id == "llm-step-2")
+            .expect("wait step missing");
+        match &wait_step.tool.kind {
+            AgentToolKind::Wait { condition } => match condition {
+                AgentWaitCondition::UrlMatches(pattern) => {
+                    assert!(pattern.contains("baidu"));
+                }
+                AgentWaitCondition::UrlEquals(url) => {
+                    assert!(url.contains("baidu"));
+                }
+                other => panic!("unexpected wait condition: {:?}", other),
+            },
+            _ => panic!("expected wait step"),
+        }
+    }
+
+    #[test]
+    fn retarget_wait_tools_updates_custom_payload() {
+        let mut plan = AgentPlan::new(TaskId::new(), "custom wait fallback");
+        plan.push_step(AgentPlanStep::new(
+            "llm-step-1",
+            "Google search",
+            AgentTool {
+                kind: AgentToolKind::Navigate {
+                    url: "https://www.google.com/search?q=白银".into(),
+                },
+                wait: WaitMode::DomReady,
+                timeout_ms: Some(30_000),
+            },
+        ));
+        plan.push_step(AgentPlanStep::new(
+            "llm-step-2",
+            "wait via custom tool",
+            AgentTool {
+                kind: AgentToolKind::Custom {
+                    name: "wait-for-condition".into(),
+                    payload: json!({
+                        "expect": {
+                            "url_equals": "https://www.google.com/search?q=白银"
+                        }
+                    }),
+                },
+                wait: WaitMode::DomReady,
+                timeout_ms: Some(30_000),
+            },
+        ));
+
+        let mut ledger = PlanRepairLedger::new(PLAN_REPAIR_NOTE_BUDGET);
+        let context = StageContext {
+            current_url: None,
+            snapshot_url: None,
+            preferred_sites: Vec::new(),
+            tenant_default_url: None,
+            search_terms: vec!["查询白银价格".to_string()],
+            guardrail_keywords: Vec::new(),
+            guardrail_keyword_count: 0,
+            guardrail_domains: Vec::new(),
+            requested_outputs: Vec::new(),
+            browser_context: None,
+            search_fallback_url: "https://www.baidu.com/s?wd=查询白银价格".to_string(),
+            force_observe_current: false,
+            auto_act_retry: 0,
+            auto_act: AutoActTuning::default(),
+        };
+
+        retarget_wait_tools(&mut plan, &context, &mut ledger);
+
+        let wait_step = plan
+            .steps
+            .iter()
+            .find(|step| step.id == "llm-step-2")
+            .expect("wait step missing");
+        match &wait_step.tool.kind {
+            AgentToolKind::Custom { payload, .. } => {
+                let payload_str = payload.to_string();
+                assert!(payload_str.contains("baidu"), "payload={}", payload_str);
+            }
+            other => panic!("unexpected tool: {:?}", other),
+        }
+    }
+
+    #[test]
     fn fills_github_username_from_navigation() {
         let mut plan = AgentPlan::new(TaskId::new(), "github");
         plan.push_step(AgentPlanStep {
@@ -3636,6 +4495,138 @@ mod tests {
 
         assert!(matches!(plan.steps[0].tool.wait, WaitMode::None));
     }
+
+    #[test]
+    fn stage_auditor_inserts_search_step_for_informational_requests() {
+        let mut plan = AgentPlan::new(TaskId::new(), "informational");
+        plan.push_step(AgentPlanStep::new(
+            "nav",
+            "导航至搜索结果",
+            AgentTool {
+                kind: AgentToolKind::Navigate {
+                    url: "https://www.baidu.com/s?wd=%E6%9C%80%E9%AB%98%E4%BA%BA%E6%B0%91%E6%A3%80%E5%AF%9F%E9%99%A2".to_string(),
+                },
+                wait: WaitMode::DomReady,
+                timeout_ms: Some(30_000),
+            },
+        ));
+
+        let mut request = AgentRequest::new(TaskId::new(), "我想看下现在办理最多的案件是那种");
+        request.intent.intent_kind = AgentIntentKind::Informational;
+        request.intent.target_sites = vec!["https://stats.gov.cn".to_string()];
+        let context = ContextResolver::new(&request).build();
+
+        let mut ledger = PlanRepairLedger::new(8);
+        StageAuditor::new(&mut plan, &request, context, &mut ledger, true).audit();
+
+        assert!(
+            plan.steps.iter().any(|step| match &step.tool.kind {
+                AgentToolKind::Custom { name, .. } => name.eq_ignore_ascii_case("browser.search"),
+                _ => false,
+            }),
+            "Plan tools: {:?}",
+            plan.steps
+                .iter()
+                .map(|step| format!("{:?}", step.tool.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| matches!(step.tool.kind, AgentToolKind::Click { .. })),
+            "Plan tools: {:?}",
+            plan.steps
+                .iter()
+                .map(|step| format!("{:?}", step.tool.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn informational_pipeline_includes_observe_validate_and_deliver() {
+        let mut plan = AgentPlan::new(TaskId::new(), "informational-observe");
+        plan.push_step(AgentPlanStep::new(
+            "nav",
+            "打开首页",
+            AgentTool {
+                kind: AgentToolKind::Navigate {
+                    url: "https://www.baidu.com".to_string(),
+                },
+                wait: WaitMode::DomReady,
+                timeout_ms: Some(30_000),
+            },
+        ));
+
+        use crate::agent::guardrails::{derive_guardrail_domains, derive_guardrail_keywords};
+
+        let mut request = AgentRequest::new(TaskId::new(), "我想看下现在办理最多的案件是那种");
+        request.intent.intent_kind = AgentIntentKind::Informational;
+        request.intent.validation_keywords = vec!["最高人民检察院 案件".to_string()];
+        request.intent.target_sites = vec!["https://stats.gov.cn".to_string()];
+        assert!(!derive_guardrail_keywords(&request).is_empty());
+        assert!(!derive_guardrail_domains(&request).is_empty());
+        let context = ContextResolver::new(&request).build();
+
+        let mut ledger = PlanRepairLedger::new(16);
+        StageAuditor::new(&mut plan, &request, context, &mut ledger, true).audit();
+
+        let extract_index = plan
+            .steps
+            .iter()
+            .position(|step| match &step.tool.kind {
+                AgentToolKind::Custom { name, .. } => {
+                    name.eq_ignore_ascii_case("data.extract-site")
+                }
+                _ => false,
+            })
+            .expect("data.extract-site inserted");
+        let validate_index = plan
+            .steps
+            .iter()
+            .position(|step| match &step.tool.kind {
+                AgentToolKind::Custom { name, .. } => {
+                    name.eq_ignore_ascii_case("data.validate-target")
+                }
+                _ => false,
+            })
+            .expect("data.validate-target inserted");
+        let parse_index = plan
+            .steps
+            .iter()
+            .position(|step| match &step.tool.kind {
+                AgentToolKind::Custom { name, .. } => name.starts_with("data.parse"),
+                _ => false,
+            })
+            .expect("data.parse.* inserted");
+        let deliver_index = plan
+            .steps
+            .iter()
+            .position(|step| match &step.tool.kind {
+                AgentToolKind::Custom { name, .. } => {
+                    name.eq_ignore_ascii_case("data.deliver.structured")
+                }
+                _ => false,
+            })
+            .expect("data.deliver.structured inserted");
+
+        assert!(extract_index < validate_index);
+        assert!(validate_index < parse_index);
+        assert!(parse_index < deliver_index);
+
+        let timeline = plan
+            .meta
+            .vendor_context
+            .get("stage_timeline")
+            .expect("stage timeline");
+        assert!(
+            timeline
+                .get("stages")
+                .and_then(|value| value.as_array())
+                .map(|items| items.len())
+                .unwrap_or(0)
+                >= 4
+        );
+    }
 }
 
 /// Composite result returned to the CLI command.
@@ -3698,6 +4689,13 @@ impl<'a> fmt::Display for StepSummary<'a> {
                 format!("Wait until {}", describe_wait_condition(condition))
             }
             AgentToolKind::Custom { name, .. } => format!("Invoke custom tool '{}'", name),
+            AgentToolKind::Done { success, text } => {
+                if *success {
+                    format!("Complete task: {}", text)
+                } else {
+                    format!("Abort task: {}", text)
+                }
+            }
         };
 
         let wait_note = match step.tool.wait {

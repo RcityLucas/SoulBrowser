@@ -1,17 +1,21 @@
 use crate::errors::AgentError;
+use crate::guardrails::{derive_guardrail_domains, derive_guardrail_keywords};
 use crate::model::AgentRequest;
 use crate::plan::{
     AgentLocator, AgentPlan, AgentPlanMeta, AgentPlanStep, AgentScrollTarget, AgentTool,
     AgentToolKind, AgentValidation, AgentWaitCondition, WaitMode,
 };
-use crate::planner::{AgentPlanner, PlanStageGraph, PlannerConfig, PlannerOutcome};
+use crate::planner::{
+    resolve_quote_plan, AgentPlanner, PlanStageGraph, PlannerConfig, PlannerOutcome, QuoteQuery,
+};
 use crate::weather::{first_weather_subject, weather_query_text, weather_search_url};
+use chrono::{Datelike, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Number as JsonNumber, Value};
 use std::borrow::Cow;
-use std::collections::HashMap;
-use url::form_urlencoded;
+use std::collections::{HashMap, HashSet};
+use url::{form_urlencoded, Url};
 
 static STAGE_GRAPH: Lazy<PlanStageGraph> =
     Lazy::new(|| PlanStageGraph::load_from_env_or_default().unwrap_or_default());
@@ -42,9 +46,234 @@ impl RuleBasedPlanner {
         let intent_id = request.intent.intent_id.as_deref()?;
         match intent_id {
             "search_market_info" => Some(self.build_market_info_recipe(request)),
+            "market_quote_lookup" => Some(self.build_market_quote_recipe(request)),
             "summarize_news" => Some(self.build_news_recipe(request)),
             "fetch_weather" => Some(self.build_weather_recipe(request)),
             _ => None,
+        }
+    }
+
+    fn build_market_quote_recipe(&self, request: &AgentRequest) -> PlannerOutcome {
+        let mut plan = AgentPlan::new(request.task_id.clone(), Self::default_title(&request.goal));
+        let quote_context = QuoteIntentContext::from_request(request);
+        let guardrail_domains = derive_guardrail_domains(request);
+        let guardrail_keywords = derive_guardrail_keywords(request);
+        let plan_spec = resolve_quote_plan(request, quote_context.as_query());
+        let search_step_id = step_id(plan.steps.len());
+        let search_query = format!(
+            "{} {} 行情",
+            quote_context.metal_label, quote_context.contract
+        );
+        let site_hint = Url::parse(&plan_spec.navigate_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_string()));
+        if !guardrail_keywords.is_empty() {
+            plan.meta.vendor_context.insert(
+                "guardrail_keywords".to_string(),
+                json!({
+                    "keywords": guardrail_keywords,
+                    "count": guardrail_keywords.len(),
+                    "emitted": false,
+                }),
+            );
+        }
+        let mut search_payload = json!({
+            "query": guardrail_search_query(&search_query, &guardrail_domains),
+        });
+        plan.push_step(
+            AgentPlanStep::new(
+                search_step_id,
+                format!("搜索{}行情入口", quote_context.metal_label),
+                AgentTool {
+                    kind: AgentToolKind::Custom {
+                        name: "browser.search".to_string(),
+                        payload: search_payload,
+                    },
+                    wait: WaitMode::DomReady,
+                    timeout_ms: Some(30_000),
+                },
+            )
+            .with_detail(format!(
+                "使用搜索引擎定位可靠的{}报价页面，必要时可更换站点",
+                quote_context.metal_label
+            )),
+        );
+        let target_domain = site_hint.clone();
+        let auto_act_domains = auto_act_domain_hints(target_domain.clone(), &guardrail_domains);
+        let refresh_queries = guardrail_refresh_queries(&search_query, &auto_act_domains);
+        if !auto_act_domains.is_empty() {
+            plan.meta.vendor_context.insert(
+                "auto_act_engine".to_string(),
+                json!({
+                    "engine": "baidu",
+                    "domains": auto_act_domains.clone(),
+                    "emitted": false,
+                }),
+            );
+        }
+        let auto_click_id = step_id(plan.steps.len());
+        let auto_detail = if auto_act_domains.is_empty() {
+            format!("自动点击{}的搜索结果", quote_context.metal_label)
+        } else {
+            format!("优先打开 {} 的搜索结果", auto_act_domains.join(" / "))
+        };
+        let auto_payload = json!({
+            "engine": "baidu",
+            "selectors": ["div#content_left h3 a", "div#content_left a"],
+            "domains": auto_act_domains,
+            "max_candidates": 40,
+            "max_attempts": 3,
+            "wait_per_candidate_ms": 15_000,
+            "guardrail_queries": refresh_queries,
+        });
+        let mut auto_step = AgentPlanStep::new(
+            auto_click_id.clone(),
+            format!("打开{}权威结果", quote_context.metal_label),
+            AgentTool {
+                kind: AgentToolKind::Custom {
+                    name: "browser.search.click-result".to_string(),
+                    payload: auto_payload,
+                },
+                wait: WaitMode::DomReady,
+                timeout_ms: Some(60_000),
+            },
+        )
+        .with_detail(auto_detail);
+        if let Some(ref domain) = target_domain {
+            auto_step
+                .metadata
+                .insert("expected_url".to_string(), json!(domain));
+        }
+        if !refresh_queries.is_empty() {
+            let max_retries = refresh_queries.len().min(3) as u32;
+            auto_step.metadata.insert(
+                "auto_act_refresh".to_string(),
+                json!({
+                    "engine": "baidu",
+                    "queries": refresh_queries,
+                    "max_retries": max_retries,
+                }),
+            );
+        }
+        plan.push_step(auto_step);
+        let observe_url = plan_spec.navigate_url.clone();
+        let mut navigate_step = AgentPlanStep::new(
+            step_id(plan.steps.len()),
+            "选择行情数据源并打开",
+            AgentTool {
+                kind: AgentToolKind::Navigate {
+                    url: plan_spec.navigate_url.clone(),
+                },
+                wait: WaitMode::DomReady,
+                timeout_ms: Some(30_000),
+            },
+        )
+        .with_detail(format!(
+            "打开{}行情页面（来源：{}）",
+            quote_context.metal_label, observe_url
+        ));
+        if let Some(ref domain) = target_domain {
+            navigate_step
+                .metadata
+                .insert("expected_url".to_string(), json!(domain));
+        }
+        plan.push_step(navigate_step);
+
+        let observe_step_id = step_id(plan.steps.len());
+        plan.push_step(
+            AgentPlanStep::new(
+                observe_step_id.clone(),
+                "采集行情快照",
+                AgentTool {
+                    kind: AgentToolKind::Custom {
+                        name: "market.quote.fetch".to_string(),
+                        payload: plan_spec.payload.clone(),
+                    },
+                    wait: WaitMode::None,
+                    timeout_ms: Some(10_000),
+                },
+            )
+            .with_detail("调用行情 API 并在页面中抓取备选表格/要素"),
+        );
+
+        let validation_keywords =
+            assemble_validation_keywords(request, &quote_context.validation_keywords());
+        let candidate_urls =
+            candidate_urls_from_payload(&plan_spec.payload, &plan_spec.navigate_url);
+        let allowed_domains =
+            collect_allowed_domains(&request.intent.allowed_domains, &candidate_urls);
+        if let Some(step) = build_target_validation_step(
+            plan.steps.len(),
+            &observe_step_id,
+            &validation_keywords,
+            &allowed_domains,
+            Some(200),
+            &format!("确认{}行情页面有效", quote_context.metal_label),
+        ) {
+            plan.push_step(step);
+        }
+
+        let parse_step_id = step_id(plan.steps.len());
+        plan.push_step(AgentPlanStep::new(
+            parse_step_id.clone(),
+            "解析金属价格",
+            AgentTool {
+                kind: AgentToolKind::Custom {
+                    name: "data.parse.metal_price".to_string(),
+                    payload: json!({
+                        "source_step_id": observe_step_id,
+                        "detail": "结构化提取金属行情表格",
+                    }),
+                },
+                wait: WaitMode::None,
+                timeout_ms: Some(5_000),
+            },
+        ));
+
+        let validate_step_id = step_id(plan.steps.len());
+        plan.push_step(AgentPlanStep::new(
+            validate_step_id.clone(),
+            "校验金属行情有效性",
+            AgentTool {
+                kind: AgentToolKind::Custom {
+                    name: "data.validate.metal_price".to_string(),
+                    payload: json!({
+                        "source_step_id": parse_step_id,
+                        "metal_keyword": quote_context.metal_label,
+                        "allowed_markets": quote_context.allowed_markets,
+                        "max_age_hours": 24,
+                    }),
+                },
+                wait: WaitMode::None,
+                timeout_ms: Some(3_000),
+            },
+        ));
+
+        let schema = required_schema(request, "metal_price_v1.json");
+        plan.push_step(AgentPlanStep::new(
+            step_id(plan.steps.len()),
+            "交付金属报价结果",
+            AgentTool {
+                kind: AgentToolKind::Custom {
+                    name: "data.deliver.structured".to_string(),
+                    payload: json!({
+                        "schema": schema,
+                        "artifact_label": "structured.metal_price_v1",
+                        "filename": schema,
+                        "source_step_id": parse_step_id,
+                        "target_url": observe_url,
+                    }),
+                },
+                wait: WaitMode::None,
+                timeout_ms: Some(2_000),
+            },
+        ));
+
+        plan.meta = recipe_meta(request, "market_quote_lookup");
+        attach_stage_metadata(&mut plan, request);
+        PlannerOutcome {
+            plan,
+            explanations: vec!["Intent recipe market_quote_lookup applied".to_string()],
         }
     }
 
@@ -342,6 +571,20 @@ impl RuleBasedPlanner {
             )
             .with_detail("Capture the destination page for parsing"),
         );
+
+        let validation_keywords = assemble_validation_keywords(request, &[]);
+        let allowed_domains =
+            collect_allowed_domains(&request.intent.allowed_domains, &[default_url.clone()]);
+        if let Some(step) = build_target_validation_step(
+            steps.len(),
+            &observe_id,
+            &validation_keywords,
+            &allowed_domains,
+            Some(200),
+            "确保采集页面与目标一致",
+        ) {
+            steps.push(step);
+        }
 
         if let Some(schema) = first_required_schema(request) {
             let parse_id = step_id(steps.len());
@@ -960,6 +1203,186 @@ fn preferred_intent_site(request: &AgentRequest, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+#[derive(Debug, Clone)]
+struct QuoteIntentContext {
+    metal_label: String,
+    slug: String,
+    contract: String,
+    prefer_spot: bool,
+    allowed_markets: Vec<String>,
+}
+
+impl QuoteIntentContext {
+    fn from_request(request: &AgentRequest) -> Self {
+        let text = if !request.goal.trim().is_empty() {
+            request.goal.as_str()
+        } else {
+            request
+                .intent
+                .primary_goal
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| request.goal.as_str())
+        };
+        let (label, symbol) = detect_metal_symbol(text);
+        let slug = symbol.to_ascii_lowercase();
+        let prefer_spot =
+            contains_any(text, &["现货", "spot", "即期"]) || matches!(symbol, "AG" | "AU");
+        let contract_suffix = detect_contract_suffix(text).unwrap_or_else(|| "0".to_string());
+        let contract = format!("{}{}", symbol, contract_suffix);
+        let allowed_markets = infer_allowed_markets(text, prefer_spot);
+        Self {
+            metal_label: label.to_string(),
+            slug,
+            contract,
+            prefer_spot,
+            allowed_markets,
+        }
+    }
+
+    fn as_query(&self) -> QuoteQuery<'_> {
+        QuoteQuery {
+            metal_label: &self.metal_label,
+            contract: &self.contract,
+            slug: &self.slug,
+            prefer_spot: self.prefer_spot,
+            allowed_markets: &self.allowed_markets,
+        }
+    }
+
+    fn validation_keywords(&self) -> Vec<String> {
+        let mut keywords = Vec::new();
+        keywords.push(self.metal_label.clone());
+        append_unique_keyword(&mut keywords, &self.slug);
+        append_unique_keyword(&mut keywords, &self.slug.to_ascii_uppercase());
+        append_unique_keyword(&mut keywords, &self.contract);
+        keywords
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    if haystack.is_empty() {
+        return false;
+    }
+    let lower = haystack.to_ascii_lowercase();
+    needles.iter().any(|needle| {
+        let trimmed = needle.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        haystack.contains(trimmed) || lower.contains(&trimmed.to_ascii_lowercase())
+    })
+}
+
+fn detect_metal_symbol(text: &str) -> (&'static str, &'static str) {
+    for keyword in METAL_KEYWORDS.iter() {
+        if contains_any(text, keyword.aliases) {
+            return (keyword.label, keyword.symbol);
+        }
+    }
+    ("铜", "CU")
+}
+
+fn detect_contract_suffix(text: &str) -> Option<String> {
+    CONTRACT_HINT_RE
+        .captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+        .filter(|code| code.len() >= 2)
+        .map(|code| {
+            if code.len() == 2 {
+                format!("{:02}{}", Utc::now().year() % 100, code)
+            } else {
+                code
+            }
+        })
+}
+
+fn infer_allowed_markets(text: &str, prefer_spot: bool) -> Vec<String> {
+    let mut markets = Vec::new();
+    if prefer_spot {
+        markets.push("上海期货交易所".to_string());
+    }
+    if contains_any(text, &["伦敦", "LME"]) {
+        markets.push("伦敦金属交易所".to_string());
+    }
+    if contains_any(text, &["上海", "SHFE", "国内"]) {
+        markets.push("上海期货交易所".to_string());
+    }
+    if markets.is_empty() {
+        markets.push("上海期货交易所".to_string());
+        markets.push("伦敦金属交易所".to_string());
+    }
+    dedup_preserve(markets)
+}
+
+fn dedup_preserve(source: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for entry in source {
+        if seen.insert(entry.clone()) {
+            output.push(entry);
+        }
+    }
+    output
+}
+
+struct MetalKeyword {
+    label: &'static str,
+    symbol: &'static str,
+    aliases: &'static [&'static str],
+}
+
+const METAL_KEYWORDS: &[MetalKeyword] = &[
+    MetalKeyword {
+        label: "铜",
+        symbol: "CU",
+        aliases: &["铜", "copper", "cu"],
+    },
+    MetalKeyword {
+        label: "铝",
+        symbol: "AL",
+        aliases: &["铝", "aluminum", "al"],
+    },
+    MetalKeyword {
+        label: "镍",
+        symbol: "NI",
+        aliases: &["镍", "nickel", "ni"],
+    },
+    MetalKeyword {
+        label: "锌",
+        symbol: "ZN",
+        aliases: &["锌", "zinc", "zn"],
+    },
+    MetalKeyword {
+        label: "铅",
+        symbol: "PB",
+        aliases: &["铅", "lead", "pb"],
+    },
+    MetalKeyword {
+        label: "锡",
+        symbol: "SN",
+        aliases: &["锡", "tin", "sn"],
+    },
+    MetalKeyword {
+        label: "黄金",
+        symbol: "AU",
+        aliases: &["金", "黄金", "gold", "au"],
+    },
+    MetalKeyword {
+        label: "白银",
+        symbol: "AG",
+        aliases: &["银", "白银", "silver", "ag"],
+    },
+    MetalKeyword {
+        label: "原油",
+        symbol: "SC",
+        aliases: &["油", "原油", "oil", "sc"],
+    },
+];
+
+static CONTRACT_HINT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d{4})").unwrap());
+
 fn required_schema(request: &AgentRequest, fallback: &str) -> String {
     request
         .intent
@@ -1021,12 +1444,12 @@ fn infer_url_from_goal(goal: &str) -> String {
         return format!("https://www.baidu.com/s?wd={encoded}%20天气");
     }
     if lowered.contains("news") || goal.contains("新闻") {
-        return format!("https://news.google.com/search?q={encoded}");
+        return format!("https://news.baidu.com/ns?word={encoded}");
     }
     if lowered.contains("market") || lowered.contains("stock") || goal.contains("行情") {
         return format!("https://www.baidu.com/s?wd={encoded}%20行情");
     }
-    format!("https://www.google.com/search?q={encoded}")
+    format!("https://www.baidu.com/s?wd={encoded}")
 }
 
 fn first_required_schema(request: &AgentRequest) -> Option<String> {
@@ -1041,6 +1464,164 @@ fn first_required_schema(request: &AgentRequest) -> Option<String> {
 
 fn encode_query(goal: &str) -> String {
     form_urlencoded::byte_serialize(goal.as_bytes()).collect()
+}
+
+fn assemble_validation_keywords(request: &AgentRequest, extras: &[String]) -> Vec<String> {
+    let mut keywords = default_intent_keywords(request);
+    for extra in extras {
+        append_unique_keyword(&mut keywords, extra);
+    }
+    keywords.truncate(10);
+    keywords
+}
+
+fn default_intent_keywords(request: &AgentRequest) -> Vec<String> {
+    let mut keywords: Vec<String> = request
+        .intent
+        .validation_keywords
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if keywords.is_empty() {
+        if let Some(goal) = request.intent.primary_goal.as_deref() {
+            keywords.extend(split_goal_terms(goal));
+        }
+    }
+    if keywords.is_empty() {
+        keywords.extend(split_goal_terms(&request.goal));
+    }
+    keywords
+}
+
+fn split_goal_terms(goal: &str) -> Vec<String> {
+    if goal.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut terms = Vec::new();
+    for chunk in goal.split(|ch: char| {
+        matches!(
+            ch,
+            ',' | '，'
+                | '。'
+                | ';'
+                | '；'
+                | ':'
+                | '：'
+                | '/'
+                | '|'
+                | '\\'
+                | '、'
+                | '!'
+                | '！'
+                | '?'
+                | '？'
+                | '-'
+                | '—'
+                | '\t'
+        )
+    }) {
+        let trimmed = chunk.trim();
+        if !trimmed.is_empty() {
+            terms.push(trimmed.to_string());
+        }
+    }
+    if terms.is_empty() {
+        terms.push(goal.trim().to_string());
+    }
+    terms
+}
+
+fn append_unique_keyword(keywords: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if keywords
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+    {
+        return;
+    }
+    keywords.push(trimmed.to_string());
+}
+
+fn collect_allowed_domains(intent_domains: &[String], urls: &[String]) -> Vec<String> {
+    let mut domains: Vec<String> = intent_domains
+        .iter()
+        .filter_map(|value| normalize_domain(value))
+        .collect();
+    for url in urls {
+        if let Some(domain) = normalize_domain(url) {
+            domains.push(domain);
+        }
+    }
+    domains.retain(|value| !value.is_empty());
+    let mut seen = HashSet::new();
+    domains
+        .into_iter()
+        .filter(|domain| seen.insert(domain.clone()))
+        .collect()
+}
+
+fn normalize_domain(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains('/') {
+        Url::parse(trimmed)
+            .ok()
+            .and_then(|parsed| parsed.domain().map(|domain| domain.to_ascii_lowercase()))
+    } else {
+        Some(trimmed.trim_start_matches("www.").to_ascii_lowercase())
+    }
+}
+
+fn candidate_urls_from_payload(payload: &Value, navigate_url: &str) -> Vec<String> {
+    let mut urls = vec![navigate_url.to_string()];
+    if let Some(fallbacks) = payload.get("fallback_sources").and_then(Value::as_array) {
+        for entry in fallbacks {
+            if let Some(url) = entry.get("source_url").and_then(Value::as_str) {
+                urls.push(url.to_string());
+            }
+        }
+    }
+    urls
+}
+
+fn build_target_validation_step(
+    index: usize,
+    source_step_id: &str,
+    keywords: &[String],
+    allowed_domains: &[String],
+    expected_status: Option<u16>,
+    detail: &str,
+) -> Option<AgentPlanStep> {
+    if keywords.is_empty() && allowed_domains.is_empty() && expected_status.is_none() {
+        return None;
+    }
+    let payload = json!({
+        "source_step_id": source_step_id,
+        "keywords": keywords,
+        "allowed_domains": allowed_domains,
+        "expected_status": expected_status,
+    });
+    Some(
+        AgentPlanStep::new(
+            step_id(index),
+            "验证目标页面",
+            AgentTool {
+                kind: AgentToolKind::Custom {
+                    name: "data.validate-target".to_string(),
+                    payload,
+                },
+                wait: WaitMode::None,
+                timeout_ms: Some(3_000),
+            },
+        )
+        .with_detail(detail.to_string()),
+    )
 }
 
 fn extract_first_quoted(text: &str) -> Option<String> {
@@ -1208,3 +1789,156 @@ static SCROLL_PIXELS_REGEX: Lazy<Regex> = Lazy::new(|| {
 });
 
 const DEFAULT_SCROLL_PIXELS: i32 = 600;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soulbrowser_core_types::TaskId;
+
+    fn build_quote_request(goal: &str) -> AgentRequest {
+        let mut request = AgentRequest::new(TaskId::new(), goal);
+        request.intent.intent_id = Some("market_quote_lookup".to_string());
+        request.intent.primary_goal = Some(goal.to_string());
+        request
+    }
+
+    #[test]
+    fn quote_source_defaults_to_qh_contract_page() {
+        let request = build_quote_request("查询铜价");
+        let context = QuoteIntentContext::from_request(&request);
+        let plan_spec = resolve_quote_plan(&request, context.as_query());
+        assert!(plan_spec
+            .navigate_url
+            .starts_with("https://quote.eastmoney.com/qh/"));
+    }
+
+    #[test]
+    fn quote_source_prefers_spot_site_when_requested() {
+        let request = build_quote_request("查询铜现货价格");
+        let context = QuoteIntentContext::from_request(&request);
+        assert_eq!(context.prefer_spot, true);
+        let plan_spec = resolve_quote_plan(&request, context.as_query());
+        assert!(plan_spec
+            .navigate_url
+            .starts_with("https://finance.sina.com.cn/futures/quotes/"));
+    }
+
+    #[test]
+    fn silver_quote_defaults_to_spot_site() {
+        let request = build_quote_request("查询白银价格");
+        let context = QuoteIntentContext::from_request(&request);
+        assert_eq!(context.slug, "ag");
+        assert!(context.prefer_spot);
+        let plan_spec = resolve_quote_plan(&request, context.as_query());
+        assert_eq!(
+            plan_spec.navigate_url,
+            "https://finance.sina.com.cn/futures/quotes/AG0.shtml"
+        );
+    }
+
+    #[test]
+    fn quote_source_respects_explicit_target_site() {
+        let mut request = build_quote_request("查询铜价");
+        request.intent.target_sites = vec!["https://example.com/custom".to_string()];
+        let context = QuoteIntentContext::from_request(&request);
+        let plan_spec = resolve_quote_plan(&request, context.as_query());
+        assert_eq!(plan_spec.navigate_url, "https://example.com/custom");
+    }
+
+    #[test]
+    fn quote_plan_contains_fallback_sources() {
+        let request = build_quote_request("查询铜价");
+        let context = QuoteIntentContext::from_request(&request);
+        let plan_spec = resolve_quote_plan(&request, context.as_query());
+        assert!(plan_spec
+            .payload
+            .get("fallback_sources")
+            .and_then(Value::as_array)
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn quote_context_prefers_user_goal_over_template_goal() {
+        let mut request = build_quote_request("请查看白银最新价格");
+        request.intent.primary_goal = Some("查询指定金属的最新行情".to_string());
+        let context = QuoteIntentContext::from_request(&request);
+        assert_eq!(context.metal_label, "白银");
+        assert_eq!(context.contract, "AG0");
+    }
+
+    #[test]
+    fn quote_plan_ignores_hint_sites_for_manual_override() {
+        let mut request = build_quote_request("查一下白银价格");
+        request.intent.primary_goal = Some("查询指定金属的最新行情".to_string());
+        request.intent.target_sites = vec!["https://quote.eastmoney.com/qh/CU0.html".to_string()];
+        request.intent.target_sites_are_hints = true;
+        let context = QuoteIntentContext::from_request(&request);
+        let plan_spec = resolve_quote_plan(&request, context.as_query());
+        assert!(plan_spec.navigate_url.contains("AG0"));
+        assert!(plan_spec.sources.iter().all(|id| id != "manual_override"));
+    }
+
+    #[test]
+    fn mismatched_manual_override_is_demoted() {
+        let mut request = build_quote_request("查一下白银价格");
+        request.intent.target_sites = vec!["https://quote.eastmoney.com/qh/CU0.html".to_string()];
+        request.intent.target_sites_are_hints = false;
+        let context = QuoteIntentContext::from_request(&request);
+        let plan_spec = resolve_quote_plan(&request, context.as_query());
+        assert!(plan_spec.navigate_url.to_ascii_lowercase().contains("ag"));
+        assert!(plan_spec.sources.iter().all(|id| id != "manual_override"));
+    }
+}
+
+fn auto_act_domain_hints(
+    target_domain: Option<String>,
+    guardrail_domains: &[String],
+) -> Vec<String> {
+    let mut hints = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(domain) = target_domain {
+        let normalized = domain.trim().trim_start_matches("www.");
+        if !normalized.is_empty() && seen.insert(normalized.to_ascii_lowercase()) {
+            hints.push(normalized.to_string());
+        }
+    }
+    for domain in guardrail_domains {
+        let normalized = domain.trim().trim_start_matches("www.");
+        if normalized.is_empty() {
+            continue;
+        }
+        if seen.insert(normalized.to_ascii_lowercase()) {
+            hints.push(normalized.to_string());
+        }
+    }
+    hints
+}
+
+fn guardrail_refresh_queries(base_query: &str, domains: &[String]) -> Vec<String> {
+    let mut queries = Vec::new();
+    let mut seen = HashSet::new();
+    for domain in domains {
+        let candidate = format!("{base_query} site:{domain}");
+        if seen.insert(candidate.to_ascii_lowercase()) {
+            queries.push(candidate);
+        }
+    }
+    if seen.insert(base_query.to_ascii_lowercase()) {
+        queries.push(base_query.to_string());
+    }
+    let fallback = format!("{base_query} 最新 行情");
+    if seen.insert(fallback.to_ascii_lowercase()) {
+        queries.push(fallback);
+    }
+    queries.truncate(5);
+    queries
+}
+
+fn guardrail_search_query(base_query: &str, domains: &[String]) -> String {
+    if let Some(domain) = domains.first() {
+        format!("{base_query} site:{domain}")
+    } else {
+        base_query.to_string()
+    }
+}

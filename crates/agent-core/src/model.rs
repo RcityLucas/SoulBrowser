@@ -61,6 +61,33 @@ impl AgentContext {
     }
 }
 
+/// Execution mode for the agent.
+///
+/// Determines how the agent processes the user's request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// Plan-Execute Mode (default): Generate a complete plan upfront,
+    /// then execute sequentially. Replanning only occurs on failure.
+    #[default]
+    PlanExecute,
+    /// Agent Loop Mode: Browser-use style iterative execution where
+    /// the LLM is consulted at each step based on current browser state.
+    AgentLoop,
+}
+
+impl ExecutionMode {
+    /// Check if this is agent loop mode.
+    pub fn is_agent_loop(&self) -> bool {
+        matches!(self, ExecutionMode::AgentLoop)
+    }
+
+    /// Check if this is plan-execute mode.
+    pub fn is_plan_execute(&self) -> bool {
+        matches!(self, ExecutionMode::PlanExecute)
+    }
+}
+
 /// Classification assigned to the user's intent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -92,12 +119,27 @@ pub struct AgentIntentMetadata {
     #[serde(default)]
     pub target_sites: Vec<String>,
     #[serde(default)]
+    pub target_sites_are_hints: bool,
+    #[serde(default)]
     pub required_outputs: Vec<RequestedOutput>,
     pub preferred_language: Option<String>,
     #[serde(default)]
     pub blocker_remediations: Vec<(String, String)>,
     #[serde(default)]
+    pub validation_keywords: Vec<String>,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
     pub intent_kind: AgentIntentKind,
+}
+
+impl AgentIntentMetadata {
+    pub fn is_market_intent(&self) -> bool {
+        matches!(
+            self.intent_id.as_deref(),
+            Some("market_quote_lookup") | Some("search_market_info")
+        )
+    }
 }
 
 impl Default for AgentIntentMetadata {
@@ -106,9 +148,12 @@ impl Default for AgentIntentMetadata {
             intent_id: None,
             primary_goal: None,
             target_sites: Vec::new(),
+            target_sites_are_hints: false,
             required_outputs: Vec::new(),
             preferred_language: None,
             blocker_remediations: Vec::new(),
+            validation_keywords: Vec::new(),
+            allowed_domains: Vec::new(),
             intent_kind: AgentIntentKind::Operational,
         }
     }
@@ -161,6 +206,9 @@ pub struct AgentRequest {
     /// Optional intent metadata populated by the caller.
     #[serde(default)]
     pub intent: AgentIntentMetadata,
+    /// Execution mode: Plan-Execute or Agent Loop.
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
 }
 
 fn default_allow_custom() -> bool {
@@ -179,11 +227,26 @@ impl AgentRequest {
             allow_custom_tools: false,
             metadata: HashMap::new(),
             intent: AgentIntentMetadata::default(),
+            execution_mode: ExecutionMode::default(),
+        }
+    }
+
+    /// Create a new request configured for agent loop mode.
+    pub fn agent_loop(task_id: TaskId, goal: impl Into<String>) -> Self {
+        Self {
+            execution_mode: ExecutionMode::AgentLoop,
+            ..Self::new(task_id, goal)
         }
     }
 
     pub fn with_context(mut self, context: AgentContext) -> Self {
         self.context = Some(context);
+        self
+    }
+
+    /// Set the execution mode.
+    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
+        self.execution_mode = mode;
         self
     }
 

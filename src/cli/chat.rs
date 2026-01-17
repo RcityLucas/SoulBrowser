@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,14 +9,20 @@ use serde_yaml;
 use tokio::fs;
 use tracing::info;
 
-use agent_core::{AgentContext, AgentRequest, ConversationRole, ConversationTurn};
+use agent_core::AgentContext;
+use soulbrowser_kernel::agent::executor::{ExecutionMemoryEntry, SearchContext};
 use soulbrowser_kernel::agent::{
-    execute_plan, ChatSessionOutput, FlowExecutionOptions, FlowExecutionReport, StepExecutionStatus,
+    execute_plan,
+    message_manager::{HistoryItem, MessageManager},
+    ChatSessionOutput, FlowExecutionOptions, FlowExecutionReport, StepExecutionStatus,
 };
 use soulbrowser_kernel::chat_support::{
-    build_chat_runner, ChatRunnerBuild, LlmProviderConfig, LlmProviderSelection, PlannerSelection,
+    apply_message_manager_metadata, apply_tool_registry_prompt, build_chat_runner,
+    failed_step_context, guardrail_requires_replan, ChatRunnerBuild, LlmProviderConfig,
+    LlmProviderSelection, PlannerSelection,
 };
 use soulbrowser_kernel::plan_payload;
+use soulbrowser_kernel::replan::augment_request_for_replan;
 use soulbrowser_state_center::{DispatchStatus, PerceiverEventKind, StateEvent};
 
 use crate::cli::context::CliContext;
@@ -135,6 +142,8 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
     }
 
     let app_context = ctx.app_context().await?;
+    ctx.ensure_tool_registry_loaded(app_context.tool_registry())
+        .await?;
 
     let mut agent_context = AgentContext::default();
     if let Some(url) = args.current_url.clone() {
@@ -169,7 +178,116 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
         api_base: args.llm_api_base.clone(),
         temperature: args.llm_temperature,
         api_key: args.llm_api_key.clone(),
+        backup_api_key: None,
         max_output_tokens: args.llm_max_output_tokens,
+        // Provider-specific keys from config file
+        openai_api_key: ctx
+            .config()
+            .soul
+            .providers
+            .openai
+            .as_ref()
+            .and_then(|p| p.api_key.clone()),
+        zhipu_api_key: ctx
+            .config()
+            .soul
+            .providers
+            .zhipu
+            .as_ref()
+            .and_then(|p| p.api_key.clone()),
+        anthropic_api_key: ctx
+            .config()
+            .soul
+            .providers
+            .anthropic
+            .as_ref()
+            .and_then(|p| p.api_key.clone()),
+        deepseek_api_key: ctx
+            .config()
+            .soul
+            .providers
+            .deepseek
+            .as_ref()
+            .and_then(|p| p.api_key.clone()),
+        // Provider-specific API base URLs from config file
+        openai_api_base: ctx
+            .config()
+            .soul
+            .providers
+            .openai
+            .as_ref()
+            .and_then(|p| p.api_base.clone()),
+        zhipu_api_base: ctx
+            .config()
+            .soul
+            .providers
+            .zhipu
+            .as_ref()
+            .and_then(|p| p.api_base.clone()),
+        anthropic_api_base: ctx
+            .config()
+            .soul
+            .providers
+            .anthropic
+            .as_ref()
+            .and_then(|p| p.api_base.clone()),
+        deepseek_api_base: ctx
+            .config()
+            .soul
+            .providers
+            .deepseek
+            .as_ref()
+            .and_then(|p| p.api_base.clone()),
+        // Provider-specific models from config file
+        openai_model: ctx
+            .config()
+            .soul
+            .providers
+            .openai
+            .as_ref()
+            .and_then(|p| p.model.clone()),
+        zhipu_model: ctx
+            .config()
+            .soul
+            .providers
+            .zhipu
+            .as_ref()
+            .and_then(|p| p.model.clone()),
+        anthropic_model: ctx
+            .config()
+            .soul
+            .providers
+            .anthropic
+            .as_ref()
+            .and_then(|p| p.model.clone()),
+        deepseek_model: ctx
+            .config()
+            .soul
+            .providers
+            .deepseek
+            .as_ref()
+            .and_then(|p| p.model.clone()),
+        gemini_api_key: ctx
+            .config()
+            .soul
+            .providers
+            .gemini
+            .as_ref()
+            .and_then(|p| p.api_key.clone()),
+        gemini_api_base: ctx
+            .config()
+            .soul
+            .providers
+            .gemini
+            .as_ref()
+            .and_then(|p| p.api_base.clone()),
+        gemini_model: ctx
+            .config()
+            .soul
+            .providers
+            .gemini
+            .as_ref()
+            .and_then(|p| p.model.clone()),
     };
 
     let ChatRunnerBuild {
@@ -177,6 +295,7 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
         planner_used: actual_planner,
         provider_used,
         fallback_reason,
+        llm_backend: _,
     } = build_chat_runner(planner_choice, llm_choice, llm_config, None, None)?;
 
     let planner_warning = fallback_reason.clone();
@@ -199,6 +318,8 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
         },
         args.constraints.clone(),
     );
+    let tool_registry = app_context.tool_registry();
+    apply_tool_registry_prompt(&mut exec_request, tool_registry.as_ref(), 12);
 
     if let Some(note) = planner_warning {
         exec_request
@@ -218,6 +339,9 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
         );
     }
 
+    // Reduced max_history from 20 to 8 to save tokens on OpenAI API calls
+    let mut message_manager = MessageManager::new(prompt.clone()).with_max_history(Some(8));
+    apply_message_manager_metadata(&mut exec_request, &message_manager);
     let mut current_session = runner.plan(exec_request.clone()).await?;
 
     let mut plan_payloads = Vec::new();
@@ -241,6 +365,7 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
     }
 
     let mut attempt = 0u32;
+    let mut guardrail_bonus_used = false;
 
     loop {
         plan_payloads.push(plan_payload(&current_session));
@@ -278,8 +403,14 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
             break;
         }
 
+        let guardrail_forced = guardrail_requires_replan(&exec_report);
         if attempt >= args.max_replans.into() {
-            if let Some(last) = exec_report
+            if guardrail_forced && !guardrail_bonus_used {
+                guardrail_bonus_used = true;
+                if matches!(output, OutputFormat::Human) {
+                    println!("Guardrail 命中 page_not_found/url_mismatch，自动追加一次重规划");
+                }
+            } else if let Some(last) = exec_report
                 .steps
                 .iter()
                 .rev()
@@ -291,17 +422,51 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
             }
         }
 
-        if let Some(updated) = augment_request_for_replan(&exec_request, &exec_report, attempt) {
-            exec_request = updated;
+        let (observation_summary, blocker_kind) = failed_step_context(&exec_report);
+        if let Some(summary) = observation_summary.as_deref() {
+            message_manager.push_read_state(summary.to_string());
         }
-
-        current_session = runner.plan(exec_request.clone()).await?;
+        if let Some(kind) = blocker_kind.as_deref() {
+            message_manager.push_item(HistoryItem::with_label(
+                "blocker",
+                format!("attempt_{}", attempt + 1),
+                kind.to_string(),
+            ));
+        }
+        let history_prompt = message_manager.agent_history_prompt();
+        let Some((next_request, failure_summary)) = augment_request_for_replan(
+            &exec_request,
+            &exec_report,
+            attempt,
+            observation_summary.as_deref(),
+            blocker_kind.as_deref(),
+            history_prompt.as_deref(),
+        ) else {
+            bail!("Execution failed and replan context was unavailable");
+        };
+        message_manager.push_item(HistoryItem::with_label(
+            "evaluation",
+            format!("attempt_{}", attempt + 1),
+            failure_summary.clone(),
+        ));
+        let mut next_request = next_request;
+        apply_message_manager_metadata(&mut next_request, &message_manager);
+        let replanned = runner
+            .replan(
+                next_request.clone(),
+                &current_session.plan,
+                &failure_summary,
+            )
+            .await?;
+        current_session = replanned;
+        exec_request = next_request;
         attempt += 1;
     }
 
     let state_events_slice = state_events_payload.as_ref().map(|v| v.as_slice());
     let (execution_payloads, manifest) =
         build_execution_payloads(&execution_reports, state_events_slice);
+    let message_manager_state = serde_json::to_value(message_manager.snapshot())?;
 
     if !matches!(output, OutputFormat::Human) {
         emit_structured_output(
@@ -309,6 +474,7 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
             &execution_payloads,
             &manifest,
             state_events_slice,
+            Some(&message_manager_state),
             output.clone(),
             args.artifacts_only,
         )?;
@@ -326,9 +492,14 @@ pub async fn cmd_chat(args: ChatArgs, ctx: &CliContext, output: OutputFormat) ->
             &execution_payloads,
             &manifest,
             state_events_slice,
+            Some(&message_manager_state),
         )
         .await?;
         info!("Run data saved to: {}", path.display());
+    }
+
+    if matches!(output, OutputFormat::Human) {
+        print_message_manager_state(&message_manager);
     }
 
     Ok(())
@@ -361,20 +532,70 @@ fn print_human_plan(session: &ChatSessionOutput, attempt: u32) {
 fn print_execution_summary(report: &FlowExecutionReport, attempt: u32) {
     println!("Execution Summary (attempt {})", attempt + 1);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    let memory_lookup: HashMap<&str, &ExecutionMemoryEntry> = report
+        .memory_log
+        .iter()
+        .map(|entry| (entry.step_id.as_str(), entry))
+        .collect();
     for (idx, step) in report.steps.iter().enumerate() {
-        let _status = match step.status {
+        let status = match step.status {
             StepExecutionStatus::Success => "success",
             StepExecutionStatus::Failed => "failed",
         };
         println!(
-            "  - Step {}: {} ({} attempt{})",
+            "  - Step {}: {} [{} | {} attempt{}]",
             idx + 1,
             step.title,
+            status,
             step.attempts,
             if step.attempts == 1 { "" } else { "s" }
         );
+        if let Some(summary) = &step.observation_summary {
+            println!("      observation: {}", summary);
+        }
+        if let Some(kind) = &step.blocker_kind {
+            println!("      blocker: {}", kind);
+        }
         if let Some(error) = &step.error {
             println!("      error: {}", error);
+        }
+        if let Some(entry) = memory_lookup.get(step.step_id.as_str()) {
+            print_timeline_channel(
+                "thinking",
+                agent_state_text(&step.agent_state, "thinking").or_else(|| entry.thinking.clone()),
+            );
+            print_timeline_channel(
+                "evaluation",
+                agent_state_text(&step.agent_state, "evaluation")
+                    .or_else(|| entry.evaluation.clone()),
+            );
+            print_timeline_channel(
+                "memory",
+                agent_state_text(&step.agent_state, "memory").or_else(|| entry.memory.clone()),
+            );
+            print_timeline_channel(
+                "next_goal",
+                agent_state_text(&step.agent_state, "next_goal")
+                    .or_else(|| entry.next_goal.clone()),
+            );
+            if let Some(context) = entry
+                .search_context
+                .as_ref()
+                .and_then(describe_search_context)
+            {
+                println!("      search_context: {}", context);
+            }
+        } else {
+            print_timeline_channel("thinking", agent_state_text(&step.agent_state, "thinking"));
+            print_timeline_channel(
+                "evaluation",
+                agent_state_text(&step.agent_state, "evaluation"),
+            );
+            print_timeline_channel("memory", agent_state_text(&step.agent_state, "memory"));
+            print_timeline_channel(
+                "next_goal",
+                agent_state_text(&step.agent_state, "next_goal"),
+            );
         }
         for dispatch in &step.dispatches {
             println!(
@@ -406,6 +627,63 @@ fn print_execution_summary(report: &FlowExecutionReport, attempt: u32) {
             }
         }
     }
+    match &report.judge_verdict {
+        Some(verdict) => {
+            let label = if verdict.passed { "PASSED" } else { "FAILED" };
+            if let Some(reason) = &verdict.reason {
+                println!("Judge verdict: {} ({})", label, reason);
+            } else {
+                println!("Judge verdict: {}", label);
+            }
+        }
+        None => println!("Judge verdict: not recorded"),
+    }
+}
+
+fn print_timeline_channel(label: &str, value: Option<String>) {
+    if let Some(text) = value {
+        println!("      {}: {}", label, text);
+    }
+}
+
+fn agent_state_text(state: &Option<Value>, key: &str) -> Option<String> {
+    let map = state.as_ref()?.as_object()?;
+    let value = map.get(key)?.as_str()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn describe_search_context(context: &SearchContext) -> Option<String> {
+    let mut fields = Vec::new();
+    if let Some(query) = context.query.as_deref() {
+        if !query.is_empty() {
+            fields.push(format!("query=\"{}\"", query));
+        }
+    }
+    if let Some(engine) = context.engine.as_deref() {
+        if !engine.is_empty() {
+            fields.push(format!("engine={}", engine));
+        }
+    }
+    if let Some(selector) = context.results_selector.as_deref() {
+        if !selector.is_empty() {
+            fields.push(format!("results_selector={}", selector));
+        }
+    }
+    if let Some(url) = context.url.as_deref() {
+        if !url.is_empty() {
+            fields.push(format!("url={}", url));
+        }
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields.join(", "))
+    }
 }
 
 fn emit_structured_output(
@@ -413,6 +691,7 @@ fn emit_structured_output(
     execution: &[Value],
     manifest: &ArtifactManifest,
     events: Option<&[Value]>,
+    message_state: Option<&Value>,
     output: OutputFormat,
     artifacts_only: bool,
 ) -> Result<()> {
@@ -420,7 +699,7 @@ fn emit_structured_output(
         return emit_artifact_manifest(manifest, output);
     }
 
-    let payload = manifest.build_output_payload(plans, execution, events);
+    let payload = manifest.build_output_payload(plans, execution, events, message_state);
 
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&payload)?),
@@ -459,6 +738,33 @@ fn emit_artifact_manifest(manifest: &ArtifactManifest, output: OutputFormat) -> 
     Ok(())
 }
 
+fn print_message_manager_state(manager: &MessageManager) {
+    println!("Message Timeline Snapshot");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    let snapshot = manager.snapshot();
+    let recent: Vec<_> = snapshot.history_items.iter().rev().take(5).collect();
+    if recent.is_empty() {
+        println!("(暂无内部历史记录)");
+    } else {
+        for item in recent.iter().rev() {
+            let label = item
+                .label
+                .as_ref()
+                .map(|value| format!("/{}", value))
+                .unwrap_or_default();
+            println!(
+                "[{tag}{label}] {content}",
+                tag = item.tag,
+                label = label,
+                content = item.content.replace('\n', " ")
+            );
+        }
+    }
+    if let Some(history_prompt) = snapshot.agent_history_prompt {
+        println!("\nAgent history prompt preview:\n{}", history_prompt);
+    }
+}
+
 fn build_execution_payloads(
     reports: &[FlowExecutionReport],
     events: Option<&[Value]>,
@@ -488,6 +794,7 @@ fn execution_report_payload(
         let mut step_obj = serde_json::Map::new();
         step_obj.insert("step_id".into(), Value::String(step.step_id.clone()));
         step_obj.insert("title".into(), Value::String(step.title.clone()));
+        step_obj.insert("tool_kind".into(), Value::String(step.tool_kind.clone()));
         step_obj.insert(
             "status".into(),
             Value::String(
@@ -499,10 +806,21 @@ fn execution_report_payload(
             ),
         );
         step_obj.insert("attempts".into(), Value::from(step.attempts));
+        step_obj.insert("total_wait_ms".into(), Value::from(step.total_wait_ms));
+        step_obj.insert("total_run_ms".into(), Value::from(step.total_run_ms));
         step_obj.insert(
             "error".into(),
             step.error.clone().map(Value::String).unwrap_or(Value::Null),
         );
+        if let Some(summary) = &step.observation_summary {
+            step_obj.insert("observation_summary".into(), Value::String(summary.clone()));
+        }
+        if let Some(kind) = &step.blocker_kind {
+            step_obj.insert("blocker_kind".into(), Value::String(kind.clone()));
+        }
+        if let Some(state) = step.agent_state.clone() {
+            step_obj.insert("agent_state".into(), state);
+        }
 
         let mut dispatch_values = Vec::new();
         for (dispatch_index, dispatch) in step.dispatches.iter().enumerate() {
@@ -569,40 +887,41 @@ fn execution_report_payload(
     let mut payload = serde_json::Map::new();
     payload.insert("attempt".into(), Value::Number(attempt.into()));
     payload.insert("steps".into(), Value::Array(steps));
+    payload.insert("success".into(), Value::Bool(report.success));
+    payload.insert(
+        "memory_log".into(),
+        serde_json::to_value(&report.memory_log).unwrap_or_else(|_| Value::Null),
+    );
+    if let Some(verdict) = &report.judge_verdict {
+        payload.insert(
+            "judge_verdict".into(),
+            json!({ "passed": verdict.passed, "reason": verdict.reason }),
+        );
+    }
+    let user_results: Vec<Value> = report
+        .user_results
+        .iter()
+        .map(|result| {
+            json!({
+                "step_id": result.step_id,
+                "step_title": result.step_title,
+                "kind": result.kind.as_str(),
+                "schema": result.schema,
+                "content": result.content,
+                "artifact_path": result.artifact_path,
+            })
+        })
+        .collect();
+    payload.insert("user_results".into(), Value::Array(user_results));
+    payload.insert(
+        "missing_user_result".into(),
+        Value::Bool(report.missing_user_result),
+    );
     if let Some(events) = events {
         payload.insert("state_events".into(), Value::Array(events.to_vec()));
     }
 
     Value::Object(payload)
-}
-
-fn augment_request_for_replan(
-    request: &AgentRequest,
-    report: &FlowExecutionReport,
-    attempt: u32,
-) -> Option<AgentRequest> {
-    if report.steps.is_empty() {
-        return None;
-    }
-
-    let last_step = report.steps.last()?;
-    if !matches!(last_step.status, StepExecutionStatus::Failed) {
-        return None;
-    }
-
-    let mut next_request = request.clone();
-    next_request.constraints.push(format!(
-        "Previous attempt {} failed at step '{}': {}",
-        attempt + 1,
-        last_step.step_id,
-        last_step.error.as_deref().unwrap_or("unknown error")
-    ));
-    next_request.conversation.push(ConversationTurn::new(
-        ConversationRole::User,
-        "Please suggest a revised plan that can succeed.",
-    ));
-
-    Some(next_request)
 }
 
 #[derive(Default)]
@@ -620,9 +939,10 @@ impl ArtifactManifest {
         plans: &[Value],
         execution: &[Value],
         events: Option<&[Value]>,
+        message_state: Option<&Value>,
     ) -> Value {
         let artifacts = self.json_array();
-        build_payload(plans, execution, artifacts, events)
+        build_payload(plans, execution, artifacts, events, message_state)
     }
 
     fn json_array(&self) -> Value {
@@ -635,21 +955,26 @@ fn build_payload(
     execution: &[Value],
     artifacts: Value,
     events: Option<&[Value]>,
+    message_state: Option<&Value>,
 ) -> Value {
+    let mut payload = json!({
+        "plans": plans,
+        "execution": execution,
+        "artifacts": artifacts,
+    });
     if let Some(events) = events {
-        json!({
-            "plans": plans,
-            "execution": execution,
-            "artifacts": artifacts,
-            "state_events": events,
-        })
-    } else {
-        json!({
-            "plans": plans,
-            "execution": execution,
-            "artifacts": artifacts,
-        })
+        payload
+            .as_object_mut()
+            .expect("payload map")
+            .insert("state_events".to_string(), Value::Array(events.to_vec()));
     }
+    if let Some(state) = message_state {
+        payload
+            .as_object_mut()
+            .expect("payload map")
+            .insert("message_state".to_string(), state.clone());
+    }
+    payload
 }
 
 async fn persist_run(
@@ -658,6 +983,7 @@ async fn persist_run(
     execution: &[Value],
     manifest: &ArtifactManifest,
     events: Option<&[Value]>,
+    message_state: Option<&Value>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -665,7 +991,7 @@ async fn persist_run(
             .with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
 
-    let payload = manifest.build_output_payload(plans, execution, events);
+    let payload = manifest.build_output_payload(plans, execution, events, message_state);
     fs::write(path, serde_json::to_vec_pretty(&payload)?)
         .await
         .with_context(|| format!("Failed to write run data to {}", path.display()))?;

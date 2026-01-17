@@ -1,5 +1,6 @@
 use agent_core::plan::{AgentPlan, AgentTool, AgentToolKind};
 use serde_json::json;
+use std::collections::HashMap;
 
 use super::{stage_overlay, StageStrategy, StrategyApplication, StrategyInput, StrategyStep};
 
@@ -26,12 +27,13 @@ impl StageStrategy for StructuredDeliverStrategy {
             return None;
         };
         let schema_value = schema.unwrap_or_else(|| "generic_observation_v1".to_string());
+        let schema_for_payload = schema_value.clone();
         let tool = AgentTool {
             kind: AgentToolKind::Custom {
                 name: "data.deliver.structured".to_string(),
                 payload: json!({
                     "source_step_id": parse_id,
-                    "schema": schema_value,
+                    "schema": schema_for_payload,
                     "artifact_label": format!("structured.{}", schema_value),
                     "filename": format!("{}.json", schema_value),
                 }),
@@ -39,7 +41,11 @@ impl StageStrategy for StructuredDeliverStrategy {
             wait: agent_core::WaitMode::None,
             timeout_ms: Some(3_000),
         };
-        let step = StrategyStep::new("交付结构化结果", tool);
+        let step = StrategyStep::new("交付结构化结果", tool).with_agent_state(json!({
+            "thinking": "整理解析结果为结构化输出",
+            "memory": format!("生成 {} 数据文件", schema_value),
+            "next_goal": "补充文字总结或结束任务"
+        }));
         Some(StrategyApplication {
             steps: vec![step],
             note: Some("生成结构化交付步骤".to_string()),
@@ -49,6 +55,7 @@ impl StageStrategy for StructuredDeliverStrategy {
                 "applied",
                 "📦 输出结构化结果",
             )),
+            vendor_context: HashMap::new(),
         })
     }
 }
@@ -78,18 +85,23 @@ impl StageStrategy for AgentNoteStrategy {
             .primary_goal
             .clone()
             .unwrap_or_else(|| input.request.goal.clone());
+        let note_detail = summary.clone();
         let tool = AgentTool {
             kind: AgentToolKind::Custom {
                 name: "agent.note".to_string(),
                 payload: json!({
                     "title": "自动总结",
-                    "detail": summary,
+                    "detail": note_detail,
                 }),
             },
             wait: agent_core::WaitMode::None,
             timeout_ms: Some(2_000),
         };
-        let step = StrategyStep::new("生成总结", tool);
+        let step = StrategyStep::new("生成总结", tool).with_agent_state(json!({
+            "thinking": "根据结构化信息写出可读总结",
+            "memory": summary,
+            "next_goal": "完成交付"
+        }));
         Some(StrategyApplication {
             steps: vec![step],
             note: Some("补充 agent.note 输出".to_string()),
@@ -99,6 +111,7 @@ impl StageStrategy for AgentNoteStrategy {
                 "applied",
                 "📝 生成文字总结",
             )),
+            vendor_context: HashMap::new(),
         })
     }
 }

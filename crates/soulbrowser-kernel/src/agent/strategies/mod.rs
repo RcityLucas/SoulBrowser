@@ -2,25 +2,31 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_core::{
-    plan::{AgentPlan, AgentPlanStep, AgentTool, AgentValidation},
+    plan::{AgentPlan, AgentPlanStep, AgentTool, AgentToolKind, AgentValidation},
     planner::PlanStageKind,
     AgentRequest,
 };
 use serde_json::{json, Value};
 
+#[cfg(test)]
+use crate::agent::stage_context::AutoActTuning;
 use crate::agent::stage_context::StageContext;
 
 mod act;
 mod deliver;
+mod evaluate;
 mod navigate;
 mod observe;
 mod parse;
+mod validate;
 
 pub use act::*;
 pub use deliver::*;
+pub use evaluate::*;
 pub use navigate::*;
 pub use observe::*;
 pub use parse::*;
+pub use validate::*;
 
 #[derive(Debug)]
 pub struct StrategyInput<'a> {
@@ -53,6 +59,11 @@ impl StrategyStep {
         self.detail = Some(detail.into());
         self
     }
+
+    pub fn with_agent_state(mut self, state: Value) -> Self {
+        self.metadata.insert("agent_state".to_string(), state);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +71,7 @@ pub struct StrategyApplication {
     pub steps: Vec<StrategyStep>,
     pub note: Option<String>,
     pub overlay: Option<Value>,
+    pub vendor_context: HashMap<String, Value>,
 }
 
 pub(crate) fn stage_overlay(
@@ -84,7 +96,9 @@ pub(crate) fn stage_label(stage: PlanStageKind) -> &'static str {
     match stage {
         PlanStageKind::Navigate => "导航",
         PlanStageKind::Observe => "观察",
+        PlanStageKind::Validate => "校验",
         PlanStageKind::Act => "执行",
+        PlanStageKind::Evaluate => "评估",
         PlanStageKind::Parse => "解析",
         PlanStageKind::Deliver => "交付",
     }
@@ -111,9 +125,11 @@ impl StrategyRegistry {
         registry.register(WeatherSearchStrategy::new());
         registry.register(ExtractSiteObserveStrategy::new());
         registry.register(AutoActStrategy::new());
+        registry.register(AutoEvaluateStrategy::new());
         registry.register(GenericParseStrategy::new());
         registry.register(WeatherParseStrategy::new());
         registry.register(LlmSummaryStrategy::new());
+        registry.register(TargetGuardrailStrategy::new());
         registry.register(StructuredDeliverStrategy::new());
         registry.register(AgentNoteStrategy::new());
         registry
@@ -141,6 +157,26 @@ pub fn materialize_step(template: &StrategyStep, id: String) -> AgentPlanStep {
     }
 }
 
+pub(crate) fn latest_observation_step(plan: &AgentPlan) -> Option<(usize, String)> {
+    plan.steps
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, step)| match &step.tool.kind {
+            AgentToolKind::Custom { name, .. } if is_observation_tool(name) => {
+                Some((idx, step.id.clone()))
+            }
+            _ => None,
+        })
+}
+
+fn is_observation_tool(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "data.extract-site" | "page.observe" | "market.quote.fetch"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,16 +198,22 @@ mod tests {
             preferred_sites: vec![],
             tenant_default_url: None,
             search_terms: vec!["demo".to_string()],
+            guardrail_keywords: Vec::new(),
+            guardrail_keyword_count: 0,
+            guardrail_domains: Vec::new(),
             requested_outputs: Vec::new(),
             browser_context: None,
             search_fallback_url: "https://www.baidu.com/s?wd=demo".to_string(),
             force_observe_current: false,
+            auto_act_retry: 0,
+            auto_act: AutoActTuning::default(),
         }
     }
 
     fn populated_context() -> StageContext {
         StageContext {
             current_url: Some("https://example.com".to_string()),
+            search_fallback_url: String::new(),
             ..base_context()
         }
     }
@@ -179,6 +221,7 @@ mod tests {
     fn baidu_context() -> StageContext {
         StageContext {
             current_url: Some("https://www.baidu.com".to_string()),
+            search_fallback_url: "https://www.baidu.com/s?wd=demo".to_string(),
             ..base_context()
         }
     }
@@ -313,16 +356,25 @@ mod tests {
             context: &context,
         };
         let result = strategy.apply(&input).expect("baidu act applied");
-        assert_eq!(result.steps.len(), 2);
+        assert_eq!(result.steps.len(), 4);
         assert!(matches!(
             &result.steps[0].tool.kind,
+            AgentToolKind::Click { locator }
+                if matches!(locator, AgentLocator::Css(selector) if selector == "input#kw")
+        ));
+        assert!(matches!(
+            &result.steps[1].tool.kind,
             AgentToolKind::TypeText { locator, submit, .. }
                 if matches!(locator, AgentLocator::Css(selector) if selector == "input#kw") && !submit
         ));
         assert!(matches!(
-            &result.steps[1].tool.kind,
+            &result.steps[2].tool.kind,
             AgentToolKind::Click { locator }
                 if matches!(locator, AgentLocator::Css(selector) if selector == "input#su")
+        ));
+        assert!(matches!(
+            &result.steps[3].tool.kind,
+            AgentToolKind::Custom { name, .. } if name == "browser.search.click-result"
         ));
     }
 

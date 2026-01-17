@@ -3,7 +3,7 @@ use crate::plan::{AgentPlan, AgentPlanStep, AgentToolKind, AgentValidation, Agen
 use crate::weather::first_weather_subject;
 use thiserror::Error;
 
-const OBSERVATION_TOOLS: &[&str] = &["data.extract-site", "page.observe"];
+const OBSERVATION_TOOLS: &[&str] = &["data.extract-site", "page.observe", "market.quote.fetch"];
 const PARSE_TOOLS: &[&str] = &[
     "data.parse.generic",
     "data.parse.market_info",
@@ -14,6 +14,7 @@ const PARSE_TOOLS: &[&str] = &[
     "data.parse.hackernews-feed",
     "data.parse.linkedin-profile",
     "data.parse.github-repo",
+    "data.parse.metal_price",
 ];
 const PARSE_TOOL_ALIASES: &[&str] = &[
     "parse",
@@ -29,9 +30,11 @@ const PARSE_TOOL_ALIASES: &[&str] = &[
     "data.parse.linkedin.profile",
 ];
 const DELIVER_TOOLS: &[&str] = &["data.deliver.structured"];
+const VALIDATE_TOOLS: &[&str] = &["data.validate.metal_price", "data.validate-target"];
 const NOTE_TOOLS: &[&str] = &["agent.note"];
+const EVALUATE_TOOLS: &[&str] = &["agent.evaluate"];
 const ALLOWED_CUSTOM_TOOL_HINT: &str =
-    "data.extract-site, data.parse.generic, data.parse.market_info, data.parse.news_brief, data.parse.weather, data.parse.twitter-feed, data.parse.facebook-feed, data.parse.hackernews-feed, data.parse.linkedin-profile, data.parse.github-repo, data.deliver.structured, agent.note, plugin.*, mock.llm.plan";
+    "data.extract-site, data.parse.generic, data.parse.market_info, data.parse.news_brief, data.parse.weather, data.parse.twitter-feed, data.parse.facebook-feed, data.parse.hackernews-feed, data.parse.linkedin-profile, data.parse.github-repo, data.parse.metal_price, data.validate-target, data.validate.metal_price, market.quote.fetch, data.deliver.structured, agent.evaluate, agent.note, browser.search, browser.search.click-result, browser.close-modal, browser.send-esc, plugin.*, mock.llm.plan";
 const RESULT_KEYWORDS: &[&str] = &["查看", "获取", "告诉", "结果", "weather", "天气"];
 
 #[derive(Debug, Error, Clone)]
@@ -164,6 +167,7 @@ impl PlanValidator {
         }
 
         if !request.intent.target_sites.is_empty()
+            && !request.intent.target_sites_are_hints
             && !targets_expected_site(plan, &request.intent.target_sites)
         {
             issues.push(format!(
@@ -207,6 +211,27 @@ impl PlanValidator {
                 "weather tasks must include data.parse.weather and structured delivery".to_string(),
             );
         }
+
+        if request.intent.is_market_intent() {
+            if !plan_has_validate_stage(plan) {
+                issues.push(
+                    "market intents must validate the target page via data.validate-target"
+                        .to_string(),
+                );
+            }
+            if !plan_has_market_parser(plan) {
+                issues.push(
+                    "market intents must parse data via data.parse.metal_price or data.parse.market_info"
+                        .to_string(),
+                );
+            }
+            if !plan_has_deliver_step(plan) {
+                issues.push(
+                    "market intents must return structured output via data.deliver.structured"
+                        .to_string(),
+                );
+            }
+        }
     }
 }
 
@@ -243,12 +268,20 @@ fn is_dom_parser(name: &str) -> bool {
             | "data.parse.facebook-feed"
             | "data.parse.hackernews-feed"
             | "data.parse.linkedin-profile"
+            | "data.parse.metal_price"
     )
 }
 
 fn plan_has_deliver_step(plan: &AgentPlan) -> bool {
     plan.steps.iter().any(|step| match &step.tool.kind {
         AgentToolKind::Custom { name, .. } => is_deliver_tool(name),
+        _ => false,
+    })
+}
+
+fn plan_has_validate_stage(plan: &AgentPlan) -> bool {
+    plan.steps.iter().any(|step| match &step.tool.kind {
+        AgentToolKind::Custom { name, .. } => is_validate_tool(name),
         _ => false,
     })
 }
@@ -300,6 +333,18 @@ fn plan_has_weather_pipeline(plan: &AgentPlan) -> bool {
     plan_has_weather_parser(plan) && plan_has_weather_deliver(plan)
 }
 
+fn plan_has_market_parser(plan: &AgentPlan) -> bool {
+    plan.steps.iter().any(|step| match &step.tool.kind {
+        AgentToolKind::Custom { name, .. }
+            if name.eq_ignore_ascii_case("data.parse.metal_price")
+                || name.eq_ignore_ascii_case("data.parse.market_info") =>
+        {
+            true
+        }
+        _ => false,
+    })
+}
+
 fn plan_contains_plugin_tool(plan: &AgentPlan) -> bool {
     plan.steps.iter().any(|step| match &step.tool.kind {
         AgentToolKind::Custom { name, .. } => name.starts_with("plugin."),
@@ -333,10 +378,23 @@ pub fn is_allowed_custom_tool(name: &str) -> bool {
     is_observation_tool(&canonical)
         || is_parse_tool(&canonical)
         || is_deliver_tool(&canonical)
+        || is_validate_tool(&canonical)
+        || is_evaluate_tool(&canonical)
         || is_note_tool(&canonical)
+        || is_browser_control_tool(&canonical)
         || canonical.starts_with("plugin.")
         || canonical == "weather.search"
         || canonical == "mock.llm.plan"
+}
+
+fn is_browser_control_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "browser.search"
+            | "browser.search.click-result"
+            | "browser.close-modal"
+            | "browser.send-esc"
+    )
 }
 
 fn is_observation_tool(name: &str) -> bool {
@@ -357,6 +415,18 @@ fn is_github_repo_tool(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "data.parse.github-repo" | "github.extract-repo" | "data.parse.github.extract-repo"
     )
+}
+
+fn is_validate_tool(name: &str) -> bool {
+    VALIDATE_TOOLS
+        .iter()
+        .any(|tool| tool.eq_ignore_ascii_case(name))
+}
+
+fn is_evaluate_tool(name: &str) -> bool {
+    EVALUATE_TOOLS
+        .iter()
+        .any(|tool| tool.eq_ignore_ascii_case(name))
 }
 
 fn is_deliver_tool(name: &str) -> bool {

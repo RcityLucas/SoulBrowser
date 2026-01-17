@@ -34,6 +34,21 @@ pub fn build_plan_overlays(plan: &AgentPlan) -> Value {
         overlays.extend(plan.meta.overlays.iter().cloned());
     }
 
+    if let Some(timeline) = plan.meta.vendor_context.get("stage_timeline") {
+        if let Some(stages) = timeline.get("stages").cloned() {
+            let recorded_at = Utc::now().to_rfc3339();
+            overlays.push(json!({
+                "kind": "stage_timeline",
+                "deterministic": timeline
+                    .get("deterministic")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                "stages": stages,
+                "recorded_at": recorded_at,
+            }));
+        }
+    }
+
     Value::Array(overlays)
 }
 
@@ -139,4 +154,43 @@ pub fn artifact_event_value(
         );
 
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::plan::{AgentPlanStep, AgentTool, AgentToolKind};
+    use agent_core::WaitMode;
+    use soulbrowser_core_types::TaskId;
+
+    #[test]
+    fn plan_overlays_include_stage_timeline() {
+        let mut plan = AgentPlan::new(TaskId::new(), "plan");
+        plan.push_step(AgentPlanStep::new(
+            "navigate-1",
+            "导航",
+            AgentTool {
+                kind: AgentToolKind::Navigate {
+                    url: "https://example.com".to_string(),
+                },
+                wait: WaitMode::DomReady,
+                timeout_ms: Some(1_000),
+            },
+        ));
+        plan.meta.vendor_context.insert(
+            "stage_timeline".to_string(),
+            json!({
+                "deterministic": true,
+                "stages": [
+                    {"stage": "navigate", "label": "导航", "status": "existing", "strategy": "plan", "detail": "原计划"}
+                ]
+            }),
+        );
+
+        let overlays = build_plan_overlays(&plan);
+        let array = overlays.as_array().expect("overlays array");
+        assert!(array
+            .iter()
+            .any(|entry| entry.get("kind") == Some(&Value::String("stage_timeline".to_string()))));
+    }
 }

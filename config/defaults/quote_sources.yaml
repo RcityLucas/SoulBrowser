@@ -1,0 +1,121 @@
+markets:
+  - id: shfe
+    label: "上海期货交易所"
+    aliases: ["shfe", "上海", "国内期货"]
+    sources:
+      - id: sina_spot_dom
+        description: "新浪财经现货行情"
+        markets: ["上海期货交易所"]
+        tags: ["spot"]
+        url_template: "https://finance.sina.com.cn/futures/quotes/{contract_upper}.shtml"
+        table_selectors:
+          - "#table-box-futures-hq"
+        key_value_selectors:
+          - label: "{metal_label}最新价"
+            selector: "#table-box-futures-hq td.price"
+          - label: "{metal_label}涨跌幅"
+            selector: "#table-box-futures-hq .amt-value"
+        max_rows: 40
+      - id: sina_futures_dom
+        description: "新浪财经期货行情"
+        markets: ["上海期货交易所"]
+        tags: ["futures"]
+        url_template: "https://finance.sina.com.cn/futures/quotes/{contract_upper}.shtml"
+        table_selectors:
+          - "#table-box-futures-hq"
+        key_value_selectors:
+          - label: "{metal_label}最新价"
+            selector: "#table-box-futures-hq td.price"
+          - label: "{metal_label}涨跌幅"
+            selector: "#table-box-futures-hq .amt-value"
+        max_rows: 40
+      - id: eastmoney_futures_dom
+        description: "东方财富主连期货"
+        markets: ["上海期货交易所"]
+        tags: ["futures"]
+        url_template: "https://quote.eastmoney.com/qh/{contract_upper}.html"
+        table_selectors:
+          - "table.hq_table"
+          - "table.dataTable"
+          - ".quote-table table"
+        key_value_selectors:
+          - label: "{metal_label}主力"
+            selector: ".hq_table tr:first-child"
+          - label: "{metal_label}最新价"
+            selector: ".price,.quote-price"
+        max_rows: 50
+        probe:
+          bad_patterns:
+            - "抱歉，你访问的页面不存在"
+            - "自动进入推广页面"
+        api:
+          url: "https://push2.eastmoney.com/api/qt/ulist.np/get"
+          params:
+            pn: "1"
+            pz: "5"
+            fl: "1"
+            secids: "115.{contract_upper}"
+            fields: "f1,f2,f3,f4,f12,f13,f14"
+          record_path: ["data", "diff"]
+          label_field: "f14"
+          price_field: "f2"
+          change_field: "f4"
+          change_pct_field: "f3"
+      - id: eastmoney_spot_dom
+        description: "东方财富现货行情"
+        markets: ["上海期货交易所"]
+        tags: ["spot"]
+        url_template: "https://data.eastmoney.com/metal/{slug}.html"
+        table_selectors:
+          - "table.hq_table"
+          - ".data-table table"
+        probe:
+          bad_patterns:
+            - "抱歉，你访问的页面不存在"
+            - "自动进入推广页面"
+  - id: lme
+    label: "伦敦金属交易所"
+    aliases: ["lme", "伦敦"]
+    sources:
+      - id: sina_global_dom
+        description: "新浪财经金属行情"
+        markets: ["伦敦金属交易所"]
+        tags: ["spot", "futures"]
+        url_template: "https://finance.sina.com.cn/futures/quotes/{contract_upper}.shtml"
+        table_selectors:
+          - "#table-box-futures-hq"
+        key_value_selectors:
+          - label: "{metal_label}最新价"
+            selector: "#table-box-futures-hq td.price"
+          - label: "{metal_label}涨跌幅"
+            selector: "#table-box-futures-hq .amt-value"
+        max_rows: 40
+      - id: eastmoney_lme_dom
+        description: "东方财富伦敦金属"
+        markets: ["伦敦金属交易所"]
+        tags: ["futures"]
+        url_template: "https://quote.eastmoney.com/qh/{contract_upper}.html"
+        table_selectors:
+          - "table.hq_table"
+          - "table.dataTable"
+        key_value_selectors:
+          - label: "{metal_label}主力"
+            selector: ".hq_table tr:first-child"
+        max_rows: 50
+        probe:
+          bad_patterns:
+            - "抱歉，你访问的页面不存在"
+            - "自动进入推广页面"
+        api:
+          url: "https://push2.eastmoney.com/api/qt/ulist.np/get"
+          params:
+            pn: "1"
+            pz: "5"
+            fl: "1"
+            secids: "115.{contract_upper}"
+            fields: "f1,f2,f3,f4,f12,f13,f14"
+          record_path: ["data", "diff"]
+          label_field: "f14"
+          price_field: "f2"
+          change_field: "f4"
+          change_pct_field: "f3"

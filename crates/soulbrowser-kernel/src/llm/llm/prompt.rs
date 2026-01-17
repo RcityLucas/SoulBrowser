@@ -1,6 +1,10 @@
 use agent_core::{AgentIntentKind, AgentPlan, AgentRequest};
 use serde_json::Value;
 
+/// Maximum total prompt length in characters to avoid token budget explosion.
+/// ~20000 chars ≈ 5000-6000 tokens, leaving room for system prompt and response.
+const MAX_PROMPT_CHARS: usize = 20000;
+
 const CAPABILITY_OVERVIEW: &str = "- Browser automation core: navigate, click, type_text (with submit), select, scroll, wait (visible/hidden/network idle).\n- Observation -> Parse -> Deliver pipeline is enforced automatically; structured outputs always flow through `data.extract-site` -> `data.parse.*` -> `data.deliver.structured`.\n- Deterministic parsers available: generic observation, market info, news brief, GitHub repositories, Twitter feed, Facebook feed, LinkedIn profile, Hacker News feed.\n- GitHub repo parsing can auto-fill the username based on recent navigation/current URL if planner forgets.\n- Planner may insert `agent.note` for inline reporting when needed.\n- The executor automatically normalizes tool aliases (e.g., browser.*) and enforces sensible waits/timeouts.\n";
 
 const STRUCTURED_SCHEMA_GUIDE: &str = "- data.parse.generic -> schema=generic_observation_v1 (default when summarizing DOM observations).\n- data.parse.market_info -> schema=market_info_v1.\n- data.parse.news_brief -> schema=news_brief_v1.\n- data.parse.weather -> schema=weather_report_v1.\n- data.parse.github-repo / github.extract-repo -> schema=github_repos_v1.\n- data.parse.twitter-feed -> schema=twitter_feed_v1.\n- data.parse.facebook-feed -> schema=facebook_feed_v1.\n- data.parse.linkedin-profile -> schema=linkedin_profile_v1.\n- data.parse.hackernews-feed -> schema=hackernews_feed_v1.\n";
@@ -119,12 +123,22 @@ impl PromptBuilder {
                 .join("\n");
             sections.push(format!("Recent conversation:\n{}", history));
         }
+        // Limit agent_history_prompt to ~4000 chars (~1000 tokens) to save token budget
         if let Some(history_block) = request
             .metadata
             .get("agent_history_prompt")
             .and_then(Value::as_str)
         {
-            sections.push(history_block.to_string());
+            const MAX_HISTORY_CHARS: usize = 4000;
+            if history_block.len() > MAX_HISTORY_CHARS {
+                let truncated = format!(
+                    "<agent_history>\n[... earlier history omitted ...]\n{}\n</agent_history>",
+                    &history_block[history_block.len().saturating_sub(MAX_HISTORY_CHARS - 100)..]
+                );
+                sections.push(truncated);
+            } else {
+                sections.push(history_block.to_string());
+            }
         }
         if let Some(helpers) = request
             .metadata
@@ -132,6 +146,14 @@ impl PromptBuilder {
             .and_then(Value::as_str)
         {
             sections.push(format!("Registry helper actions:\n{}", helpers));
+        }
+
+        if let Some(tools) = request
+            .metadata
+            .get("tool_registry_prompt")
+            .and_then(Value::as_str)
+        {
+            sections.push(format!("Available custom tools:\n{}", tools));
         }
 
         if let Some(browser_state) = browser_state_section(request) {
@@ -161,11 +183,20 @@ impl PromptBuilder {
             sections.push(format!("Failure context: {}", summary));
         }
 
-        format!(
+        let prompt = format!(
             "{header}\n\nProduce JSON following this schema: {schema}\nRules:\n1. Always emit valid JSON without markdown.\n2. Use css selectors prefixed with 'css=' when possible.\n3. Supported actions: navigate, click, type_text, select, scroll, wait.\n4. Use wait='idle' for network idle waits.\n5. Provide rationale and risks arrays even if empty.\n6. When structured outputs are requested, include explicit navigate -> observe -> act -> parse -> deliver steps covering data acquisition, parsing, and persistence.\n7. Parsing steps must cite deterministic parsers and final steps must mention the structured schema/screenshot that will be produced.\n8. Custom tool allowlist (anything else will be rejected): data.extract-site (observation), data.parse.market_info, data.parse.news_brief, data.parse.twitter-feed, data.parse.facebook-feed, data.parse.linkedin-profile, data.parse.hackernews-feed, data.parse.github-repo (or github.extract-repo alias), data.deliver.structured, and agent.note.\n9. `data.parse.github-repo` steps must include `payload.username` (GitHub handle without the leading `@`) derived from the navigation target or user request.\n10. To observe a page, rely on the automatically inserted data.extract-site step; do not schedule extra ad-hoc \"observe\" actions.\n11. When emitting `data.deliver.structured`, its payload must include `schema`, `artifact_label`, `filename`, and `source_step_id` pointing to the parse step that produced the data; missing any of these fields causes automatic plan rejection.\n12. Deliver `payload.schema` must come from the canonical map (generic_observation_v1, market_info_v1, news_brief_v1, github_repos_v1, twitter_feed_v1, facebook_feed_v1, linkedin_profile_v1, hackernews_feed_v1) aligned with the preceding parser.\n13. When submitting a Baidu search, target the actual submit button (`css=#su`, `text=百度一下`, or equivalent) rather than container selectors like `.s_search`.",
             header = sections.join("\n"),
             schema = JSON_SCHEMA
-        )
+        );
+
+        // Truncate prompt if too long to avoid token budget explosion
+        if prompt.len() > MAX_PROMPT_CHARS {
+            let mut truncated = prompt[..MAX_PROMPT_CHARS].to_string();
+            truncated.push_str("\n[... prompt truncated for token budget ...]");
+            truncated
+        } else {
+            prompt
+        }
     }
 }
 

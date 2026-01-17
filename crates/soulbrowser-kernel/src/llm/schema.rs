@@ -4,7 +4,7 @@ use agent_core::{
     AgentTool, AgentToolKind, AgentValidation, AgentWaitCondition, PlannerOutcome, WaitMode,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
 use crate::agent::{ContextResolver, StageContext};
@@ -28,6 +28,14 @@ pub struct LlmJsonStep {
     pub title: String,
     #[serde(default)]
     pub detail: String,
+    #[serde(default)]
+    pub thinking: Option<String>,
+    #[serde(default)]
+    pub evaluation: Option<String>,
+    #[serde(default)]
+    pub memory: Option<String>,
+    #[serde(default)]
+    pub next_goal: Option<String>,
     #[serde(default = "default_action")]
     pub action: String,
     #[serde(default)]
@@ -93,6 +101,11 @@ pub fn plan_from_json_payload(
                 "locator": step.locator,
             }),
         );
+        if let Some(state) = agent_state_metadata(step) {
+            agent_step
+                .metadata
+                .insert("agent_state".to_string(), Value::Object(state));
+        }
         if !step.validations.is_empty() {
             let validations = step
                 .validations
@@ -128,6 +141,35 @@ pub fn plan_from_json_payload(
     };
 
     Ok(PlannerOutcome { plan, explanations })
+}
+
+fn agent_state_metadata(step: &LlmJsonStep) -> Option<Map<String, Value>> {
+    let mut state = Map::new();
+    if let Some(value) = clean_agent_state_text(&step.thinking) {
+        state.insert("thinking".to_string(), Value::String(value));
+    }
+    if let Some(value) = clean_agent_state_text(&step.evaluation) {
+        state.insert("evaluation".to_string(), Value::String(value));
+    }
+    if let Some(value) = clean_agent_state_text(&step.memory) {
+        state.insert("memory".to_string(), Value::String(value));
+    }
+    if let Some(value) = clean_agent_state_text(&step.next_goal) {
+        state.insert("next_goal".to_string(), Value::String(value));
+    }
+    if state.is_empty() {
+        None
+    } else {
+        Some(state)
+    }
+}
+
+fn clean_agent_state_text(value: &Option<String>) -> Option<String> {
+    value
+        .as_ref()
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .map(|text| text.to_string())
 }
 
 fn to_agent_tool(step: &LlmJsonStep, context: &StageContext) -> Result<AgentTool, AgentError> {
@@ -168,6 +210,13 @@ fn to_agent_tool(step: &LlmJsonStep, context: &StageContext) -> Result<AgentTool
         },
         "wait" => AgentToolKind::Wait {
             condition: parse_wait_condition(step)?,
+        },
+        "agent.evaluate" | "evaluate" => AgentToolKind::Custom {
+            name: "agent.evaluate".to_string(),
+            payload: json!({
+                "title": step.title,
+                "detail": step.detail,
+            }),
         },
         _ => AgentToolKind::Custom {
             name: step.action.clone(),

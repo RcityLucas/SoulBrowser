@@ -28,6 +28,11 @@ static PLAN_REJECTIONS: OnceCell<IntCounterVec> = OnceCell::new();
 static PLAN_TEMPLATE_USAGE: OnceCell<IntCounterVec> = OnceCell::new();
 static PLAN_STRATEGY_USAGE: OnceCell<IntCounterVec> = OnceCell::new();
 static PLAN_AUTO_REPAIRS: OnceCell<IntCounterVec> = OnceCell::new();
+static GUARDRAIL_KEYWORD_USAGE: OnceCell<IntCounterVec> = OnceCell::new();
+static AUTO_ACT_SEARCH_ENGINES: OnceCell<IntCounterVec> = OnceCell::new();
+static MARKET_QUOTE_FETCH: OnceCell<IntCounterVec> = OnceCell::new();
+static MARKET_QUOTE_FALLBACK: OnceCell<IntCounterVec> = OnceCell::new();
+static MANUAL_TAKEOVER: OnceCell<IntCounterVec> = OnceCell::new();
 static MISSING_RESULT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 const MISSING_RESULT_ALERT_THRESHOLD: u64 = 10;
@@ -41,6 +46,7 @@ pub fn register_metrics() {
         register_execution_metrics(registry);
         register_llm_cache_metrics(registry);
         register_plan_metrics(registry);
+        register_quote_metrics(registry);
     });
 }
 
@@ -153,6 +159,73 @@ fn register_plan_metrics(registry: &Registry) {
         error!(?err, "failed to register auto repair counter");
     }
     let _ = PLAN_AUTO_REPAIRS.set(auto_repairs);
+
+    let guardrail_keywords = IntCounterVec::new(
+        Opts::new(
+            "soul_guardrail_keyword_seeds_total",
+            "Guardrail keywords merged into search seeds grouped by intent",
+        ),
+        &["intent"],
+    )
+    .expect("create guardrail keyword counter");
+    if let Err(err) = registry.register(Box::new(guardrail_keywords.clone())) {
+        error!(?err, "failed to register guardrail keyword counter");
+    }
+    let _ = GUARDRAIL_KEYWORD_USAGE.set(guardrail_keywords);
+
+    let auto_act = IntCounterVec::new(
+        Opts::new(
+            "soul_auto_act_search_engine_total",
+            "AutoAct search submissions grouped by intent and engine",
+        ),
+        &["intent", "engine"],
+    )
+    .expect("create auto act search counter");
+    if let Err(err) = registry.register(Box::new(auto_act.clone())) {
+        error!(?err, "failed to register auto act search counter");
+    }
+    let _ = AUTO_ACT_SEARCH_ENGINES.set(auto_act);
+}
+
+fn register_quote_metrics(registry: &Registry) {
+    let quote_fetch = IntCounterVec::new(
+        Opts::new(
+            "soul_market_quote_fetch_total",
+            "Market quote fetch attempts grouped by mode/result",
+        ),
+        &["mode", "result"],
+    )
+    .expect("create market quote fetch counter");
+    if let Err(err) = registry.register(Box::new(quote_fetch.clone())) {
+        error!(?err, "failed to register quote fetch metrics");
+    }
+    let _ = MARKET_QUOTE_FETCH.set(quote_fetch);
+
+    let fallback = IntCounterVec::new(
+        Opts::new(
+            "soul_market_quote_fallback_total",
+            "Market quote fallback attempts grouped by kind",
+        ),
+        &["kind"],
+    )
+    .expect("create market quote fallback counter");
+    if let Err(err) = registry.register(Box::new(fallback.clone())) {
+        error!(?err, "failed to register quote fallback metrics");
+    }
+    let _ = MARKET_QUOTE_FALLBACK.set(fallback);
+
+    let takeover = IntCounterVec::new(
+        Opts::new(
+            "soul_manual_takeover_total",
+            "Manual takeover triggers grouped by source",
+        ),
+        &["source"],
+    )
+    .expect("create manual takeover metric");
+    if let Err(err) = registry.register(Box::new(takeover.clone())) {
+        error!(?err, "failed to register manual takeover metric");
+    }
+    let _ = MANUAL_TAKEOVER.set(takeover);
 }
 
 pub fn observe_execution_step(tool: &str, result: &str, wait_ms: u64, run_ms: u64, attempts: u64) {
@@ -256,6 +329,21 @@ pub fn record_plan_rejection(reason: &str) {
     debug!(target = "plan_validation", %reason, "plan rejected");
 }
 
+pub fn record_guardrail_keyword_usage(intent: &str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    if let Some(counter) = GUARDRAIL_KEYWORD_USAGE.get() {
+        counter.with_label_values(&[intent]).inc_by(count as u64);
+    }
+}
+
+pub fn record_auto_act_search_engine(intent: &str, engine: &str) {
+    if let Some(counter) = AUTO_ACT_SEARCH_ENGINES.get() {
+        counter.with_label_values(&[intent, engine]).inc();
+    }
+}
+
 pub fn record_template_usage(template: &str) {
     register_metrics();
     if let Some(counter) = PLAN_TEMPLATE_USAGE.get() {
@@ -311,4 +399,28 @@ pub fn record_missing_user_result(intent_kind: &str) {
     } else {
         debug!(target = "execution", %intent_kind, "execution missing user result");
     }
+}
+
+pub fn record_market_quote_fetch(mode: &str, result: &str) {
+    register_metrics();
+    if let Some(counter) = MARKET_QUOTE_FETCH.get() {
+        counter.with_label_values(&[mode, result]).inc();
+    }
+    debug!(target = "quotes", %mode, %result, "market quote fetch attempt");
+}
+
+pub fn record_market_quote_fallback(kind: &str) {
+    register_metrics();
+    if let Some(counter) = MARKET_QUOTE_FALLBACK.get() {
+        counter.with_label_values(&[kind]).inc();
+    }
+    debug!(target = "quotes", %kind, "market quote fallback");
+}
+
+pub fn record_manual_takeover_triggered(source: &str) {
+    register_metrics();
+    if let Some(counter) = MANUAL_TAKEOVER.get() {
+        counter.with_label_values(&[source]).inc();
+    }
+    debug!(target = "manual_override", %source, "manual takeover triggered");
 }

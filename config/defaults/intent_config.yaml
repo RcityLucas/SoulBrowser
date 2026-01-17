@@ -42,6 +42,44 @@ intents:
       captcha: require_manual_captcha
       blank_page: auto_retry
 
+  market_quote_lookup:
+    triggers:
+      - "铜价"
+      - "铝价"
+      - "金属价格"
+      - "行情"
+      - "报价"
+      - "期货"
+      - "现货"
+      - "metal price"
+      - "market quote"
+      - "LME"
+      - "伦敦金属"
+      - "上海期货"
+    primary_goal: "查询指定金属（默认铜）的最新价格并结构化返回"
+    primary_sites:
+      - "https://quote.eastmoney.com/qh/CU0.html"
+      - "https://data.eastmoney.com/metal/cu.html"
+      - "https://www.eastmoney.com/"
+    output:
+      schema: metal_price_v1.json
+      include_screenshot: true
+      description: "Array of {metal,price,contract,market,currency,as_of,source_url}"
+    preferred_language: zh-CN
+    blockers:
+      captcha: require_manual_captcha
+      login_wall: require_manual_captcha
+      blank_page: auto_retry
+    validation_keywords:
+      - "金属"
+      - "行情"
+      - "报价"
+      - "期货"
+    allowed_domains:
+      - "quote.eastmoney.com"
+      - "data.eastmoney.com"
+      - "eastmoney.com"
+
   fetch_weather:
     triggers:
       - "天气"

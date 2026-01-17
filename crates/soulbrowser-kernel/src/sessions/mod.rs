@@ -5,6 +5,6 @@ mod types;
 pub use live::SessionLiveEvent;
 pub use service::SessionService;
 pub use types::{
-    CreateSessionRequest, LiveFramePayload, LiveOverlayEntry, SessionRecord, SessionShareContext,
-    SessionSnapshot, SessionStatus,
+    CreateSessionRequest, LiveFramePayload, LiveOverlayEntry, RouteSummary, SessionRecord,
+    SessionShareContext, SessionSnapshot, SessionStatus,
 };

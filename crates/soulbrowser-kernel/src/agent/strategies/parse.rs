@@ -1,8 +1,12 @@
-use agent_core::plan::{AgentPlan, AgentTool, AgentToolKind};
+use agent_core::plan::{AgentTool, AgentToolKind};
 use agent_core::{requires_weather_pipeline, WaitMode};
 use serde_json::json;
+use std::collections::HashMap;
 
-use super::{stage_overlay, StageStrategy, StrategyApplication, StrategyInput, StrategyStep};
+use super::{
+    latest_observation_step, stage_overlay, StageStrategy, StrategyApplication, StrategyInput,
+    StrategyStep,
+};
 
 #[derive(Debug, Default)]
 pub struct GenericParseStrategy;
@@ -23,7 +27,7 @@ impl StageStrategy for GenericParseStrategy {
     }
 
     fn apply(&self, input: &StrategyInput<'_>) -> Option<StrategyApplication> {
-        let Some((_, observation_id)) = latest_observation(input.plan) else {
+        let Some((_, observation_id)) = latest_observation_step(input.plan) else {
             return None;
         };
         let tool = AgentTool {
@@ -49,6 +53,7 @@ impl StageStrategy for GenericParseStrategy {
                 "applied",
                 "🧠 追加通用解析",
             )),
+            vendor_context: HashMap::new(),
         })
     }
 }
@@ -75,7 +80,7 @@ impl StageStrategy for WeatherParseStrategy {
         if !requires_weather_pipeline(input.request) {
             return None;
         }
-        let Some((_, observation_id)) = latest_observation(input.plan) else {
+        let Some((_, observation_id)) = latest_observation_step(input.plan) else {
             return None;
         };
         let tool = AgentTool {
@@ -100,23 +105,9 @@ impl StageStrategy for WeatherParseStrategy {
                 "applied",
                 "🌤️ 自动插入天气解析",
             )),
+            vendor_context: HashMap::new(),
         })
     }
-}
-
-fn latest_observation(plan: &AgentPlan) -> Option<(usize, String)> {
-    plan.steps
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, step)| match &step.tool.kind {
-            AgentToolKind::Custom { name, .. }
-                if name.eq_ignore_ascii_case("data.extract-site") =>
-            {
-                Some((idx, step.id.clone()))
-            }
-            _ => None,
-        })
 }
 
 #[derive(Debug, Default)]
@@ -138,7 +129,7 @@ impl StageStrategy for LlmSummaryStrategy {
     }
 
     fn apply(&self, input: &StrategyInput<'_>) -> Option<StrategyApplication> {
-        let Some((_, observation_id)) = latest_observation(input.plan) else {
+        let Some((_, observation_id)) = latest_observation_step(input.plan) else {
             return None;
         };
         let summary = input
@@ -182,6 +173,7 @@ impl StageStrategy for LlmSummaryStrategy {
                 "applied",
                 "🧠 使用 LLM 总结",
             )),
+            vendor_context: HashMap::new(),
         })
     }
 }

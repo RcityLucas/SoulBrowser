@@ -31,6 +31,7 @@ pub mod judge;
 pub mod kernel;
 pub mod l0_bridge;
 pub mod llm;
+pub mod manual_override;
 pub mod metrics;
 pub mod observation;
 pub mod parsers;
@@ -47,6 +48,7 @@ pub mod storage;
 pub mod structured_output;
 pub mod task_status;
 pub mod task_store;
+pub mod tool_registry;
 pub mod tools;
 pub mod types;
 pub mod utils;
@@ -70,3 +72,5 @@ pub const CONSOLE_HTML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../static/console.html"
 ));
+
+pub mod telemetry;

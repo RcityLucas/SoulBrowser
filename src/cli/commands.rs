@@ -17,7 +17,9 @@ use super::run::RunArgs;
 use super::scheduler::SchedulerArgs;
 use super::serve::ServeArgs;
 use super::start::StartArgs;
+use super::telemetry::TelemetryArgs;
 use super::timeline::TimelineArgs;
+use super::tools::ToolsArgs;
 
 #[derive(Subcommand, Clone)]
 pub enum Commands {
@@ -77,4 +79,10 @@ pub enum Commands {
 
     /// Launch a lightweight testing server with a visual console
     Serve(ServeArgs),
+
+    /// Manage tool registry entries (list/register/remove)
+    Tools(ToolsArgs),
+
+    /// Telemetry utilities (e.g. tail live events)
+    Telemetry(TelemetryArgs),
 }

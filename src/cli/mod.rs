@@ -26,3 +26,6 @@ pub mod scheduler;
 pub mod serve;
 pub mod start;
 pub mod timeline;
+pub mod tools;
+
+pub mod telemetry;

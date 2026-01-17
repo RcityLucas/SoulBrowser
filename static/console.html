@@ -6,11 +6,534 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SoulBrowser Console</title>
     <script type="module" crossorigin src="/assets/index-D5i7TVm2.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/react-vendor-4PqL0t5k.js">
-    <link rel="modulepreload" crossorigin href="/assets/antd-vendor-BKEjgGZA.js">
-    <link rel="stylesheet" crossorigin href="/assets/index-57iz2Kz6.css">
+    <link rel="modulepreload" crossorigin href="/assets/react-vendor-4PqL0t5k.js" />
+    <link rel="modulepreload" crossorigin href="/assets/antd-vendor-BKEjgGZA.js" />
+    <link rel="stylesheet" crossorigin href="/assets/index-57iz2Kz6.css" />
+    <style>
+      .message-state-panel {
+        position: fixed;
+        right: 24px;
+        bottom: 24px;
+        width: 360px;
+        max-width: calc(100% - 48px);
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 12px;
+        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.18);
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        font-family: 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
+        color: #0f172a;
+        padding: 16px 18px 12px;
+        z-index: 999;
+        display: none;
+        transition: opacity 0.25s ease, transform 0.25s ease;
+      }
+      .message-state-panel[data-visible='true'] {
+        display: block;
+      }
+      .message-state-panel[data-collapsed='true'] .panel-sections {
+        display: none;
+      }
+      .message-state-panel[data-collapsed='true'] {
+        opacity: 0.92;
+      }
+      .message-state-panel h2 {
+        margin: 0 0 8px;
+        font-size: 16px;
+        font-weight: 600;
+      }
+      .message-state-panel .panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .message-state-panel button.panel-toggle {
+        border: none;
+        background: rgba(99, 102, 241, 0.12);
+        color: #4c1d95;
+        border-radius: 20px;
+        padding: 4px 12px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .message-state-panel button.panel-toggle:hover {
+        background: rgba(99, 102, 241, 0.24);
+      }
+      .message-state-panel .panel-meta {
+        font-size: 12px;
+        color: #64748b;
+        margin-bottom: 12px;
+      }
+      .message-state-panel .panel-sections {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .message-state-panel .panel-section {
+        padding-bottom: 10px;
+        border-bottom: 1px solid rgba(100, 116, 139, 0.2);
+      }
+      .message-state-panel .panel-section h3 {
+        margin: 0 0 6px;
+        font-size: 13px;
+        font-weight: 600;
+        color: #1e293b;
+      }
+      .message-state-panel .panel-section p {
+        margin: 0;
+        font-size: 13px;
+        line-height: 1.4;
+        white-space: pre-wrap;
+      }
+      .stage-timeline-panel {
+        position: fixed;
+        left: 24px;
+        bottom: 24px;
+        width: 360px;
+        max-width: calc(100% - 48px);
+        background: rgba(15, 23, 42, 0.92);
+        border-radius: 12px;
+        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.28);
+        border: 1px solid rgba(248, 250, 252, 0.18);
+        padding: 16px 18px 14px;
+        color: #e2e8f0;
+        font-family: 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
+        display: none;
+        z-index: 998;
+      }
+      .stage-timeline-panel[data-visible='true'] {
+        display: block;
+      }
+      .stage-timeline-header {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        margin-bottom: 12px;
+      }
+      .stage-timeline-header h2 {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 600;
+      }
+      .stage-timeline-header p {
+        margin: 0;
+        font-size: 12px;
+        color: rgba(226, 232, 240, 0.75);
+      }
+      .stage-list {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .stage-item {
+        border-radius: 10px;
+        padding: 10px 12px;
+        border: 1px solid rgba(226, 232, 240, 0.2);
+        background: rgba(15, 23, 42, 0.65);
+        transition: border-color 0.2s ease, background 0.2s ease;
+      }
+      .stage-item[data-status='auto_strategy'] {
+        border-color: rgba(192, 132, 252, 0.6);
+        background: rgba(88, 28, 135, 0.35);
+      }
+      .stage-item[data-status='existing'] {
+        border-color: rgba(96, 165, 250, 0.5);
+        background: rgba(30, 64, 175, 0.35);
+      }
+      .stage-item[data-status='manual'] {
+        border-color: rgba(248, 181, 0, 0.5);
+        background: rgba(120, 53, 15, 0.35);
+      }
+      .stage-item-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        font-size: 13px;
+      }
+      .stage-label {
+        font-weight: 600;
+      }
+      .stage-status-badge {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        background: rgba(15, 23, 42, 0.4);
+        border-radius: 999px;
+        padding: 2px 8px;
+        border: 1px solid rgba(226, 232, 240, 0.2);
+      }
+      .stage-detail {
+        margin: 8px 0 0;
+        font-size: 13px;
+        line-height: 1.4;
+        color: rgba(226, 232, 240, 0.92);
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
+    <aside
+      id="message-state-panel"
+      class="message-state-panel"
+      data-visible="false"
+      data-collapsed="false"
+    >
+      <div class="panel-header">
+        <h2>Evaluate · Next Goal · Memory</h2>
+        <button id="message-state-toggle" class="panel-toggle" type="button">Collapse</button>
+      </div>
+      <div class="panel-meta" id="message-state-meta">Waiting for guardrail telemetry…</div>
+      <div class="panel-sections">
+        <div class="panel-section">
+          <h3>Evaluation</h3>
+          <p id="message-state-evaluation">Loading…</p>
+        </div>
+        <div class="panel-section">
+          <h3>Next Goal</h3>
+          <p id="message-state-goal">Loading…</p>
+        </div>
+        <div class="panel-section">
+          <h3>Memory</h3>
+          <p id="message-state-memory">Loading…</p>
+        </div>
+        <div class="panel-section" id="message-state-blocker-wrapper" style="display:none;">
+          <h3>Guardrail / Blocker</h3>
+          <p id="message-state-blocker"></p>
+        </div>
+      </div>
+    </aside>
+    <aside
+      id="stage-timeline-panel"
+      class="stage-timeline-panel"
+      data-visible="false"
+    >
+      <div class="stage-timeline-header">
+        <h2>Stage Timeline</h2>
+        <p id="stage-timeline-meta">Waiting for planner overlays…</p>
+      </div>
+      <div id="stage-timeline-list" class="stage-list"></div>
+    </aside>
+    <script>
+      (function () {
+        const messagePanel = document.getElementById('message-state-panel');
+        const timelinePanel = document.getElementById('stage-timeline-panel');
+        if (!messagePanel) {
+          return;
+        }
+
+        const evaluationEl = document.getElementById('message-state-evaluation');
+        const goalEl = document.getElementById('message-state-goal');
+        const memoryEl = document.getElementById('message-state-memory');
+        const blockerWrapper = document.getElementById('message-state-blocker-wrapper');
+        const blockerEl = document.getElementById('message-state-blocker');
+        const metaEl = document.getElementById('message-state-meta');
+        const toggleBtn = document.getElementById('message-state-toggle');
+        const timelineListEl = document.getElementById('stage-timeline-list');
+        const timelineMetaEl = document.getElementById('stage-timeline-meta');
+        let lastTimelineHash = '';
+
+        if (toggleBtn) {
+          toggleBtn.addEventListener('click', () => {
+            const collapsed = messagePanel.getAttribute('data-collapsed') === 'true';
+            const nextCollapsed = !collapsed;
+            messagePanel.setAttribute('data-collapsed', nextCollapsed ? 'true' : 'false');
+            toggleBtn.textContent = nextCollapsed ? 'Expand' : 'Collapse';
+          });
+        }
+
+        function latestItem(items, tagPrefix) {
+          if (!Array.isArray(items)) {
+            return null;
+          }
+          for (let i = items.length - 1; i >= 0; i -= 1) {
+            const item = items[i];
+            if (!item || typeof item.tag !== 'string') {
+              continue;
+            }
+            if (item.tag === tagPrefix || item.tag.startsWith(tagPrefix)) {
+              return item;
+            }
+          }
+          return null;
+        }
+
+        function normalizeContent(item, fallback) {
+          if (!item) {
+            return fallback;
+          }
+          const content = typeof item.content === 'string' ? item.content.trim() : '';
+          return content || fallback;
+        }
+
+        function escapeHtml(text) {
+          return String(text || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+        }
+
+        function recordSource(tag) {
+          if (!metaEl) {
+            return;
+          }
+          const text = metaEl.textContent || 'Message state ready';
+          if (!text.includes('source:')) {
+            metaEl.textContent = `${text} · source: ${tag}`;
+          }
+        }
+
+        function renderState(state) {
+          const items = Array.isArray(state.history_items) ? state.history_items : [];
+          evaluationEl.textContent = normalizeContent(
+            latestItem(items, 'evaluation'),
+            'No evaluation messages yet.',
+          );
+          goalEl.textContent = normalizeContent(
+            latestItem(items, 'next_goal'),
+            'The next goal will appear once AutoAct evaluates a step.',
+          );
+          memoryEl.textContent = normalizeContent(
+            latestItem(items, 'memory'),
+            'Memory entries will surface when the agent stores context.',
+          );
+
+          const blockerItem = latestItem(items, 'blocker');
+          if (blockerItem) {
+            blockerEl.textContent = normalizeContent(blockerItem, 'Pending blocker notes.');
+            blockerWrapper.style.display = 'block';
+          } else {
+            blockerWrapper.style.display = 'none';
+          }
+
+          const updated = latestItem(items, 'evaluation') || latestItem(items, 'read_state');
+          if (updated && typeof updated.recorded_at === 'string') {
+            metaEl.textContent = `Last updated · ${new Date(updated.recorded_at).toLocaleString()}`;
+          } else {
+            metaEl.textContent = 'Message state ready';
+          }
+
+          messagePanel.setAttribute('data-visible', 'true');
+        }
+
+        function normalizeTimelinePayload(entry) {
+          if (!entry || typeof entry !== 'object') {
+            return null;
+          }
+          if (entry.kind === 'stage_timeline') {
+            return entry;
+          }
+          if (entry.data && entry.data.kind === 'stage_timeline') {
+            return entry.data;
+          }
+          if (entry.overlay && entry.overlay.data && entry.overlay.data.kind === 'stage_timeline') {
+            return entry.overlay.data;
+          }
+          return null;
+        }
+
+        function timelineStatusLabel(stage) {
+          const status = stage.status || '';
+          if (status === 'auto_strategy') {
+            return `Auto strategy · ${stage.strategy || 'auto'}`;
+          }
+          if (status === 'existing') {
+            return 'Plan intact';
+          }
+          if (status === 'manual') {
+            return 'Manual repair';
+          }
+          return stage.strategy || 'Pending';
+        }
+
+        function renderStageTimeline(rawTimeline, sourceLabel) {
+          if (!timelinePanel || !timelineListEl) {
+            return;
+          }
+          const timeline = normalizeTimelinePayload(rawTimeline);
+          if (!timeline || !Array.isArray(timeline.stages)) {
+            return;
+          }
+          const signature = JSON.stringify(timeline.stages);
+          if (signature === lastTimelineHash) {
+            return;
+          }
+          lastTimelineHash = signature;
+          const itemsHtml = timeline.stages
+            .map((stage) => {
+              const label = escapeHtml(stage.label || stage.stage || '阶段');
+              const detail = escapeHtml(stage.detail || stage.strategy || '待定');
+              const badge = escapeHtml(timelineStatusLabel(stage));
+              return `
+                <div class="stage-item" data-status="${escapeHtml(stage.status || 'unknown')}">
+                  <div class="stage-item-header">
+                    <span class="stage-label">${label}</span>
+                    <span class="stage-status-badge">${badge}</span>
+                  </div>
+                  <p class="stage-detail">${detail}</p>
+                </div>
+              `;
+            })
+            .join('');
+          timelineListEl.innerHTML = itemsHtml || '<p class="stage-detail">No stage data yet.</p>';
+          if (timelineMetaEl) {
+            const metaParts = [];
+            metaParts.push(
+              timeline.deterministic
+                ? 'Deterministic guardrail loop'
+                : 'LLM plan with auto repairs',
+            );
+            if (timeline.recorded_at) {
+              metaParts.push(new Date(timeline.recorded_at).toLocaleString());
+            }
+            if (sourceLabel) {
+              metaParts.push(`source: ${sourceLabel}`);
+            }
+            timelineMetaEl.textContent = metaParts.join(' · ');
+          }
+          timelinePanel.setAttribute('data-visible', 'true');
+        }
+
+        function extractTimelineFromOverlays(overlays) {
+          if (!Array.isArray(overlays)) {
+            return null;
+          }
+          for (const entry of overlays) {
+            const timeline = normalizeTimelinePayload(entry);
+            if (timeline) {
+              return timeline;
+            }
+          }
+          return null;
+        }
+
+        function taskIdFromPath() {
+          const match = window.location.pathname.match(/tasks\/(\w[\w-]+)/i);
+          return match ? match[1] : null;
+        }
+
+        async function fetchConsolePayload() {
+          try {
+            const response = await fetch('/data', { cache: 'no-store' });
+            if (!response.ok) {
+              return null;
+            }
+            return response.json();
+          } catch (err) {
+            return null;
+          }
+        }
+
+        async function fetchServeMessageState(taskId) {
+          if (!taskId) {
+            return null;
+          }
+          try {
+            const response = await fetch(`/api/tasks/${taskId}/message_state`, { cache: 'no-store' });
+            if (!response.ok) {
+              return null;
+            }
+            const payload = await response.json();
+            if (payload && payload.success && payload.message_state) {
+              return payload.message_state;
+            }
+            return null;
+          } catch (err) {
+            return null;
+          }
+        }
+
+        async function fetchServeTimeline(taskId) {
+          if (!taskId) {
+            return null;
+          }
+          try {
+            const response = await fetch(`/api/tasks/${taskId}`, { cache: 'no-store' });
+            if (!response.ok) {
+              return null;
+            }
+            const payload = await response.json();
+            const stageTimeline =
+              payload &&
+              payload.task &&
+              payload.task.plan &&
+              payload.task.plan.meta &&
+              payload.task.plan.meta.vendor_context &&
+              payload.task.plan.meta.vendor_context.stage_timeline;
+            return stageTimeline || null;
+          } catch (err) {
+            return null;
+          }
+        }
+
+        function subscribeToLiveTaskEvents(taskId) {
+          try {
+            const stream = new EventSource(`/api/tasks/${taskId}/events`);
+            stream.addEventListener('message_state', (event) => {
+              try {
+                const payload = JSON.parse(event.data);
+                if (payload && payload.state) {
+                  renderState(payload.state);
+                  recordSource('sse');
+                }
+              } catch (err) {
+                /* ignore */
+              }
+            });
+            stream.addEventListener('overlay', (event) => {
+              try {
+                const payload = JSON.parse(event.data);
+                if (payload && payload.overlay && payload.overlay.data) {
+                  const timeline = normalizeTimelinePayload(payload.overlay.data);
+                  if (timeline) {
+                    const source = payload.overlay.source || 'overlay';
+                    renderStageTimeline(timeline, source);
+                  }
+                }
+              } catch (err) {
+                /* ignore */
+              }
+            });
+            stream.onerror = () => {
+              stream.close();
+              setTimeout(() => subscribeToLiveTaskEvents(taskId), 5000);
+            };
+          } catch (err) {
+            /* ignore */
+          }
+        }
+
+        async function bootstrapPanels() {
+          const consolePayload = await fetchConsolePayload();
+          if (consolePayload) {
+            if (consolePayload.message_state) {
+              renderState(consolePayload.message_state);
+              recordSource('console');
+            }
+            const timeline = extractTimelineFromOverlays(consolePayload.overlays);
+            if (timeline) {
+              renderStageTimeline(timeline, 'console');
+            }
+            return;
+          }
+
+          const taskId = taskIdFromPath();
+          const serveState = await fetchServeMessageState(taskId);
+          if (serveState) {
+            renderState(serveState);
+            recordSource('serve');
+          }
+          const serveTimeline = await fetchServeTimeline(taskId);
+          if (serveTimeline) {
+            renderStageTimeline(serveTimeline, 'serve');
+          }
+          if (taskId) {
+            subscribeToLiveTaskEvents(taskId);
+          }
+        }
+
+        bootstrapPanels();
+      })();
+    </script>
   </body>
 </html>

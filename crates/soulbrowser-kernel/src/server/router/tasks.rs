@@ -7,8 +7,8 @@ use axum::response::sse::{Event, KeepAlive};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Sse},
-    routing::get,
+    response::{IntoResponse, Response, Sse},
+    routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -16,10 +16,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs;
 use tokio::sync::broadcast;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
+use cdp_adapter::{AdapterMode, DebuggerEndpoint, PageId as AdapterPageId};
+use soulbrowser_core_types::TaskId;
+use uuid::Uuid;
+
+use crate::manual_override::{
+    ManualOverrideError, ManualOverridePhase, ManualOverrideSnapshot, ManualRouteContext,
+    ManualTakeoverRequest,
+};
+use crate::metrics::record_manual_takeover_triggered;
 use crate::server::ServeState;
-use crate::task_status::{TaskLogEntry, TaskStatusSnapshot, TaskStreamEnvelope};
+use crate::task_status::{ExecutionStatus, TaskLogEntry, TaskStatusSnapshot, TaskStreamEnvelope};
 use crate::task_store::{PlanSummary, TaskPlanStore};
 
 pub(crate) fn router() -> Router<ServeState> {
@@ -34,8 +43,20 @@ pub(crate) fn router() -> Router<ServeState> {
         .route("/api/tasks/:task_id/events", get(task_events_sse_handler))
         .route("/api/tasks/:task_id/stream", get(task_events_sse_handler))
         .route(
+            "/api/tasks/:task_id/message_state",
+            get(task_message_state_handler),
+        )
+        .route(
             "/api/tasks/:task_id/executions",
             get(task_executions_handler),
+        )
+        .route(
+            "/api/tasks/:task_id/manual_takeover",
+            post(task_manual_takeover_handler),
+        )
+        .route(
+            "/api/tasks/:task_id/manual_takeover/resume",
+            post(task_manual_takeover_resume_handler),
         )
 }
 
@@ -82,6 +103,15 @@ struct TaskDetailResponse {
 struct TaskExecutionsResponse {
     success: bool,
     executions: Vec<Value>,
+}
+
+#[derive(Serialize)]
+struct TaskMessageStateResponse {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_state: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
 }
 
 #[instrument(name = "soul.tasks.detail", skip(state))]
@@ -137,6 +167,333 @@ async fn task_executions_handler(
             Json(json!({ "success": false, "error": err.to_string() })),
         )
             .into_response(),
+    }
+}
+
+#[instrument(name = "soul.tasks.message_state", skip(state))]
+async fn task_message_state_handler(
+    State(state): State<ServeState>,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    let registry = state.task_status_registry().await;
+    if let Some(snapshot) = registry.snapshot(&task_id) {
+        if let Some(value) = snapshot.message_state.clone() {
+            return Json(TaskMessageStateResponse {
+                success: true,
+                message_state: Some(value),
+                source: Some("live".to_string()),
+            })
+            .into_response();
+        }
+    }
+
+    let path = state
+        .execution_output_root()
+        .join(&task_id)
+        .join("message_state.json");
+    match fs::read(&path).await {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => Json(TaskMessageStateResponse {
+                success: true,
+                message_state: Some(value),
+                source: Some("artifact".to_string()),
+            })
+            .into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "error": format!("failed to parse message_state.json: {err}"),
+                })),
+            )
+                .into_response(),
+        },
+        Err(err) => {
+            if err.kind() == ErrorKind::NotFound {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "success": false,
+                        "error": "message_state not available",
+                    })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "error": err.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ManualTakeoverBody {
+    #[serde(default)]
+    requested_by: Option<String>,
+    #[serde(default)]
+    expires_in_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ManualTakeoverResumeBody {
+    resume_token: String,
+}
+
+#[derive(Serialize)]
+struct ManualTakeoverApiResponse {
+    success: bool,
+    takeover: ManualOverrideView,
+}
+
+#[derive(Serialize)]
+struct ManualOverrideView {
+    status: ManualOverridePhase,
+    requested_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resumed_at: Option<DateTime<Utc>>,
+    expires_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_by: Option<String>,
+    route: ManualRouteContext,
+    debugger: ManualDebuggerView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ManualDebuggerView {
+    ws_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inspect_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch_url: Option<String>,
+}
+
+#[instrument(
+    name = "soul.tasks.manual_takeover",
+    skip(state, body),
+    fields(task_id = %task_id)
+)]
+async fn task_manual_takeover_handler(
+    State(state): State<ServeState>,
+    Path(task_id): Path<String>,
+    Json(body): Json<ManualTakeoverBody>,
+) -> impl IntoResponse {
+    let manager = state.manual_session_manager().await;
+    if !manager.config().enabled {
+        return manual_error_response(StatusCode::FORBIDDEN, "manual takeover disabled");
+    }
+
+    let registry = state.task_status_registry().await;
+    let Some(handle) = registry.handle(TaskId(task_id.clone())) else {
+        return manual_error_response(StatusCode::NOT_FOUND, "task not found");
+    };
+    let Some(status) = registry.snapshot(&task_id) else {
+        return manual_error_response(StatusCode::NOT_FOUND, "task not found");
+    };
+    if !matches!(
+        status.status,
+        ExecutionStatus::Running | ExecutionStatus::Pending
+    ) {
+        return manual_error_response(StatusCode::CONFLICT, "task is not running");
+    }
+
+    let Some(route) = registry.latest_route_context(&task_id) else {
+        warn!(task = %task_id, "manual takeover requested but no route available");
+        return manual_error_response(
+            StatusCode::CONFLICT,
+            "no recent browser route available for task",
+        );
+    };
+
+    let Some(page_id) = parse_adapter_page(&route) else {
+        warn!(task = %task_id, "manual takeover route missing page identifier");
+        return manual_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "task route missing page identifier",
+        );
+    };
+
+    let app_ctx = state.app_context().await;
+    let tools = app_ctx.tool_manager();
+    if matches!(tools.adapter_mode(), Some(AdapterMode::Stub)) {
+        warn!(task = %task_id, "manual takeover requested while adapter in stub mode");
+        return manual_error_response(
+            StatusCode::FAILED_DEPENDENCY,
+            "browser not running in real mode",
+        );
+    }
+    let Some(adapter) = tools.cdp_adapter() else {
+        return manual_error_response(StatusCode::FAILED_DEPENDENCY, "browser adapter unavailable");
+    };
+
+    let Some(debugger) = adapter.debugger_endpoint(page_id).await else {
+        warn!(task = %task_id, "manual takeover debugger endpoint unavailable");
+        return manual_error_response(
+            StatusCode::CONFLICT,
+            "debugger endpoint not available for page",
+        );
+    };
+
+    let expires_override = body
+        .expires_in_secs
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs);
+    let takeover_request = ManualTakeoverRequest {
+        task_id: TaskId(task_id.clone()),
+        debugger: debugger.clone(),
+        route: route.clone(),
+        requested_by: body.requested_by.clone(),
+        expires_in: expires_override,
+    };
+
+    let response = match manager.request_takeover(takeover_request) {
+        Ok(resp) => resp,
+        Err(err) => {
+            let (status, message) = map_manual_override_error(err);
+            return manual_error_response(status, message);
+        }
+    };
+
+    let snapshot = response.snapshot.clone();
+    let view = build_manual_override_view(
+        &snapshot,
+        debugger,
+        route,
+        Some(response.resume_token.clone()),
+    );
+    handle.update_manual_override(snapshot);
+    record_manual_takeover_triggered(
+        body.requested_by
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("api"),
+    );
+
+    Json(ManualTakeoverApiResponse {
+        success: true,
+        takeover: view,
+    })
+    .into_response()
+}
+
+#[instrument(
+    name = "soul.tasks.manual_takeover_resume",
+    skip(state, body),
+    fields(task_id = %task_id)
+)]
+async fn task_manual_takeover_resume_handler(
+    State(state): State<ServeState>,
+    Path(task_id): Path<String>,
+    Json(body): Json<ManualTakeoverResumeBody>,
+) -> impl IntoResponse {
+    let manager = state.manual_session_manager().await;
+    if !manager.config().enabled {
+        return manual_error_response(StatusCode::FORBIDDEN, "manual takeover disabled");
+    }
+
+    let registry = state.task_status_registry().await;
+    let Some(handle) = registry.handle(TaskId(task_id.clone())) else {
+        return manual_error_response(StatusCode::NOT_FOUND, "task not found");
+    };
+
+    let result = match manager.resume(&TaskId(task_id.clone()), &body.resume_token) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let (status, message) = map_manual_override_error(err);
+            return manual_error_response(status, message);
+        }
+    };
+
+    let debugger = match result.debugger.clone() {
+        Some(dbg) => dbg,
+        None => {
+            warn!(task = %task_id, "manual takeover snapshot missing debugger info");
+            return manual_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "missing debugger endpoint",
+            );
+        }
+    };
+    let route = match result.route.clone() {
+        Some(route) => route,
+        None => {
+            warn!(task = %task_id, "manual takeover snapshot missing route info");
+            return manual_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "missing route context",
+            );
+        }
+    };
+
+    let view = build_manual_override_view(&result, debugger, route, None);
+    handle.update_manual_override(result);
+
+    Json(ManualTakeoverApiResponse {
+        success: true,
+        takeover: view,
+    })
+    .into_response()
+}
+
+fn manual_error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(json!({ "success": false, "error": message.into() })),
+    )
+        .into_response()
+}
+
+fn parse_adapter_page(route: &ManualRouteContext) -> Option<AdapterPageId> {
+    let page = route.page.as_deref()?;
+    let uuid = Uuid::parse_str(page).ok()?;
+    Some(AdapterPageId(uuid))
+}
+
+fn map_manual_override_error(err: ManualOverrideError) -> (StatusCode, String) {
+    match err {
+        ManualOverrideError::Disabled => (StatusCode::FORBIDDEN, "manual takeover disabled".into()),
+        ManualOverrideError::AlreadyActive => (
+            StatusCode::CONFLICT,
+            "manual takeover already active for task".into(),
+        ),
+        ManualOverrideError::NotFound => (
+            StatusCode::NOT_FOUND,
+            "manual takeover not active for task".into(),
+        ),
+        ManualOverrideError::InvalidToken => {
+            (StatusCode::UNAUTHORIZED, "resume token invalid".into())
+        }
+        ManualOverrideError::Expired => (StatusCode::GONE, "manual takeover expired".into()),
+    }
+}
+
+fn build_manual_override_view(
+    snapshot: &ManualOverrideSnapshot,
+    debugger: DebuggerEndpoint,
+    route: ManualRouteContext,
+    resume_token: Option<String>,
+) -> ManualOverrideView {
+    let debugger_view = ManualDebuggerView {
+        ws_url: debugger.ws_url.clone(),
+        inspect_url: debugger.inspect_url.clone(),
+        launch_url: debugger.inspect_url.clone(),
+    };
+
+    ManualOverrideView {
+        status: snapshot.status,
+        requested_at: snapshot.requested_at,
+        activated_at: snapshot.activated_at,
+        resumed_at: snapshot.resumed_at,
+        expires_at: snapshot.expires_at,
+        requested_by: snapshot.requested_by.clone(),
+        route,
+        debugger: debugger_view,
+        resume_token,
     }
 }
 

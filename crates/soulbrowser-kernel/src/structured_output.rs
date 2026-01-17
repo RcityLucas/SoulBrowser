@@ -1,5 +1,8 @@
 use anyhow::{anyhow, bail, Result};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
+use std::error::Error;
+use std::fmt;
 
 /// Normalize schema identifiers (remove extension, lowercase).
 pub fn canonical_schema_id(value: &str) -> String {
@@ -26,6 +29,7 @@ pub fn validate_structured_output(schema: &str, value: &Value) -> Result<()> {
 
     match canonical.as_str() {
         "market_info_v1" => validate_market_info(value),
+        "metal_price_v1" => validate_metal_price(value),
         "news_brief_v1" => validate_news_brief(value),
         "github_repos_v1" => validate_github_repos(value),
         "twitter_feed_v1" => validate_twitter_feed(value),
@@ -36,12 +40,191 @@ pub fn validate_structured_output(schema: &str, value: &Value) -> Result<()> {
     }
 }
 
+fn validate_metal_price(value: &Value) -> Result<()> {
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("metal_price_v1 requires 'items' array"))?;
+    if items.is_empty() {
+        bail!("metal_price_v1 requires at least one entry");
+    }
+    for (idx, item) in items.iter().enumerate() {
+        let metal = item
+            .get("metal")
+            .and_then(Value::as_str)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("items[{}] missing 'metal'", idx))?;
+        let price = item
+            .get("price")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| anyhow!("items[{}] missing numeric 'price'", idx))?;
+        if !price.is_finite() || price <= 0.0 {
+            bail!("items[{}] has invalid price", idx);
+        }
+        if let Some(currency) = item.get("currency").and_then(Value::as_str) {
+            if currency.trim().is_empty() {
+                bail!("items[{}] contains empty 'currency'", idx);
+            }
+        }
+        if let Some(unit) = item.get("unit").and_then(Value::as_str) {
+            if unit.trim().is_empty() {
+                bail!("items[{}] contains empty 'unit'", idx);
+            }
+        }
+        if let Some(change) = item.get("change") {
+            change
+                .as_f64()
+                .ok_or_else(|| anyhow!("items[{}] contains non-numeric 'change'", idx))?;
+        }
+        if let Some(change_pct) = item.get("change_pct") {
+            change_pct
+                .as_f64()
+                .ok_or_else(|| anyhow!("items[{}] contains non-numeric 'change_pct'", idx))?;
+        }
+        if let Some(as_of) = item.get("as_of").and_then(Value::as_str) {
+            if as_of.trim().is_empty() {
+                bail!("items[{}] contains empty 'as_of'", idx);
+            }
+        }
+        if metal.is_empty() {
+            bail!("items[{}] contains empty 'metal'", idx);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub enum MetalPriceValidationFailure {
+    MissingMetal(String),
+    MissingMarket(Vec<String>),
+    StaleQuotes { max_age_hours: f64 },
+}
+
+impl fmt::Display for MetalPriceValidationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MetalPriceValidationFailure::MissingMetal(keyword) => {
+                write!(f, "未找到匹配 {} 的金属行情", keyword)
+            }
+            MetalPriceValidationFailure::MissingMarket(markets) => {
+                write!(f, "抓取结果未覆盖期望市场: {}", markets.join("/"))
+            }
+            MetalPriceValidationFailure::StaleQuotes { max_age_hours } => {
+                write!(f, "行情时间超过 {} 小时", max_age_hours)
+            }
+        }
+    }
+}
+
+impl Error for MetalPriceValidationFailure {}
+
+pub struct MetalPriceValidationContext<'a> {
+    pub metal_keyword: &'a str,
+    pub allowed_markets: &'a [String],
+    pub max_age_hours: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetalPriceValidationReport {
+    pub total_items: usize,
+    pub matched_metal: usize,
+    pub matched_market: usize,
+    pub fresh_entries: usize,
+    pub newest_as_of: Option<String>,
+}
+
+pub fn validate_metal_price_with_context(
+    value: &Value,
+    context: &MetalPriceValidationContext,
+) -> Result<MetalPriceValidationReport> {
+    validate_metal_price(value)?;
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("metal_price_v1 requires 'items' array"))?;
+    let keyword = context.metal_keyword.trim();
+    let allowed_markets = context.allowed_markets;
+    let threshold_secs = (context.max_age_hours.max(1.0) * 3600.0) as i64;
+    let freshness_threshold = Utc::now() - Duration::seconds(threshold_secs);
+
+    let mut matched_metal = 0usize;
+    let mut matched_market = 0usize;
+    let mut fresh_entries = 0usize;
+    let mut newest: Option<DateTime<Utc>> = None;
+    let mut newest_str: Option<String> = None;
+
+    for item in items {
+        let metal = item.get("metal").and_then(Value::as_str).unwrap_or("");
+        if !keyword.is_empty() && contains_insensitive(metal, keyword) {
+            matched_metal += 1;
+        }
+
+        if !allowed_markets.is_empty() {
+            let market = item.get("market").and_then(Value::as_str).unwrap_or("");
+            if allowed_markets
+                .iter()
+                .any(|expected| contains_insensitive(market, expected))
+            {
+                matched_market += 1;
+            }
+        }
+
+        if let Some(as_of) = item.get("as_of").and_then(Value::as_str) {
+            if let Some(parsed) = parse_timestamp(as_of) {
+                if newest.map(|current| parsed > current).unwrap_or(true) {
+                    newest = Some(parsed);
+                    newest_str = Some(as_of.to_string());
+                }
+                if parsed >= freshness_threshold {
+                    fresh_entries += 1;
+                }
+            }
+        }
+    }
+
+    if !keyword.is_empty() && matched_metal == 0 {
+        return Err(MetalPriceValidationFailure::MissingMetal(keyword.to_string()).into());
+    }
+    if !allowed_markets.is_empty() && matched_market == 0 {
+        return Err(MetalPriceValidationFailure::MissingMarket(allowed_markets.to_vec()).into());
+    }
+    if fresh_entries == 0 {
+        return Err(MetalPriceValidationFailure::StaleQuotes {
+            max_age_hours: context.max_age_hours,
+        }
+        .into());
+    }
+
+    Ok(MetalPriceValidationReport {
+        total_items: items.len(),
+        matched_metal,
+        matched_market,
+        fresh_entries,
+        newest_as_of: newest_str,
+    })
+}
+
 /// Generate a short human readable summary for structured payloads when possible.
 pub fn summarize_structured_output(schema: &str, value: &Value) -> Option<String> {
     match canonical_schema_id(schema).as_str() {
         "weather_report_v1" => summarize_weather_report(value),
         _ => None,
     }
+}
+
+fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+}
+
+fn contains_insensitive(haystack: &str, needle: &str) -> bool {
+    if haystack.is_empty() || needle.trim().is_empty() {
+        return false;
+    }
+    let lower = haystack.to_ascii_lowercase();
+    lower.contains(&needle.to_ascii_lowercase()) || haystack.contains(needle)
 }
 
 fn validate_market_info(value: &Value) -> Result<()> {
@@ -393,6 +576,86 @@ mod tests {
             "items": []
         });
         assert!(validate_structured_output("market_info_v1", &value).is_err());
+    }
+
+    #[test]
+    fn validates_metal_price() {
+        let value = json!({
+            "schema": "metal_price_v1",
+            "items": [
+                {
+                    "metal": "沪铜主连",
+                    "price": 60590.0,
+                    "currency": "CNY",
+                    "unit": "元/吨",
+                    "change": -120.0,
+                    "change_pct": -0.2,
+                    "as_of": "2026-01-03T02:10:00Z"
+                }
+            ]
+        });
+        validate_structured_output("metal_price_v1", &value).expect("valid schema");
+    }
+
+    #[test]
+    fn rejects_invalid_metal_price() {
+        let value = json!({
+            "schema": "metal_price_v1",
+            "items": [
+                {
+                    "metal": "",
+                    "price": -1.0
+                }
+            ]
+        });
+        assert!(validate_structured_output("metal_price_v1", &value).is_err());
+    }
+
+    #[test]
+    fn validates_metal_price_context_success() {
+        let now = Utc::now().to_rfc3339();
+        let value = json!({
+            "schema": "metal_price_v1",
+            "items": [
+                {
+                    "metal": "沪铜主连",
+                    "market": "上海期货交易所",
+                    "price": 62000.0,
+                    "as_of": now
+                }
+            ]
+        });
+        let ctx = MetalPriceValidationContext {
+            metal_keyword: "铜",
+            allowed_markets: &["上海期货交易所".to_string()],
+            max_age_hours: 24.0,
+        };
+        let report = validate_metal_price_with_context(&value, &ctx).expect("valid context");
+        assert_eq!(report.fresh_entries, 1);
+        assert_eq!(report.matched_metal, 1);
+        assert_eq!(report.total_items, 1);
+    }
+
+    #[test]
+    fn rejects_stale_metal_price_context() {
+        let stale = (Utc::now() - Duration::hours(30)).to_rfc3339();
+        let value = json!({
+            "schema": "metal_price_v1",
+            "items": [
+                {
+                    "metal": "沪铜主连",
+                    "market": "上海期货交易所",
+                    "price": 60000.0,
+                    "as_of": stale
+                }
+            ]
+        });
+        let ctx = MetalPriceValidationContext {
+            metal_keyword: "铜",
+            allowed_markets: &[],
+            max_age_hours: 24.0,
+        };
+        assert!(validate_metal_price_with_context(&value, &ctx).is_err());
     }
 
     #[test]

@@ -1,8 +1,16 @@
+use crate::llm::agent_loop_prompt::{
+    build_system_prompt as build_agent_loop_system_prompt,
+    build_user_message as build_agent_loop_user_message,
+    parse_agent_output as parse_agent_loop_output,
+};
 use crate::llm::prompt::PromptBuilder;
 use crate::llm::schema::{plan_from_json_payload, LlmJsonPlan};
 use crate::llm::utils::extract_json_object;
 use agent_core::AgentError;
-use agent_core::{AgentPlan, AgentRequest, LlmProvider, PlannerOutcome};
+use agent_core::{
+    AgentHistoryEntry, AgentOutput, AgentPlan, AgentRequest, BrowserStateSummary, LlmProvider,
+    PlannerOutcome,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -128,6 +136,64 @@ impl LlmProvider for ClaudeLlmProvider {
     ) -> Result<PlannerOutcome, AgentError> {
         self.invoke(request, Some(previous_plan), Some(error_summary))
             .await
+    }
+
+    async fn decide(
+        &self,
+        request: &AgentRequest,
+        state: &BrowserStateSummary,
+        history: &[AgentHistoryEntry],
+    ) -> Result<AgentOutput, AgentError> {
+        let body = ClaudeRequest {
+            model: self.config.model.clone(),
+            temperature: self.config.temperature,
+            max_tokens: self.config.max_tokens,
+            system: build_agent_loop_system_prompt(state),
+            messages: vec![ClaudeMessage {
+                role: "user".to_string(),
+                content: vec![ClaudeContent {
+                    _type: "text".to_string(),
+                    text: build_agent_loop_user_message(request, state, history),
+                }],
+            }],
+        };
+
+        let url = format!("{}/messages", self.config.api_base.trim_end_matches('/'));
+        let response = self
+            .client
+            .post(url)
+            .header("x-api-key", &self.config.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| AgentError::invalid_request(format!("claude request failed: {err}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<response unavailable>".to_string());
+            return Err(AgentError::invalid_request(format!(
+                "claude returned {}: {}",
+                status, text
+            )));
+        }
+
+        let response: ClaudeResponse = response.json().await.map_err(|err| {
+            AgentError::invalid_request(format!("claude response invalid: {err}"))
+        })?;
+
+        let content = response
+            .content
+            .iter()
+            .filter_map(|part| part.text.as_ref())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        parse_agent_loop_output(&content)
     }
 }
 

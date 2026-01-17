@@ -22,6 +22,16 @@ static TOO_MANY_REQUESTS_PATTERNS: Lazy<Vec<&'static str>> = Lazy::new(|| {
     ]
 });
 
+static CN_NOT_FOUND_PATTERNS: Lazy<Vec<&'static str>> = Lazy::new(|| {
+    vec![
+        "页面不存在",
+        "页面已删除",
+        "抱歉，你访问的页面不存在",
+        "抱歉，您访问的页面不存在",
+        "自动进入推广页面",
+    ]
+});
+
 /// Detect whether the captured page content looks like an access block (403/404/captcha).
 /// Returns a short human-readable reason when a blocker is detected.
 pub fn detect_block_reason(title: &str, body: &str, url: Option<&str>) -> Option<String> {
@@ -61,6 +71,13 @@ pub fn detect_block_reason(title: &str, body: &str, url: Option<&str>) -> Option
         return Some("Site reports too many requests".to_string());
     }
 
+    if CN_NOT_FOUND_PATTERNS
+        .iter()
+        .any(|pattern| body.contains(pattern) || title.contains(pattern))
+    {
+        return Some("Page reports 404/NotFound message".to_string());
+    }
+
     None
 }
 
@@ -88,5 +105,15 @@ mod tests {
             Some("https://wappass.baidu.com/wappass"),
         );
         assert_eq!(reason.unwrap(), "Baidu returned a verification page");
+    }
+
+    #[test]
+    fn detects_cn_not_found_copy() {
+        let reason = detect_block_reason(
+            "抱歉，您访问的页面不存在或已删除！",
+            "抱歉，你访问的页面不存在！2秒后 自动进入推广页面",
+            None,
+        );
+        assert_eq!(reason.unwrap(), "Page reports 404/NotFound message");
     }
 }

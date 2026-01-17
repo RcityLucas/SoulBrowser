@@ -20,14 +20,6 @@ pub fn enrich_request_with_intent(request: &mut AgentRequest, prompt: &str) {
         "intent_kind".to_string(),
         Value::String(intent_kind.as_str().to_string()),
     );
-    request
-        .intent
-        .primary_goal
-        .get_or_insert_with(|| trimmed.to_string());
-    request
-        .metadata
-        .entry("primary_goal".to_string())
-        .or_insert_with(|| Value::String(trimmed.to_string()));
     if contains_cjk(trimmed) {
         request.intent.preferred_language = Some("zh-CN".to_string());
         request
@@ -36,6 +28,19 @@ pub fn enrich_request_with_intent(request: &mut AgentRequest, prompt: &str) {
             .or_insert_with(|| Value::String("zh-CN".to_string()));
     }
     apply_configured_intent(request, trimmed);
+    if request
+        .intent
+        .primary_goal
+        .as_ref()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        request.intent.primary_goal = Some(trimmed.to_string());
+        request.metadata.insert(
+            "primary_goal".to_string(),
+            Value::String(trimmed.to_string()),
+        );
+    }
     update_todo_snapshot(request);
 }
 
@@ -114,7 +119,9 @@ fn classify_intent_kind(prompt: &str) -> AgentIntentKind {
 }
 
 fn apply_configured_intent(request: &mut AgentRequest, prompt: &str) {
-    let Some((intent_id, definition)) = match_intent(prompt) else {
+    let Some((intent_id, definition)) =
+        match_builtin_intent(prompt).or_else(|| match_intent(prompt))
+    else {
         return;
     };
 
@@ -124,14 +131,23 @@ fn apply_configured_intent(request: &mut AgentRequest, prompt: &str) {
         .insert("intent_id".to_string(), Value::String(intent_id));
 
     if let Some(goal) = definition.primary_goal.as_deref() {
-        request.intent.primary_goal = Some(goal.to_string());
-        request
-            .metadata
-            .insert("primary_goal".to_string(), Value::String(goal.to_string()));
+        let has_goal = request
+            .intent
+            .primary_goal
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if !has_goal {
+            request.intent.primary_goal = Some(goal.to_string());
+            request
+                .metadata
+                .insert("primary_goal".to_string(), Value::String(goal.to_string()));
+        }
     }
 
-    if !definition.primary_sites.is_empty() {
+    if request.intent.target_sites.is_empty() && !definition.primary_sites.is_empty() {
         request.intent.target_sites = definition.primary_sites.clone();
+        request.intent.target_sites_are_hints = true;
         request.metadata.insert(
             "target_sites".to_string(),
             Value::Array(
@@ -173,6 +189,37 @@ fn apply_configured_intent(request: &mut AgentRequest, prompt: &str) {
             .map(|(kind, remediation)| (kind.clone(), remediation.clone()))
             .collect();
     }
+
+    if !definition.validation_keywords.is_empty() {
+        request.intent.validation_keywords = definition.validation_keywords.clone();
+        let values: Vec<Value> = definition
+            .validation_keywords
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| Value::String(value.to_string()))
+            .collect();
+        if !values.is_empty() {
+            request.metadata.insert(
+                "intent_validation_keywords".to_string(),
+                Value::Array(values),
+            );
+        }
+    }
+
+    if !definition.allowed_domains.is_empty() {
+        request.intent.allowed_domains = definition.allowed_domains.clone();
+        let values: Vec<Value> = definition
+            .allowed_domains
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| Value::String(value.to_string()))
+            .collect();
+        if !values.is_empty() {
+            request
+                .metadata
+                .insert("intent_allowed_domains".to_string(), Value::Array(values));
+        }
+    }
 }
 
 fn match_intent(prompt: &str) -> Option<(String, IntentDefinition)> {
@@ -182,6 +229,94 @@ fn match_intent(prompt: &str) -> Option<(String, IntentDefinition)> {
         .iter()
         .find(|entry| entry.definition.matches(prompt))
         .map(|entry| (entry.id.clone(), entry.definition.clone()))
+}
+
+fn match_builtin_intent(prompt: &str) -> Option<(String, IntentDefinition)> {
+    if matches_market_quote_prompt(prompt) {
+        return Some(("market_quote_lookup".to_string(), market_quote_definition()));
+    }
+    None
+}
+
+fn matches_market_quote_prompt(prompt: &str) -> bool {
+    const PRICE_KEYWORDS: &[&str] = &[
+        "行情", "价格", "报价", "走势", "price", "quote", "期货", "现货",
+    ];
+    const METAL_KEYWORDS: &[&str] = &[
+        "铜",
+        "铝",
+        "镍",
+        "锌",
+        "铅",
+        "锡",
+        "金属",
+        "贵金属",
+        "金价",
+        "银价",
+        "银子",
+        "黄金",
+        "金子",
+        "白银",
+        "silver",
+        "gold",
+        "oil",
+        "原油",
+        "metal",
+        "lme",
+        "shfe",
+        "伦敦",
+        "上海期货",
+        "东方财富",
+    ];
+    let lower = prompt.to_ascii_lowercase();
+    let matches_any = |needles: &[&str]| {
+        needles.iter().any(|needle| {
+            let trimmed = needle.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            prompt.contains(trimmed) || lower.contains(&trimmed.to_ascii_lowercase())
+        })
+    };
+    matches_any(PRICE_KEYWORDS) && matches_any(METAL_KEYWORDS)
+}
+
+fn market_quote_definition() -> IntentDefinition {
+    let mut blockers = HashMap::new();
+    blockers.insert("captcha".to_string(), "require_manual_captcha".to_string());
+    blockers.insert(
+        "login_wall".to_string(),
+        "require_manual_captcha".to_string(),
+    );
+    blockers.insert("blank_page".to_string(), "auto_retry".to_string());
+    IntentDefinition {
+        triggers: Vec::new(),
+        primary_goal: Some("查询指定金属的最新行情".to_string()),
+        primary_sites: vec![
+            "https://quote.eastmoney.com/qh/CU0.html".to_string(),
+            "https://data.eastmoney.com/metal/cu.html".to_string(),
+        ],
+        output: Some(IntentOutput {
+            schema: Some("metal_price_v1.json".to_string()),
+            include_screenshot: Some(true),
+            description: Some(
+                "Array of {metal,price,contract,market,currency,as_of,source_url}".to_string(),
+            ),
+        }),
+        preferred_language: Some("zh-CN".to_string()),
+        blockers,
+        validation_keywords: vec![
+            "金属".to_string(),
+            "行情".to_string(),
+            "期货".to_string(),
+            "报价".to_string(),
+        ],
+        allowed_domains: vec![
+            "quote.eastmoney.com".to_string(),
+            "data.eastmoney.com".to_string(),
+            "eastmoney.com".to_string(),
+        ],
+    }
 }
 
 fn load_intent_config() -> Option<IntentConfig> {
@@ -281,6 +416,10 @@ struct IntentDefinition {
     preferred_language: Option<String>,
     #[serde(default)]
     blockers: HashMap<String, String>,
+    #[serde(default)]
+    validation_keywords: Vec<String>,
+    #[serde(default)]
+    allowed_domains: Vec<String>,
 }
 
 impl IntentDefinition {
@@ -311,6 +450,7 @@ struct IntentOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::{AgentPlanner, AgentToolKind, PlannerConfig, RuleBasedPlanner};
     use soulbrowser_core_types::TaskId;
     use std::env;
     use std::fs;
@@ -336,6 +476,40 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         assert_eq!(lang_meta, "zh-CN");
+    }
+
+    #[test]
+    fn builtin_market_quote_intent_detects_keywords() {
+        let mut request = AgentRequest::new(TaskId::new(), "我想看最新铜价行情");
+        enrich_request_with_intent(&mut request, "我想看最新铜价行情");
+        assert_eq!(
+            request.intent.intent_id.as_deref(),
+            Some("market_quote_lookup")
+        );
+        assert_eq!(
+            request
+                .intent
+                .required_outputs
+                .first()
+                .map(|output| output.schema.as_str()),
+            Some("metal_price_v1.json")
+        );
+    }
+
+    #[test]
+    fn configured_intent_preserves_user_goal_and_sites() {
+        let mut request = AgentRequest::new(TaskId::new(), "请帮我看看白银报价");
+        request.intent.primary_goal = Some("我自己的目标".to_string());
+        request.intent.target_sites = vec!["https://user.example.com".to_string()];
+        request.intent.target_sites_are_hints = false;
+        enrich_request_with_intent(&mut request, "请帮我看看白银报价");
+
+        assert_eq!(request.intent.primary_goal.as_deref(), Some("我自己的目标"));
+        assert_eq!(
+            request.intent.target_sites,
+            vec!["https://user.example.com".to_string()]
+        );
+        assert!(!request.intent.target_sites_are_hints);
     }
 
     #[test]
@@ -375,6 +549,7 @@ intents:
             Some("Run special workflow")
         );
         assert_eq!(request.intent.target_sites.len(), 2);
+        assert!(request.intent.target_sites_are_hints);
         assert_eq!(request.intent.preferred_language.as_deref(), Some("en-US"));
         assert_eq!(request.intent.required_outputs.len(), 1);
         let output = &request.intent.required_outputs[0];
@@ -410,5 +585,29 @@ intents:
         let mut request = AgentRequest::new(TaskId::new(), "登录账户");
         enrich_request_with_intent(&mut request, "请登录账户并修改密码");
         assert_eq!(request.intent.intent_kind, AgentIntentKind::Operational);
+    }
+
+    #[test]
+    fn market_prompt_generates_validated_plan() {
+        reset_intent_cache_for_tests();
+        let prompt = "通过东方财富查一下白银走势";
+        let mut request = AgentRequest::new(TaskId::new(), prompt);
+        enrich_request_with_intent(&mut request, prompt);
+
+        let planner = RuleBasedPlanner::new(PlannerConfig::default());
+        let outcome = planner.draft_plan(&request).expect("plan");
+        let plan = outcome.plan;
+
+        assert!(contains_tool(&plan, "market.quote.fetch"));
+        assert!(contains_tool(&plan, "data.validate-target"));
+        assert!(contains_tool(&plan, "data.parse.metal_price"));
+        assert!(contains_tool(&plan, "data.deliver.structured"));
+    }
+
+    fn contains_tool(plan: &agent_core::AgentPlan, tool_name: &str) -> bool {
+        plan.steps.iter().any(|step| match &step.tool.kind {
+            AgentToolKind::Custom { name, .. } => name.eq_ignore_ascii_case(tool_name),
+            _ => false,
+        })
     }
 }

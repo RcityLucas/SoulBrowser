@@ -154,6 +154,63 @@ fn note_step(message: &str) -> AgentPlanStep {
     )
 }
 
+fn metal_parse_step(id: &str, source_step_id: &str) -> AgentPlanStep {
+    AgentPlanStep::new(
+        id,
+        "Parse metal",
+        AgentTool {
+            kind: AgentToolKind::Custom {
+                name: "data.parse.metal_price".to_string(),
+                payload: json!({
+                    "source_step_id": source_step_id,
+                }),
+            },
+            wait: WaitMode::Idle,
+            timeout_ms: None,
+        },
+    )
+}
+
+fn validate_target_step(id: &str, source_step_id: &str) -> AgentPlanStep {
+    AgentPlanStep::new(
+        id,
+        "Validate target",
+        AgentTool {
+            kind: AgentToolKind::Custom {
+                name: "data.validate-target".to_string(),
+                payload: json!({
+                    "source_step_id": source_step_id,
+                    "keywords": ["白银"],
+                    "allowed_domains": ["eastmoney.com"],
+                    "expected_status": 200,
+                }),
+            },
+            wait: WaitMode::None,
+            timeout_ms: None,
+        },
+    )
+}
+
+fn metal_deliver_step(id: &str, source_step_id: &str) -> AgentPlanStep {
+    AgentPlanStep::new(
+        id,
+        "Deliver metal price",
+        AgentTool {
+            kind: AgentToolKind::Custom {
+                name: "data.deliver.structured".to_string(),
+                payload: json!({
+                    "schema": "metal_price_v1.json",
+                    "artifact_label": "structured.metal_price_v1",
+                    "filename": "metal_price_v1.json",
+                    "source_step_id": source_step_id,
+                }),
+            },
+            wait: WaitMode::None,
+            timeout_ms: None,
+        },
+    )
+}
+
 fn github_parse_step(payload: serde_json::Value) -> AgentPlanStep {
     AgentPlanStep::new(
         "step-github",
@@ -390,6 +447,53 @@ fn strict_keyword_intents_need_user_result() {
 
     plan.push_step(note_step("记录结果摘要"));
     assert!(strict.validate(&plan, &request).is_ok());
+}
+
+#[test]
+fn strict_market_intents_require_guardrails() {
+    let mut request = AgentRequest::new(TaskId::new(), "查询白银");
+    request.intent.intent_id = Some("market_quote_lookup".to_string());
+
+    let strict = PlanValidator::strict();
+
+    let mut missing_validate = AgentPlan::new(request.task_id.clone(), "missing-validate");
+    missing_validate.push_step(navigation_step("https://quote.example.com"));
+    let mut observe = observe_step();
+    observe.id = "observe-metal".to_string();
+    missing_validate.push_step(observe.clone());
+    let parse = metal_parse_step("parse-metal", &observe.id);
+    missing_validate.push_step(parse.clone());
+    missing_validate.push_step(metal_deliver_step("deliver-metal", &parse.id));
+    assert!(strict.validate(&missing_validate, &request).is_err());
+
+    let mut wrong_parser = AgentPlan::new(request.task_id.clone(), "wrong-parser");
+    wrong_parser.push_step(navigation_step("https://quote.example.com"));
+    wrong_parser.push_step(observe.clone());
+    wrong_parser.push_step(validate_target_step("validate-metal", &observe.id));
+    wrong_parser.push_step(AgentPlanStep::new(
+        "parse-news",
+        "Parse news",
+        AgentTool {
+            kind: AgentToolKind::Custom {
+                name: "data.parse.news_brief".to_string(),
+                payload: json!({
+                    "source_step_id": observe.id.clone(),
+                }),
+            },
+            wait: WaitMode::Idle,
+            timeout_ms: None,
+        },
+    ));
+    wrong_parser.push_step(metal_deliver_step("deliver-news", "parse-news"));
+    assert!(strict.validate(&wrong_parser, &request).is_err());
+
+    let mut complete = AgentPlan::new(request.task_id.clone(), "complete");
+    complete.push_step(navigation_step("https://quote.example.com"));
+    complete.push_step(observe.clone());
+    complete.push_step(validate_target_step("validate-metal", &observe.id));
+    complete.push_step(parse.clone());
+    complete.push_step(metal_deliver_step("deliver-metal", &parse.id));
+    assert!(strict.validate(&complete, &request).is_ok());
 }
 
 #[test]

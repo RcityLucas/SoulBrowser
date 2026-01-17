@@ -1,0 +1,36 @@
+[package]
+name = "action-locator"
+version = "0.1.0"
+edition = "2021"
+authors = ["SoulBrowser Team"]
+license = "MIT OR Apache-2.0"
+description = "L3 Locator & Self-heal - Multi-strategy element resolution with automatic fallback"
+
+[dependencies]
+# Core types
+soulbrowser-core-types = { path = "../core-types" }
+action-primitives = { path = "../action-primitives" }
+cdp-adapter = { path = "../cdp-adapter" }
+perceiver-structural = { path = "../perceiver-structural" }
+
+# Async runtime
+tokio = { version = "1.39", features = ["full"] }
+async-trait = "0.1"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = ["stub"]
+stub = []

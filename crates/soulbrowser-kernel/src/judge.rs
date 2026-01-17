@@ -1,8 +1,9 @@
-use crate::agent::executor::{
-    FlowExecutionReport, StepExecutionReport, StepExecutionStatus, UserResult, UserResultKind,
-};
+use crate::agent::executor::{FlowExecutionReport, StepExecutionStatus};
 use agent_core::{requires_user_facing_result, AgentRequest};
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+use crate::agent::executor::{StepExecutionReport, UserResult, UserResultKind};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JudgeVerdict {
@@ -71,6 +72,8 @@ mod tests {
             )],
             user_results: Vec::new(),
             missing_user_result: true,
+            memory_log: Vec::new(),
+            judge_verdict: None,
         };
         let verdict = evaluate_plan(&request, &report);
         assert!(!verdict.passed);
@@ -85,6 +88,8 @@ mod tests {
             steps: vec![step_report(StepExecutionStatus::Success, None)],
             user_results: Vec::new(),
             missing_user_result: true,
+            memory_log: Vec::new(),
+            judge_verdict: None,
         };
         let verdict = evaluate_plan(&request, &report);
         assert!(!verdict.passed);
@@ -106,6 +111,8 @@ mod tests {
                 artifact_path: None,
             }],
             missing_user_result: false,
+            memory_log: Vec::new(),
+            judge_verdict: None,
         };
         let verdict = evaluate_plan(&request, &report);
         assert!(verdict.passed);
@@ -123,6 +130,9 @@ mod tests {
             dispatches: Vec::new(),
             total_wait_ms: 0,
             total_run_ms: 0,
+            observation_summary: None,
+            blocker_kind: None,
+            agent_state: None,
         }
     }
 }

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiConfig {
-    pub api_key: String,
+    pub api_keys: Vec<String>,
     pub model: String,
     pub api_base: String,
     pub temperature: f32,
@@ -25,6 +25,11 @@ pub struct OpenAiLlmProvider {
 
 impl OpenAiLlmProvider {
     pub fn new(config: OpenAiConfig) -> Result<Self, AgentError> {
+        if config.api_keys.is_empty() {
+            return Err(AgentError::invalid_request(
+                "missing OpenAI API key for planner",
+            ));
+        }
         let client = Client::builder()
             .timeout(config.timeout)
             .build()
@@ -44,70 +49,94 @@ impl OpenAiLlmProvider {
         previous_plan: Option<&AgentPlan>,
         failure_summary: Option<&str>,
     ) -> Result<PlannerOutcome, AgentError> {
-        let body = ChatCompletionRequest {
-            model: self.config.model.clone(),
-            temperature: self.config.temperature,
-            response_format: ResponseFormat {
-                r#type: "json_object".to_string(),
-            },
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: self.prompt.system_prompt().to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: self
-                        .prompt
-                        .build_user_prompt(request, previous_plan, failure_summary),
-                },
-            ],
-        };
-
         let url = format!(
             "{}/chat/completions",
             self.config.api_base.trim_end_matches('/')
         );
 
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(&self.config.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| AgentError::invalid_request(format!("openai request failed: {err}")))?;
+        let mut last_error: Option<AgentError> = None;
+        for (index, key) in self.config.api_keys.iter().enumerate() {
+            let body = ChatCompletionRequest {
+                model: self.config.model.clone(),
+                temperature: self.config.temperature,
+                response_format: ResponseFormat {
+                    r#type: "json_object".to_string(),
+                },
+                messages: vec![
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: self.prompt.system_prompt().to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: self
+                            .prompt
+                            .build_user_prompt(request, previous_plan, failure_summary),
+                    },
+                ],
+            };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<response unavailable>".to_string());
-            return Err(AgentError::invalid_request(format!(
-                "openai returned {}: {}",
-                status, text
-            )));
+            let response = self
+                .client
+                .post(&url)
+                .bearer_auth(key)
+                .json(&body)
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(resp) => resp,
+                Err(err) => {
+                    last_error = Some(AgentError::invalid_request(format!(
+                        "openai request failed: {err}"
+                    )));
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<response unavailable>".to_string());
+                if status.as_u16() == 429
+                    && index + 1 < self.config.api_keys.len()
+                {
+                    last_error = Some(AgentError::invalid_request(openai_rate_limit_message(
+                        &text,
+                    )));
+                    continue;
+                }
+                return Err(AgentError::invalid_request(format!(
+                    "openai returned {}: {}",
+                    status, text
+                )));
+            }
+
+            let response: ChatCompletionResponse = response.json().await.map_err(|err| {
+                AgentError::invalid_request(format!("openai response invalid: {err}"))
+            })?;
+
+            let content = response
+                .choices
+                .first()
+                .and_then(|choice| choice.message.content.as_text())
+                .ok_or_else(|| AgentError::invalid_request("openai response missing content"))?;
+
+            let json_string = extract_json_object(&content)
+                .ok_or_else(|| AgentError::invalid_request("openai response missing JSON plan"))?;
+
+            let payload: LlmJsonPlan = serde_json::from_str(&json_string).map_err(|err| {
+                AgentError::invalid_request(format!("failed to parse LLM plan JSON: {err}"))
+            })?;
+
+            return plan_from_json_payload(request, payload);
         }
 
-        let response: ChatCompletionResponse = response.json().await.map_err(|err| {
-            AgentError::invalid_request(format!("openai response invalid: {err}"))
-        })?;
-
-        let content = response
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.as_text())
-            .ok_or_else(|| AgentError::invalid_request("openai response missing content"))?;
-
-        let json_string = extract_json_object(&content)
-            .ok_or_else(|| AgentError::invalid_request("openai response missing JSON plan"))?;
-
-        let payload: LlmJsonPlan = serde_json::from_str(&json_string).map_err(|err| {
-            AgentError::invalid_request(format!("failed to parse LLM plan JSON: {err}"))
-        })?;
-
-        plan_from_json_payload(request, payload)
+        Err(last_error.unwrap_or_else(|| {
+            AgentError::invalid_request("OpenAI request exhausted all API keys")
+        }))
     }
 }
 
@@ -194,4 +223,24 @@ impl ChatCompletionContent {
 struct ChatCompletionPart {
     #[serde(default)]
     text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorEnvelope {
+    #[serde(default)]
+    error: Option<OpenAiErrorMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorMessage {
+    message: String,
+}
+
+fn openai_rate_limit_message(raw: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<OpenAiErrorEnvelope>(raw) {
+        if let Some(error) = parsed.error {
+            return error.message;
+        }
+    }
+    "OpenAI rate limit exceeded".to_string()
 }

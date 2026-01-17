@@ -1,9 +1,12 @@
+mod quote_sources;
 mod rule_based;
 mod stage_graph;
 mod stages;
 
 use crate::{errors::AgentError, model::AgentRequest, plan::AgentPlan};
 
+pub use quote_sources::mark_source_unhealthy;
+pub(crate) use quote_sources::{resolve_quote_plan, QuoteQuery};
 pub use rule_based::RuleBasedPlanner;
 pub use stage_graph::{IntentStagePlan, PlanStageGraph, StageStrategyChain};
 pub use stages::{classify_step, plan_contains_stage, stage_index, PlanStageKind};

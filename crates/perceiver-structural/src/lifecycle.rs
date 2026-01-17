@@ -231,6 +231,7 @@ mod tests {
             page,
             frame: None,
             parent: None,
+            opener: None,
             phase: "navigate".into(),
             ts: 0,
         });
@@ -281,6 +282,7 @@ mod tests {
             page,
             frame: None,
             parent: None,
+            opener: None,
             phase: "domcontentloaded".into(),
             ts: 0,
         });

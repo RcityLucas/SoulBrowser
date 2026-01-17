@@ -14,8 +14,10 @@ use tracing::warn;
 
 use crate::server::ServeState;
 use crate::sessions::{
-    CreateSessionRequest, SessionLiveEvent, SessionRecord, SessionShareContext, SessionSnapshot,
+    CreateSessionRequest, RouteSummary, SessionLiveEvent, SessionRecord, SessionShareContext,
+    SessionSnapshot,
 };
+use soulbrowser_core_types::{ExecRoute, FrameId, PageId, SessionId};
 use soulbrowser_registry::Registry;
 
 pub(crate) fn router() -> axum::Router<ServeState> {
@@ -30,6 +32,10 @@ pub(crate) fn router() -> axum::Router<ServeState> {
             post(issue_share_handler).delete(revoke_share_handler),
         )
         .route("/api/sessions/:session_id/live", get(session_live_handler))
+        .route(
+            "/api/sessions/:session_id/pointer",
+            post(session_pointer_handler),
+        )
 }
 
 #[derive(Serialize)]
@@ -206,12 +212,108 @@ async fn session_live_handler(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
+#[derive(Deserialize)]
+struct SessionPointerRequest {
+    action: String,
+    x: f64,
+    y: f64,
+    #[serde(default)]
+    button: Option<String>,
+    #[serde(default)]
+    delta_x: Option<f64>,
+    #[serde(default)]
+    delta_y: Option<f64>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    route: Option<RouteSummary>,
+}
+
+#[derive(Serialize)]
+struct SessionPointerResponse {
+    success: bool,
+}
+
+async fn session_pointer_handler(
+    State(state): State<ServeState>,
+    Path(session_id): Path<String>,
+    Json(payload): Json<SessionPointerRequest>,
+) -> Result<Json<SessionPointerResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let service = state.session_service().await;
+    let Some(snapshot) = service.snapshot(&session_id) else {
+        return Err(not_found("session not found"));
+    };
+    let route_summary = payload
+        .route
+        .clone()
+        .or_else(|| {
+            snapshot
+                .last_frame
+                .as_ref()
+                .and_then(|frame| frame.route.clone())
+        })
+        .ok_or_else(|| bad_request("route information is required"))?;
+    if route_summary.session != session_id {
+        return Err(bad_request("route session mismatch"));
+    }
+    let page_id = route_summary
+        .page
+        .clone()
+        .ok_or_else(|| bad_request("route page missing"))?;
+    let frame_id = route_summary
+        .frame
+        .clone()
+        .ok_or_else(|| bad_request("route frame missing"))?;
+    let exec_route = ExecRoute::new(
+        SessionId(session_id.clone()),
+        PageId(page_id.clone()),
+        FrameId(frame_id.clone()),
+    );
+    let subject_id = frame_id.clone();
+
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "action".into(),
+        serde_json::Value::String(payload.action.clone()),
+    );
+    map.insert("x".into(), serde_json::Value::from(payload.x));
+    map.insert("y".into(), serde_json::Value::from(payload.y));
+    if let Some(button) = payload.button {
+        map.insert("button".into(), serde_json::Value::String(button));
+    }
+    if let Some(delta_x) = payload.delta_x {
+        map.insert("delta_x".into(), serde_json::Value::from(delta_x));
+    }
+    if let Some(delta_y) = payload.delta_y {
+        map.insert("delta_y".into(), serde_json::Value::from(delta_y));
+    }
+    if let Some(text) = payload.text {
+        map.insert("text".into(), serde_json::Value::String(text));
+    }
+
+    let app_context = state.app_context().await;
+    let tool_manager = app_context.tool_manager();
+    tool_manager
+        .execute_with_route(
+            "manual.pointer",
+            &subject_id,
+            serde_json::Value::Object(map),
+            Some(exec_route),
+            Some(3_000),
+        )
+        .await
+        .map_err(|err| internal_error(&format!("pointer dispatch failed: {}", err)))?;
+
+    Ok(Json(SessionPointerResponse { success: true }))
+}
+
 fn event_from_live(event: SessionLiveEvent) -> Option<Event> {
     let event_name = match &event {
         SessionLiveEvent::Snapshot { .. } => "snapshot",
         SessionLiveEvent::Status { .. } => "status",
         SessionLiveEvent::Frame { .. } => "frame",
         SessionLiveEvent::Overlay { .. } => "overlay",
+        SessionLiveEvent::MessageState { .. } => "message_state",
     };
     match serde_json::to_string(&event) {
         Ok(payload) => Some(Event::default().event(event_name).data(payload)),
@@ -225,6 +327,26 @@ fn event_from_live(event: SessionLiveEvent) -> Option<Event> {
 fn not_found(message: &str) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::NOT_FOUND,
+        Json(json!({
+            "success": false,
+            "error": message,
+        })),
+    )
+}
+
+fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "success": false,
+            "error": message,
+        })),
+    )
+}
+
+fn internal_error(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({
             "success": false,
             "error": message,

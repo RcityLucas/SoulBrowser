@@ -5,20 +5,28 @@
 
 use crate::block_detect::detect_block_reason;
 use crate::errors::SoulBrowserError;
+use crate::metrics::{record_market_quote_fallback, record_market_quote_fetch};
 use crate::parsers::{
     parse_facebook_feed, parse_github_repos, parse_hackernews_feed, parse_linkedin_profile,
-    parse_market_info, parse_news_brief, parse_twitter_feed, parse_weather,
+    parse_market_info, parse_metal_price, parse_news_brief, parse_twitter_feed, parse_weather,
 };
-use crate::structured_output::{summarize_structured_output, validate_structured_output};
+use crate::self_heal::{record_event as record_self_heal_event, SelfHealEvent};
+use crate::structured_output::{
+    summarize_structured_output, validate_metal_price_with_context, validate_structured_output,
+    MetalPriceValidationContext, MetalPriceValidationFailure,
+};
 use action_primitives::{
     ActionError, ActionPrimitives, AnchorDescriptor, DefaultActionPrimitives, DefaultWaitStrategy,
     ExecCtx, ScrollBehavior, ScrollTarget, SelectMethod, WaitCondition, WaitTier,
 };
-use cdp_adapter::{event_bus, AdapterMode, Cdp, CdpAdapter, CdpConfig};
+use agent_core::planner::mark_source_unhealthy;
+use cdp_adapter::{event_bus, AdapterError, AdapterMode, Cdp, CdpAdapter, CdpConfig};
+use chrono::Utc;
 use dashmap::DashMap;
 use l6_observe::{guard::LabelMap as ObsLabelMap, metrics as obs_metrics, tracing as obs_tracing};
 use once_cell::sync::Lazy;
 use regex::escape;
+use reqwest::Client;
 use schemars::schema::{RootSchema, SchemaObject};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -48,8 +56,42 @@ const METRIC_TOOL_INVOCATIONS: &str = "soul.l5.tool.invocations";
 const METRIC_TOOL_LATENCY: &str = "soul.l5.tool.latency_ms";
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 30_000;
 const PAGE_OBSERVE_SCRIPT: &str = include_str!("scripts/page_observe.js");
+const QUOTE_FETCH_SCRIPT: &str = include_str!("scripts/quote_fetch.js");
 const WEATHER_CANDIDATE_LIMIT: usize = 5;
 const WEATHER_BLOCKED_CAUSE: &str = "WeatherLinkBlocked";
+const SEARCH_RESULT_ATTR: &str = "data-soulbrowser-search-hit";
+const BAIDU_RESULT_REDIRECT_PATTERN: &str = r"^https?://www\.baidu\.com/link.*";
+const AUTO_ACT_RESULT_PICKER_SCRIPT: &str = include_str!("scripts/auto_act_result_picker.js");
+const BAIDU_SEARCH_SELECTORS: &[&str] = &[
+    "div#content_left .c-container", // Modern Baidu result container (most reliable)
+    "div#content_left h3",           // Classic result title
+    "div#content_left .result",      // Legacy result class
+    "#content_left",                 // Content container itself
+    "div#wrapper",                   // Page wrapper fallback
+    "div.result",                    // Generic result
+    "#page",                         // Pagination (indicates page loaded)
+    ".nors",                         // No results indicator
+];
+const BING_SEARCH_SELECTORS: &[&str] = &["main#b_content", "ol#b_results", "div#b_content"];
+const GOOGLE_SEARCH_SELECTORS: &[&str] = &["div#search", "div#center_col", "div.g"];
+// DuckDuckGo has fewer captchas than other search engines
+const DUCKDUCKGO_SEARCH_SELECTORS: &[&str] = &[
+    "div.results",
+    "article[data-testid='result']",
+    "div#links",
+    "div.result",
+];
+const DEFAULT_MODAL_CLOSE_SELECTORS: &[&str] = &[
+    "button[aria-label='Close']",
+    "button[aria-label='关闭']",
+    ".modal-close",
+    ".modal__close",
+    ".close-button",
+    ".close-btn",
+    ".ant-modal-close",
+    ".el-dialog__headerbtn",
+    ".tj_close",
+];
 const TRUSTED_WEATHER_DOMAINS: &[&str] = &[
     "moji.com",
     "tianqi.com",
@@ -62,6 +104,18 @@ const TRUSTED_WEATHER_DOMAINS: &[&str] = &[
 const DATA_PARSE_TOOLS: &[(&str, &str)] = &[
     ("data.parse.generic", "Parse generic observation snapshot"),
     ("data.parse.market_info", "Parse market index snapshot"),
+    (
+        "data.parse.metal_price",
+        "Parse metal price quotes into structured output",
+    ),
+    (
+        "data.validate.metal_price",
+        "Validate metal price structured data freshness",
+    ),
+    (
+        "data.validate-target",
+        "Validate observed page against target keywords and domains",
+    ),
     ("data.parse.news_brief", "Parse news brief"),
     (
         "data.parse.weather",
@@ -75,11 +129,253 @@ const DATA_PARSE_TOOLS: &[(&str, &str)] = &[
 ];
 
 static OBSERVATION_CACHE: Lazy<DashMap<String, ObservationEntry>> = Lazy::new(|| DashMap::new());
+static QUOTE_ATTEMPT_CACHE: Lazy<DashMap<String, HashSet<String>>> = Lazy::new(|| DashMap::new());
 
 #[derive(Clone, Debug)]
 struct ObservationEntry {
     data: Value,
     parsed: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct KeyValueSelectorConfig {
+    #[serde(default)]
+    label: Option<String>,
+    selector: Option<String>,
+    #[serde(default)]
+    attribute: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DomQuoteConfig {
+    #[serde(default)]
+    table_selectors: Vec<String>,
+    #[serde(default)]
+    key_value_selectors: Vec<KeyValueSelectorConfig>,
+    #[serde(default)]
+    max_rows: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct QuoteFetchPayload {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    table_selectors: Vec<String>,
+    #[serde(default)]
+    key_value_selectors: Vec<KeyValueSelectorConfig>,
+    #[serde(default)]
+    max_rows: Option<usize>,
+    #[serde(default)]
+    api: Option<ApiQuoteConfig>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    source_id: Option<String>,
+    #[serde(default)]
+    market: Option<String>,
+    #[serde(default)]
+    fallback_sources: Vec<QuoteFallbackSource>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct QuoteFallbackSource {
+    #[serde(default)]
+    source_id: Option<String>,
+    #[serde(default)]
+    market: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    table_selectors: Vec<String>,
+    #[serde(default)]
+    key_value_selectors: Vec<KeyValueSelectorConfig>,
+    #[serde(default)]
+    max_rows: Option<usize>,
+    #[serde(default)]
+    api: Option<ApiQuoteConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct QuoteAttemptPlan {
+    source_id: Option<String>,
+    market: Option<String>,
+    source_url: Option<String>,
+    table_selectors: Vec<String>,
+    key_value_selectors: Vec<KeyValueSelectorConfig>,
+    max_rows: Option<usize>,
+    api: Option<ApiQuoteConfig>,
+    prefer_api_first: bool,
+}
+
+impl QuoteAttemptPlan {
+    fn from_primary(payload: &QuoteFetchPayload) -> Self {
+        Self {
+            source_id: payload
+                .source_id
+                .clone()
+                .or_else(|| payload.source_url.clone()),
+            market: payload.market.clone(),
+            source_url: payload.source_url.clone(),
+            table_selectors: if payload.table_selectors.is_empty() {
+                vec!["table".to_string()]
+            } else {
+                payload.table_selectors.clone()
+            },
+            key_value_selectors: payload.key_value_selectors.clone(),
+            max_rows: payload.max_rows.or(Some(50)),
+            api: payload.api.clone(),
+            prefer_api_first: matches!(payload.mode.as_deref(), Some("api") | Some("api_first")),
+        }
+    }
+
+    fn from_fallback(source: &QuoteFallbackSource) -> Self {
+        Self {
+            source_id: source
+                .source_id
+                .clone()
+                .or_else(|| source.source_url.clone()),
+            market: source.market.clone(),
+            source_url: source.source_url.clone(),
+            table_selectors: if source.table_selectors.is_empty() {
+                vec!["table".to_string()]
+            } else {
+                source.table_selectors.clone()
+            },
+            key_value_selectors: source.key_value_selectors.clone(),
+            max_rows: source.max_rows.or(Some(50)),
+            api: source.api.clone(),
+            prefer_api_first: false,
+        }
+    }
+
+    fn dom_attempt_key(&self) -> String {
+        format!(
+            "dom:{}:{}",
+            self.source_id.as_deref().unwrap_or("unknown_dom_source"),
+            self.source_url.as_deref().unwrap_or("")
+        )
+    }
+
+    fn api_attempt_key(&self) -> String {
+        format!(
+            "api:{}:{}",
+            self.source_id.as_deref().unwrap_or("unknown_api_source"),
+            self.api.as_ref().map(|cfg| cfg.url.as_str()).unwrap_or("")
+        )
+    }
+
+    fn should_try_dom_first(&self) -> bool {
+        self.source_url.is_some() && !self.prefer_api_first
+    }
+}
+
+fn build_quote_attempts(payload: &QuoteFetchPayload) -> Vec<QuoteAttemptPlan> {
+    let mut attempts = Vec::new();
+    attempts.push(QuoteAttemptPlan::from_primary(payload));
+    for fallback in &payload.fallback_sources {
+        attempts.push(QuoteAttemptPlan::from_fallback(fallback));
+    }
+    attempts
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct MetalPriceValidationPayload {
+    #[serde(default)]
+    source_step_id: Option<String>,
+    #[serde(default)]
+    metal_keyword: Option<String>,
+    #[serde(default)]
+    allowed_markets: Vec<String>,
+    #[serde(default = "default_validation_max_age")]
+    max_age_hours: f64,
+}
+
+fn default_validation_max_age() -> f64 {
+    24.0
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TargetValidationPayload {
+    #[serde(default)]
+    source_step_id: Option<String>,
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    allowed_domains: Vec<String>,
+    #[serde(default = "default_expected_status")]
+    expected_status: Option<u16>,
+}
+
+fn default_expected_status() -> Option<u16> {
+    Some(200)
+}
+
+fn target_validation_error(code: &str, detail: &str) -> SoulBrowserError {
+    let formatted = if detail.trim().is_empty() {
+        format!("[{}] 目标页面校验失败", code)
+    } else {
+        format!("[{}] {}", code, detail)
+    };
+    SoulBrowserError::validation_error(&formatted, code)
+}
+
+fn mark_quote_attempt(subject_id: &str, attempt_key: &str) -> bool {
+    if let Some(mut entry) = QUOTE_ATTEMPT_CACHE.get_mut(subject_id) {
+        if entry.contains(attempt_key) {
+            true
+        } else {
+            entry.insert(attempt_key.to_string());
+            false
+        }
+    } else {
+        let mut set = HashSet::new();
+        set.insert(attempt_key.to_string());
+        QUOTE_ATTEMPT_CACHE.insert(subject_id.to_string(), set);
+        false
+    }
+}
+
+fn reset_quote_attempts(subject_id: &str) {
+    QUOTE_ATTEMPT_CACHE.remove(subject_id);
+}
+
+fn emit_self_heal_event(strategy_id: &str, note: Option<String>) {
+    record_self_heal_event(SelfHealEvent {
+        timestamp: Utc::now().timestamp_millis(),
+        strategy_id: strategy_id.to_string(),
+        action: "auto".to_string(),
+        note,
+    });
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ApiQuoteConfig {
+    url: String,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    params: Option<Map<String, Value>>,
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    record_path: Option<Vec<String>>,
+    #[serde(default)]
+    field_mappings: Option<Vec<ApiFieldMapping>>,
+    #[serde(default)]
+    label_field: Option<String>,
+    #[serde(default)]
+    price_field: Option<String>,
+    #[serde(default)]
+    change_field: Option<String>,
+    #[serde(default)]
+    change_pct_field: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ApiFieldMapping {
+    column: String,
+    path: Vec<String>,
 }
 
 /// Browser tool manager using soulbase-tools
@@ -104,301 +400,142 @@ impl BrowserToolManager {
         self.executor.adapter_mode()
     }
 
-    /// Register browser navigation tool
-    pub async fn register_navigation_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_navigation_tool("navigate-to-url");
+    pub fn cdp_adapter(&self) -> Option<Arc<CdpAdapter>> {
+        self.executor.cdp_adapter()
+    }
 
+    /// Register a single tool by ID
+    async fn register_tool(&self, id: &str) -> Result<(), SoulBrowserError> {
+        let manifest = get_tool_manifest(id);
         self.registry
             .upsert(&self.tenant, manifest)
             .await
             .map_err(|e| {
-                SoulBrowserError::internal(&format!("Failed to register navigation tool: {}", e))
-            })?;
-
-        Ok(())
+                SoulBrowserError::internal(&format!("Failed to register tool '{}': {}", id, e))
+            })
     }
 
-    /// Register click tool
-    pub async fn register_click_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_click_tool("click");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!("Failed to register click tool: {}", e))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register type text tool
-    pub async fn register_type_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_type_tool("type-text");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!("Failed to register type tool: {}", e))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register select option tool
-    pub async fn register_select_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_select_tool("select-option");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!("Failed to register select tool: {}", e))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register scroll tool
-    pub async fn register_scroll_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_scroll_tool("scroll-page");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!("Failed to register scroll tool: {}", e))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register weather search macro tool
-    pub async fn register_weather_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_weather_search_tool("weather.search");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!(
-                    "Failed to register weather search tool: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register wait-for-element tool
-    pub async fn register_wait_for_element_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_wait_for_element_tool("wait-for-element");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!(
-                    "Failed to register wait-for-element tool: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register wait-for-condition tool
-    pub async fn register_wait_for_condition_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_wait_for_condition_tool("wait-for-condition");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!(
-                    "Failed to register wait-for-condition tool: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register get-element-info tool
-    pub async fn register_get_element_info_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_get_element_info_tool("get-element-info");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!(
-                    "Failed to register get-element-info tool: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register retrieve-history tool
-    pub async fn register_retrieve_history_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_retrieve_history_tool("retrieve-history");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!(
-                    "Failed to register retrieve-history tool: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register complete-task tool
-    pub async fn register_complete_task_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_complete_task_tool("complete-task");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!("Failed to register complete-task tool: {}", e))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register report-insight tool
-    pub async fn register_report_insight_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_report_insight_tool("report-insight");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!(
-                    "Failed to register report-insight tool: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register observation tool
-    pub async fn register_observation_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_observation_tool("data.extract-site");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!("Failed to register observation tool: {}", e))
-            })?;
-
-        Ok(())
-    }
-
-    /// Register structured parse tools
-    pub async fn register_data_parse_tools(&self) -> Result<(), SoulBrowserError> {
-        for (id, _) in DATA_PARSE_TOOLS {
-            let manifest = create_parse_tool(id);
-            self.registry
-                .upsert(&self.tenant, manifest)
-                .await
-                .map_err(|e| {
-                    SoulBrowserError::internal(&format!(
-                        "Failed to register parse tool {}: {}",
-                        id, e
-                    ))
-                })?;
+    /// Register multiple tools by ID
+    async fn register_tools(&self, ids: &[&str]) -> Result<(), SoulBrowserError> {
+        for id in ids {
+            self.register_tool(id).await?;
         }
-        Ok(())
-    }
-
-    /// Register structured delivery tool
-    pub async fn register_deliver_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_deliver_tool("data.deliver.structured");
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!("Failed to register deliver tool: {}", e))
-            })?;
-        Ok(())
-    }
-
-    /// Register legacy tool aliases for backward compatibility
-    pub async fn register_legacy_aliases(&self) -> Result<(), SoulBrowserError> {
-        let legacy_ids = [
-            (
-                "browser.navigate",
-                create_navigation_tool("browser.navigate"),
-            ),
-            ("browser.click", create_click_tool("browser.click")),
-            ("browser.type", create_type_tool("browser.type")),
-            ("browser.select", create_select_tool("browser.select")),
-            (
-                "browser.screenshot",
-                create_take_screenshot_tool("browser.screenshot"),
-            ),
-        ];
-
-        for (_, manifest) in legacy_ids {
-            self.registry
-                .upsert(&self.tenant, manifest)
-                .await
-                .map_err(|e| {
-                    SoulBrowserError::internal(&format!(
-                        "Failed to register legacy tool alias: {}",
-                        e
-                    ))
-                })?;
-        }
-
-        Ok(())
-    }
-
-    /// Register screenshot tool
-    pub async fn register_take_screenshot_tool(&self) -> Result<(), SoulBrowserError> {
-        let manifest = create_take_screenshot_tool("take-screenshot");
-
-        self.registry
-            .upsert(&self.tenant, manifest)
-            .await
-            .map_err(|e| {
-                SoulBrowserError::internal(&format!("Failed to register screenshot tool: {}", e))
-            })?;
-
         Ok(())
     }
 
     /// Register all default browser tools
     pub async fn register_default_tools(&self) -> Result<(), SoulBrowserError> {
-        self.register_navigation_tool().await?;
-        self.register_click_tool().await?;
-        self.register_type_tool().await?;
-        self.register_select_tool().await?;
-        self.register_scroll_tool().await?;
-        self.register_wait_for_element_tool().await?;
-        self.register_wait_for_condition_tool().await?;
-        self.register_weather_tool().await?;
-        self.register_get_element_info_tool().await?;
-        self.register_retrieve_history_tool().await?;
-        self.register_take_screenshot_tool().await?;
-        self.register_complete_task_tool().await?;
-        self.register_report_insight_tool().await?;
-        self.register_observation_tool().await?;
-        self.register_data_parse_tools().await?;
-        self.register_deliver_tool().await?;
-        self.register_legacy_aliases().await?;
+        // Core browser tools from static config
+        let core_tools: Vec<&str> = TOOL_CONFIGS.iter().map(|(id, _)| *id).collect();
+        self.register_tools(&core_tools).await?;
+
+        // Special tools
+        self.register_tools(&[
+            "take-screenshot",
+            "manual.pointer",
+            "data.extract-site",
+            "market.quote.fetch",
+            "data.deliver.structured",
+        ])
+        .await?;
+
+        // Parse tools
+        for (id, _) in DATA_PARSE_TOOLS {
+            self.register_tool(id).await?;
+        }
+
+        // Legacy aliases
+        self.register_tools(&[
+            "browser.navigate",
+            "browser.click",
+            "browser.type",
+            "browser.select",
+            "browser.screenshot",
+        ])
+        .await?;
 
         Ok(())
+    }
+
+    // Convenience methods for individual tool registration (for backward compatibility)
+    pub async fn register_navigation_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("navigate-to-url").await
+    }
+    pub async fn register_click_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("click").await
+    }
+    pub async fn register_type_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("type-text").await
+    }
+    pub async fn register_select_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("select-option").await
+    }
+    pub async fn register_scroll_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("scroll-page").await
+    }
+    pub async fn register_weather_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("weather.search").await
+    }
+    pub async fn register_browser_search_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("browser.search").await
+    }
+    pub async fn register_auto_act_click_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("browser.search.click-result").await
+    }
+    pub async fn register_close_modal_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("browser.close-modal").await
+    }
+    pub async fn register_send_escape_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("browser.send-esc").await
+    }
+    pub async fn register_wait_for_element_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("wait-for-element").await
+    }
+    pub async fn register_wait_for_condition_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("wait-for-condition").await
+    }
+    pub async fn register_get_element_info_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("get-element-info").await
+    }
+    pub async fn register_retrieve_history_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("retrieve-history").await
+    }
+    pub async fn register_complete_task_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("complete-task").await
+    }
+    pub async fn register_report_insight_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("report-insight").await
+    }
+    pub async fn register_observation_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("data.extract-site").await
+    }
+    pub async fn register_take_screenshot_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("take-screenshot").await
+    }
+    pub async fn register_pointer_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("manual.pointer").await
+    }
+    pub async fn register_quote_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("market.quote.fetch").await
+    }
+    pub async fn register_deliver_tool(&self) -> Result<(), SoulBrowserError> {
+        self.register_tool("data.deliver.structured").await
+    }
+    pub async fn register_data_parse_tools(&self) -> Result<(), SoulBrowserError> {
+        for (id, _) in DATA_PARSE_TOOLS {
+            self.register_tool(id).await?;
+        }
+        Ok(())
+    }
+    pub async fn register_legacy_aliases(&self) -> Result<(), SoulBrowserError> {
+        self.register_tools(&[
+            "browser.navigate",
+            "browser.click",
+            "browser.type",
+            "browser.select",
+            "browser.screenshot",
+        ])
+        .await
     }
 
     /// List available tools
@@ -479,240 +616,389 @@ impl BrowserToolManager {
     }
 }
 
-/// Create navigation tool manifest
-fn create_navigation_tool(id: &str) -> ToolManifest {
+/// Tool configuration for declarative manifest creation
+struct ToolConfig {
+    display_name: &'static str,
+    description: &'static str,
+    tags: &'static [&'static str],
+    scope: &'static str,
+    domain: &'static str,
+    action: &'static str,
+    side_effect: SideEffect,
+    safety_class: SafetyClass,
+    timeout_ms: u64,
+    max_bytes_in: u64,
+    max_bytes_out: u64,
+    max_files: u64,
+    max_concurrency: u32,
+    idempotency: IdempoKind,
+    concurrency: ConcurrencyKind,
+}
+
+impl ToolConfig {
+    const fn browser(
+        display_name: &'static str,
+        description: &'static str,
+        tags: &'static [&'static str],
+        scope: &'static str,
+        action: &'static str,
+        timeout_ms: u64,
+        max_bytes_in: u64,
+        max_bytes_out: u64,
+    ) -> Self {
+        Self {
+            display_name,
+            description,
+            tags,
+            scope,
+            domain: "browser",
+            action,
+            side_effect: SideEffect::Browser,
+            safety_class: SafetyClass::Low,
+            timeout_ms,
+            max_bytes_in,
+            max_bytes_out,
+            max_files: 0,
+            max_concurrency: 1,
+            idempotency: IdempoKind::None,
+            concurrency: ConcurrencyKind::Queue,
+        }
+    }
+
+    const fn read_only(
+        display_name: &'static str,
+        description: &'static str,
+        tags: &'static [&'static str],
+        scope: &'static str,
+        domain: &'static str,
+        action: &'static str,
+        timeout_ms: u64,
+        max_bytes_in: u64,
+        max_bytes_out: u64,
+        max_concurrency: u32,
+    ) -> Self {
+        Self {
+            display_name,
+            description,
+            tags,
+            scope,
+            domain,
+            action,
+            side_effect: SideEffect::Read,
+            safety_class: SafetyClass::Low,
+            timeout_ms,
+            max_bytes_in,
+            max_bytes_out,
+            max_files: 0,
+            max_concurrency,
+            idempotency: IdempoKind::None,
+            concurrency: ConcurrencyKind::Queue,
+        }
+    }
+}
+
+/// Static tool configurations - replaces 20+ individual create_xxx_tool functions
+static TOOL_CONFIGS: &[(&str, ToolConfig)] = &[
+    (
+        "navigate-to-url",
+        ToolConfig::browser(
+            "Navigate to URL",
+            "Navigate browser to specified URL",
+            &["browser", "navigation"],
+            "browser:navigate",
+            "navigate",
+            30_000,
+            1024 * 1024,
+            10 * 1024 * 1024,
+        ),
+    ),
+    (
+        "click",
+        ToolConfig::browser(
+            "Click Element",
+            "Click on a page element using selector",
+            &["browser", "interaction"],
+            "browser:interact",
+            "click",
+            10_000,
+            1024,
+            1024,
+        ),
+    ),
+    (
+        "type-text",
+        ToolConfig::browser(
+            "Type Text",
+            "Type text into an input element",
+            &["browser", "input"],
+            "browser:interact",
+            "type",
+            10_000,
+            10 * 1024,
+            1024,
+        ),
+    ),
+    (
+        "select-option",
+        ToolConfig::browser(
+            "Select Option",
+            "Choose an option from a select control",
+            &["browser", "interaction"],
+            "browser:interact",
+            "select",
+            10_000,
+            2048,
+            1024,
+        ),
+    ),
+    (
+        "scroll-page",
+        ToolConfig::browser(
+            "Scroll Page",
+            "Scroll the page or a container to reveal targets",
+            &["browser", "navigation"],
+            "browser:interact",
+            "scroll",
+            5_000,
+            8 * 1024,
+            2 * 1024,
+        ),
+    ),
+    (
+        "weather.search",
+        ToolConfig::browser(
+            "Weather Search",
+            "Navigate to a weather search page and ensure the widget loads",
+            &["browser", "macro", "weather"],
+            "browser:macro",
+            "weather-search",
+            45_000,
+            8 * 1024,
+            8 * 1024,
+        ),
+    ),
+    (
+        "browser.search",
+        ToolConfig::browser(
+            "Web Search",
+            "Open a search engine results page for the given query",
+            &["browser", "macro", "search"],
+            "browser:macro",
+            "search",
+            30_000,
+            8 * 1024,
+            8 * 1024,
+        ),
+    ),
+    (
+        "browser.search.click-result",
+        ToolConfig::browser(
+            "Search Result Click",
+            "Scan SERP DOM for authority domains and click the best match.",
+            &["browser", "macro"],
+            "browser:macro",
+            "macro",
+            20_000,
+            8 * 1024,
+            8 * 1024,
+        ),
+    ),
+    (
+        "browser.close-modal",
+        ToolConfig::browser(
+            "Close Modal",
+            "Attempt to dismiss popup dialogs by clicking close controls or sending ESC",
+            &["browser", "interaction"],
+            "browser:interact",
+            "dismiss",
+            8_000,
+            4 * 1024,
+            4 * 1024,
+        ),
+    ),
+    (
+        "browser.send-esc",
+        ToolConfig::browser(
+            "Send Escape",
+            "Dispatch Escape key events to the active page",
+            &["browser", "macro"],
+            "browser:macro",
+            "keyboard",
+            5_000,
+            2 * 1024,
+            2 * 1024,
+        ),
+    ),
+    (
+        "wait-for-element",
+        ToolConfig::read_only(
+            "Wait For Element",
+            "Wait until a structural element condition is met",
+            &["browser", "synchronization"],
+            "browser:wait",
+            "browser",
+            "wait-element",
+            60_000,
+            16 * 1024,
+            4 * 1024,
+            4,
+        ),
+    ),
+    (
+        "wait-for-condition",
+        ToolConfig::read_only(
+            "Wait For Condition",
+            "Wait until network/runtime conditions meet expectations",
+            &["browser", "synchronization"],
+            "browser:wait",
+            "browser",
+            "wait-condition",
+            60_000,
+            16 * 1024,
+            4 * 1024,
+            4,
+        ),
+    ),
+    (
+        "get-element-info",
+        ToolConfig::read_only(
+            "Get Element Info",
+            "Collect structural details about an element",
+            &["browser", "memory"],
+            "browser:inspect",
+            "browser",
+            "inspect",
+            5_000,
+            32 * 1024,
+            32 * 1024,
+            2,
+        ),
+    ),
+    (
+        "retrieve-history",
+        ToolConfig::read_only(
+            "Retrieve History",
+            "Retrieve recent tool execution or perception history",
+            &["browser", "memory"],
+            "browser:history",
+            "browser",
+            "history",
+            3_000,
+            8 * 1024,
+            64 * 1024,
+            2,
+        ),
+    ),
+    (
+        "complete-task",
+        ToolConfig::read_only(
+            "Complete Task",
+            "Record task completion metadata and evidence",
+            &["metacognition", "task"],
+            "task:complete",
+            "task",
+            "complete",
+            2_000,
+            32 * 1024,
+            16 * 1024,
+            1,
+        ),
+    ),
+    (
+        "report-insight",
+        ToolConfig::read_only(
+            "Report Insight",
+            "Record insights or observations for downstream consumers",
+            &["metacognition", "insight"],
+            "task:insight",
+            "task",
+            "insight",
+            2_000,
+            24 * 1024,
+            16 * 1024,
+            4,
+        ),
+    ),
+];
+
+/// Create tool manifest from configuration
+fn create_tool_from_config(id: &str, config: &ToolConfig) -> ToolManifest {
     ToolManifest {
         id: ToolId(id.to_string()),
         version: "1.0.0".to_string(),
-        display_name: "Navigate to URL".to_string(),
-        description: "Navigate browser to specified URL".to_string(),
-        tags: vec!["browser".to_string(), "navigation".to_string()],
+        display_name: config.display_name.to_string(),
+        description: config.description.to_string(),
+        tags: config.tags.iter().map(|s| s.to_string()).collect(),
         input_schema: create_simple_schema(),
         output_schema: create_simple_schema(),
-        scopes: vec!["browser:navigate".to_string()],
+        scopes: vec![config.scope.to_string()],
         capabilities: vec![CapabilityDecl {
-            domain: "browser".to_string(),
-            action: "navigate".to_string(),
+            domain: config.domain.to_string(),
+            action: config.action.to_string(),
             resource: "*".to_string(),
             attrs: serde_json::json!({}),
         }],
-        side_effect: SideEffect::Browser,
-        safety_class: SafetyClass::Low,
+        side_effect: config.side_effect.clone(),
+        safety_class: config.safety_class.clone(),
         consent: ConsentPolicy {
             required: false,
             max_ttl_ms: None,
         },
         limits: Limits {
-            timeout_ms: 30000,
-            max_bytes_in: 1024 * 1024,
-            max_bytes_out: 10 * 1024 * 1024,
-            max_files: 0,
+            timeout_ms: config.timeout_ms,
+            max_bytes_in: config.max_bytes_in,
+            max_bytes_out: config.max_bytes_out,
+            max_files: config.max_files,
             max_depth: 0,
-            max_concurrency: 1,
+            max_concurrency: config.max_concurrency,
         },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
+        idempotency: config.idempotency.clone(),
+        concurrency: config.concurrency.clone(),
     }
 }
 
-/// Create click tool manifest
-fn create_click_tool(id: &str) -> ToolManifest {
-    ToolManifest {
-        id: ToolId(id.to_string()),
-        version: "1.0.0".to_string(),
-        display_name: "Click Element".to_string(),
-        description: "Click on a page element using selector".to_string(),
-        tags: vec!["browser".to_string(), "interaction".to_string()],
-        input_schema: create_simple_schema(),
-        output_schema: create_simple_schema(),
-        scopes: vec!["browser:interact".to_string()],
-        capabilities: vec![CapabilityDecl {
-            domain: "browser".to_string(),
-            action: "click".to_string(),
-            resource: "*".to_string(),
-            attrs: serde_json::json!({}),
-        }],
-        side_effect: SideEffect::Browser,
-        safety_class: SafetyClass::Low,
-        consent: ConsentPolicy {
-            required: false,
-            max_ttl_ms: None,
-        },
-        limits: Limits {
-            timeout_ms: 10000,
-            max_bytes_in: 1024,
-            max_bytes_out: 1024,
-            max_files: 0,
-            max_depth: 0,
-            max_concurrency: 1,
-        },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
+/// Get tool manifest by ID from static config or special cases
+fn get_tool_manifest(id: &str) -> ToolManifest {
+    // Check static configs first
+    if let Some((_, config)) = TOOL_CONFIGS.iter().find(|(tid, _)| *tid == id) {
+        return create_tool_from_config(id, config);
+    }
+    // Special cases with unique configurations
+    match id {
+        "market.quote.fetch" => create_quote_fetch_tool(id),
+        "take-screenshot" | "browser.screenshot" => create_take_screenshot_tool(id),
+        "manual.pointer" => create_pointer_tool(id),
+        "data.extract-site" => create_observation_tool(id),
+        _ if id.starts_with("data.parse.") || id.starts_with("data.validate") => {
+            create_parse_tool(id)
+        }
+        "data.deliver.structured" => create_deliver_tool(id),
+        // Legacy aliases
+        "browser.navigate" => get_tool_manifest("navigate-to-url"),
+        "browser.click" => get_tool_manifest("click"),
+        "browser.type" => get_tool_manifest("type-text"),
+        "browser.select" => get_tool_manifest("select-option"),
+        _ => create_tool_from_config(id, &TOOL_CONFIGS[0].1), // fallback
     }
 }
 
-/// Create type text tool manifest
-fn create_type_tool(id: &str) -> ToolManifest {
+fn create_quote_fetch_tool(id: &str) -> ToolManifest {
     ToolManifest {
         id: ToolId(id.to_string()),
         version: "1.0.0".to_string(),
-        display_name: "Type Text".to_string(),
-        description: "Type text into an input element".to_string(),
-        tags: vec!["browser".to_string(), "input".to_string()],
-        input_schema: create_simple_schema(),
-        output_schema: create_simple_schema(),
-        scopes: vec!["browser:interact".to_string()],
-        capabilities: vec![CapabilityDecl {
-            domain: "browser".to_string(),
-            action: "type".to_string(),
-            resource: "*".to_string(),
-            attrs: serde_json::json!({}),
-        }],
-        side_effect: SideEffect::Browser,
-        safety_class: SafetyClass::Low,
-        consent: ConsentPolicy {
-            required: false,
-            max_ttl_ms: None,
-        },
-        limits: Limits {
-            timeout_ms: 10000,
-            max_bytes_in: 10 * 1024,
-            max_bytes_out: 1024,
-            max_files: 0,
-            max_depth: 0,
-            max_concurrency: 1,
-        },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
-    }
-}
-
-/// Create select option tool manifest
-fn create_select_tool(id: &str) -> ToolManifest {
-    ToolManifest {
-        id: ToolId(id.to_string()),
-        version: "1.0.0".to_string(),
-        display_name: "Select Option".to_string(),
-        description: "Choose an option from a select control".to_string(),
-        tags: vec!["browser".to_string(), "interaction".to_string()],
-        input_schema: create_simple_schema(),
-        output_schema: create_simple_schema(),
-        scopes: vec!["browser:interact".to_string()],
-        capabilities: vec![CapabilityDecl {
-            domain: "browser".to_string(),
-            action: "select".to_string(),
-            resource: "*".to_string(),
-            attrs: serde_json::json!({}),
-        }],
-        side_effect: SideEffect::Browser,
-        safety_class: SafetyClass::Low,
-        consent: ConsentPolicy {
-            required: false,
-            max_ttl_ms: None,
-        },
-        limits: Limits {
-            timeout_ms: 10_000,
-            max_bytes_in: 2048,
-            max_bytes_out: 1024,
-            max_files: 0,
-            max_depth: 0,
-            max_concurrency: 1,
-        },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
-    }
-}
-
-/// Create scroll page/tool manifest
-fn create_scroll_tool(id: &str) -> ToolManifest {
-    ToolManifest {
-        id: ToolId(id.to_string()),
-        version: "1.0.0".to_string(),
-        display_name: "Scroll Page".to_string(),
-        description: "Scroll the page or a container to reveal targets".to_string(),
-        tags: vec!["browser".to_string(), "navigation".to_string()],
-        input_schema: create_simple_schema(),
-        output_schema: create_simple_schema(),
-        scopes: vec!["browser:interact".to_string()],
-        capabilities: vec![CapabilityDecl {
-            domain: "browser".to_string(),
-            action: "scroll".to_string(),
-            resource: "*".to_string(),
-            attrs: serde_json::json!({}),
-        }],
-        side_effect: SideEffect::Browser,
-        safety_class: SafetyClass::Low,
-        consent: ConsentPolicy {
-            required: false,
-            max_ttl_ms: None,
-        },
-        limits: Limits {
-            timeout_ms: 5000,
-            max_bytes_in: 8 * 1024,
-            max_bytes_out: 2 * 1024,
-            max_files: 0,
-            max_depth: 0,
-            max_concurrency: 1,
-        },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
-    }
-}
-
-/// Create weather search macro tool manifest
-fn create_weather_search_tool(id: &str) -> ToolManifest {
-    ToolManifest {
-        id: ToolId(id.to_string()),
-        version: "1.0.0".to_string(),
-        display_name: "Weather Search".to_string(),
-        description: "Navigate to a weather search page and ensure the widget loads".to_string(),
+        display_name: "Fetch Metal Quotes".to_string(),
+        description: "Capture metal quote tables via DOM or API".to_string(),
         tags: vec![
             "browser".to_string(),
-            "macro".to_string(),
-            "weather".to_string(),
+            "quote".to_string(),
+            "observation".to_string(),
         ],
         input_schema: create_simple_schema(),
         output_schema: create_simple_schema(),
-        scopes: vec!["browser:macro".to_string()],
+        scopes: vec!["browser:observe".to_string()],
         capabilities: vec![CapabilityDecl {
             domain: "browser".to_string(),
-            action: "weather-search".to_string(),
-            resource: "*".to_string(),
-            attrs: serde_json::json!({}),
-        }],
-        side_effect: SideEffect::Browser,
-        safety_class: SafetyClass::Low,
-        consent: ConsentPolicy {
-            required: false,
-            max_ttl_ms: None,
-        },
-        limits: Limits {
-            timeout_ms: 45_000,
-            max_bytes_in: 8 * 1024,
-            max_bytes_out: 8 * 1024,
-            max_files: 0,
-            max_depth: 0,
-            max_concurrency: 1,
-        },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
-    }
-}
-
-/// Create wait-for-element tool manifest
-fn create_wait_for_element_tool(id: &str) -> ToolManifest {
-    ToolManifest {
-        id: ToolId(id.to_string()),
-        version: "1.0.0".to_string(),
-        display_name: "Wait For Element".to_string(),
-        description: "Wait until a structural element condition is met".to_string(),
-        tags: vec!["browser".to_string(), "synchronization".to_string()],
-        input_schema: create_simple_schema(),
-        output_schema: create_simple_schema(),
-        scopes: vec!["browser:wait".to_string()],
-        capabilities: vec![CapabilityDecl {
-            domain: "browser".to_string(),
-            action: "wait-element".to_string(),
+            action: "quote-fetch".to_string(),
             resource: "*".to_string(),
             attrs: serde_json::json!({}),
         }],
@@ -723,116 +1009,8 @@ fn create_wait_for_element_tool(id: &str) -> ToolManifest {
             max_ttl_ms: None,
         },
         limits: Limits {
-            timeout_ms: 60_000,
-            max_bytes_in: 16 * 1024,
-            max_bytes_out: 4 * 1024,
-            max_files: 0,
-            max_depth: 0,
-            max_concurrency: 4,
-        },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
-    }
-}
-
-/// Create wait-for-condition tool manifest
-fn create_wait_for_condition_tool(id: &str) -> ToolManifest {
-    ToolManifest {
-        id: ToolId(id.to_string()),
-        version: "1.0.0".to_string(),
-        display_name: "Wait For Condition".to_string(),
-        description: "Wait until network/runtime conditions meet expectations".to_string(),
-        tags: vec!["browser".to_string(), "synchronization".to_string()],
-        input_schema: create_simple_schema(),
-        output_schema: create_simple_schema(),
-        scopes: vec!["browser:wait".to_string()],
-        capabilities: vec![CapabilityDecl {
-            domain: "browser".to_string(),
-            action: "wait-condition".to_string(),
-            resource: "*".to_string(),
-            attrs: serde_json::json!({}),
-        }],
-        side_effect: SideEffect::Read,
-        safety_class: SafetyClass::Low,
-        consent: ConsentPolicy {
-            required: false,
-            max_ttl_ms: None,
-        },
-        limits: Limits {
-            timeout_ms: 60_000,
-            max_bytes_in: 16 * 1024,
-            max_bytes_out: 4 * 1024,
-            max_files: 0,
-            max_depth: 0,
-            max_concurrency: 4,
-        },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
-    }
-}
-
-/// Create get-element-info tool manifest
-fn create_get_element_info_tool(id: &str) -> ToolManifest {
-    ToolManifest {
-        id: ToolId(id.to_string()),
-        version: "1.0.0".to_string(),
-        display_name: "Get Element Info".to_string(),
-        description: "Collect structural details about an element".to_string(),
-        tags: vec!["browser".to_string(), "memory".to_string()],
-        input_schema: create_simple_schema(),
-        output_schema: create_simple_schema(),
-        scopes: vec!["browser:inspect".to_string()],
-        capabilities: vec![CapabilityDecl {
-            domain: "browser".to_string(),
-            action: "inspect".to_string(),
-            resource: "*".to_string(),
-            attrs: serde_json::json!({}),
-        }],
-        side_effect: SideEffect::Read,
-        safety_class: SafetyClass::Low,
-        consent: ConsentPolicy {
-            required: false,
-            max_ttl_ms: None,
-        },
-        limits: Limits {
-            timeout_ms: 5000,
+            timeout_ms: 20_000,
             max_bytes_in: 32 * 1024,
-            max_bytes_out: 32 * 1024,
-            max_files: 0,
-            max_depth: 0,
-            max_concurrency: 2,
-        },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
-    }
-}
-
-/// Create retrieve-history tool manifest
-fn create_retrieve_history_tool(id: &str) -> ToolManifest {
-    ToolManifest {
-        id: ToolId(id.to_string()),
-        version: "1.0.0".to_string(),
-        display_name: "Retrieve History".to_string(),
-        description: "Retrieve recent tool execution or perception history".to_string(),
-        tags: vec!["browser".to_string(), "memory".to_string()],
-        input_schema: create_simple_schema(),
-        output_schema: create_simple_schema(),
-        scopes: vec!["browser:history".to_string()],
-        capabilities: vec![CapabilityDecl {
-            domain: "browser".to_string(),
-            action: "history".to_string(),
-            resource: "*".to_string(),
-            attrs: serde_json::json!({}),
-        }],
-        side_effect: SideEffect::Read,
-        safety_class: SafetyClass::Low,
-        consent: ConsentPolicy {
-            required: false,
-            max_ttl_ms: None,
-        },
-        limits: Limits {
-            timeout_ms: 3000,
-            max_bytes_in: 8 * 1024,
             max_bytes_out: 64 * 1024,
             max_files: 0,
             max_depth: 0,
@@ -843,79 +1021,6 @@ fn create_retrieve_history_tool(id: &str) -> ToolManifest {
     }
 }
 
-/// Create complete-task tool manifest
-fn create_complete_task_tool(id: &str) -> ToolManifest {
-    ToolManifest {
-        id: ToolId(id.to_string()),
-        version: "1.0.0".to_string(),
-        display_name: "Complete Task".to_string(),
-        description: "Record task completion metadata and evidence".to_string(),
-        tags: vec!["metacognition".to_string(), "task".to_string()],
-        input_schema: create_simple_schema(),
-        output_schema: create_simple_schema(),
-        scopes: vec!["task:complete".to_string()],
-        capabilities: vec![CapabilityDecl {
-            domain: "task".to_string(),
-            action: "complete".to_string(),
-            resource: "*".to_string(),
-            attrs: serde_json::json!({}),
-        }],
-        side_effect: SideEffect::Read,
-        safety_class: SafetyClass::Low,
-        consent: ConsentPolicy {
-            required: false,
-            max_ttl_ms: None,
-        },
-        limits: Limits {
-            timeout_ms: 2000,
-            max_bytes_in: 32 * 1024,
-            max_bytes_out: 16 * 1024,
-            max_files: 0,
-            max_depth: 0,
-            max_concurrency: 1,
-        },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
-    }
-}
-
-/// Create report-insight tool manifest
-fn create_report_insight_tool(id: &str) -> ToolManifest {
-    ToolManifest {
-        id: ToolId(id.to_string()),
-        version: "1.0.0".to_string(),
-        display_name: "Report Insight".to_string(),
-        description: "Record insights or observations for downstream consumers".to_string(),
-        tags: vec!["metacognition".to_string(), "insight".to_string()],
-        input_schema: create_simple_schema(),
-        output_schema: create_simple_schema(),
-        scopes: vec!["task:insight".to_string()],
-        capabilities: vec![CapabilityDecl {
-            domain: "task".to_string(),
-            action: "insight".to_string(),
-            resource: "*".to_string(),
-            attrs: serde_json::json!({}),
-        }],
-        side_effect: SideEffect::Read,
-        safety_class: SafetyClass::Low,
-        consent: ConsentPolicy {
-            required: false,
-            max_ttl_ms: None,
-        },
-        limits: Limits {
-            timeout_ms: 2000,
-            max_bytes_in: 24 * 1024,
-            max_bytes_out: 16 * 1024,
-            max_files: 0,
-            max_depth: 0,
-            max_concurrency: 4,
-        },
-        idempotency: IdempoKind::None,
-        concurrency: ConcurrencyKind::Queue,
-    }
-}
-
-/// Create screenshot tool manifest
 fn create_take_screenshot_tool(id: &str) -> ToolManifest {
     ToolManifest {
         id: ToolId(id.to_string()),
@@ -941,10 +1046,45 @@ fn create_take_screenshot_tool(id: &str) -> ToolManifest {
         limits: Limits {
             timeout_ms: 5000,
             max_bytes_in: 1024,
-            max_bytes_out: 50 * 1024 * 1024, // 50MB for screenshot
+            max_bytes_out: 50 * 1024 * 1024,
             max_files: 1,
             max_depth: 0,
             max_concurrency: 1,
+        },
+        idempotency: IdempoKind::None,
+        concurrency: ConcurrencyKind::Parallel,
+    }
+}
+
+fn create_pointer_tool(id: &str) -> ToolManifest {
+    ToolManifest {
+        id: ToolId(id.to_string()),
+        version: "1.0.0".to_string(),
+        display_name: "Manual Pointer Event".to_string(),
+        description: "Inject low-level pointer interactions for live control".to_string(),
+        tags: vec!["browser".to_string(), "pointer".to_string()],
+        input_schema: create_simple_schema(),
+        output_schema: create_simple_schema(),
+        scopes: vec!["browser:interact".to_string()],
+        capabilities: vec![CapabilityDecl {
+            domain: "browser".to_string(),
+            action: "pointer".to_string(),
+            resource: "*".to_string(),
+            attrs: serde_json::json!({}),
+        }],
+        side_effect: SideEffect::Browser,
+        safety_class: SafetyClass::Medium,
+        consent: ConsentPolicy {
+            required: false,
+            max_ttl_ms: None,
+        },
+        limits: Limits {
+            timeout_ms: 2000,
+            max_bytes_in: 2048,
+            max_bytes_out: 2048,
+            max_files: 0,
+            max_depth: 0,
+            max_concurrency: 2,
         },
         idempotency: IdempoKind::None,
         concurrency: ConcurrencyKind::Parallel,
@@ -993,18 +1133,32 @@ fn create_parse_tool(id: &str) -> ToolManifest {
         .map(|(_, desc)| *desc)
         .unwrap_or("Parse structured observation data");
 
+    let (display_name, capability_action, tags) = if id.starts_with("data.validate.") {
+        (
+            format!("Validate {}", id.trim_start_matches("data.validate.")),
+            "validate".to_string(),
+            vec!["data".to_string(), "validate".to_string()],
+        )
+    } else {
+        (
+            format!("{}", id.replace("data.parse.", "Parse ")),
+            "parse".to_string(),
+            vec!["data".to_string(), "parse".to_string()],
+        )
+    };
+
     ToolManifest {
         id: ToolId(id.to_string()),
         version: "1.0.0".to_string(),
-        display_name: format!("{}", id.replace("data.parse.", "Parse ")),
+        display_name,
         description: description.to_string(),
-        tags: vec!["data".to_string(), "parse".to_string()],
+        tags,
         input_schema: create_simple_schema(),
         output_schema: create_simple_schema(),
         scopes: vec!["data:read".to_string()],
         capabilities: vec![CapabilityDecl {
             domain: "data".to_string(),
-            action: "parse".to_string(),
+            action: capability_action,
             resource: id.to_string(),
             attrs: Value::Null,
         }],
@@ -1151,6 +1305,33 @@ impl BrowserToolExecutor {
             })
             .await
             .map(|_| ())
+    }
+
+    async fn dispatch_keyboard_event(
+        &self,
+        exec_ctx: &ExecCtx,
+        key: &str,
+        code: &str,
+        key_code: u32,
+        focus_selector: Option<&str>,
+    ) -> Result<bool, SoulBrowserError> {
+        let context = self
+            .primitives
+            .resolve_context(exec_ctx)
+            .await
+            .map_err(|err| {
+                SoulBrowserError::internal(&format!("Failed to resolve execution context: {}", err))
+            })?;
+        let script = keyboard_event_script(key, code, key_code, focus_selector);
+        let value = self
+            .primitives
+            .adapter()
+            .evaluate_script_in_context(&context, &script)
+            .await
+            .map_err(|err| {
+                SoulBrowserError::internal(&format!("Failed to dispatch {key} event: {}", err))
+            })?;
+        Ok(value.as_bool().unwrap_or(false))
     }
 
     fn finish_tool(
@@ -1414,6 +1595,520 @@ impl BrowserToolExecutor {
         Ok(self.finish_tool(context, start, span, output))
     }
 
+    async fn execute_quote_fetch_tool(
+        &self,
+        context: &ToolExecutionContext,
+        start: Instant,
+        span: &tracing::Span,
+        exec_ctx: ExecCtx,
+    ) -> Result<ToolExecutionResult, SoulBrowserError> {
+        let payload_value = context
+            .input
+            .get("payload")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        let payload: QuoteFetchPayload = serde_json::from_value(payload_value).map_err(|err| {
+            self.record_error(context, start, span);
+            SoulBrowserError::validation_error("invalid_payload", &err.to_string())
+        })?;
+
+        let mut observation: Option<Value> = None;
+        let mut last_error: Option<SoulBrowserError> = None;
+        let mut attempt_log: Vec<serde_json::Value> = Vec::new();
+        let subject_id = context.subject_id.clone();
+        let attempts = build_quote_attempts(&payload);
+        let mut dom_block_reason_meta: Option<String> = None;
+        let mut dom_blocked_url: Option<String> = None;
+        let mut winning_source: Option<String> = None;
+        let mut winning_market: Option<String> = None;
+        let total_attempts = attempts.len();
+
+        for (idx, attempt) in attempts.into_iter().enumerate() {
+            let has_more = idx + 1 < total_attempts;
+            let mut dom_block_reason_current: Option<String> = None;
+            let mut dom_failed_for_attempt = false;
+
+            if attempt.prefer_api_first {
+                if let Some(api_cfg) = attempt.api.as_ref() {
+                    let api_key = attempt.api_attempt_key();
+                    if mark_quote_attempt(&subject_id, &api_key) {
+                        attempt_log.push(json!({
+                            "mode": "api",
+                            "status": "skipped",
+                            "reason": "already_attempted",
+                            "source": attempt.source_id,
+                        }));
+                    } else {
+                        match self
+                            .fetch_quotes_via_api(
+                                api_cfg,
+                                attempt.source_url.clone(),
+                                attempt.max_rows,
+                            )
+                            .await
+                        {
+                            Ok(value) => {
+                                record_market_quote_fetch("api", "success");
+                                attempt_log.push(json!({
+                                    "mode": "api",
+                                    "status": "success",
+                                    "source": attempt.source_id,
+                                }));
+                                winning_source = attempt.source_id.clone();
+                                winning_market = attempt.market.clone();
+                                observation = Some(value);
+                                break;
+                            }
+                            Err(err) => {
+                                record_market_quote_fetch("api", "failed");
+                                attempt_log.push(json!({
+                                    "mode": "api",
+                                    "status": "failed",
+                                    "source": attempt.source_id,
+                                }));
+                                last_error = Some(err);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if observation.is_some() {
+                break;
+            }
+
+            if attempt.source_url.is_some() {
+                let dom_key = attempt.dom_attempt_key();
+                if mark_quote_attempt(&subject_id, &dom_key) {
+                    attempt_log.push(json!({
+                        "mode": "dom",
+                        "status": "skipped",
+                        "reason": "already_attempted",
+                        "source": attempt.source_id,
+                    }));
+                } else {
+                    match self.fetch_quotes_via_dom(&attempt, exec_ctx.clone()).await {
+                        Ok(value) => {
+                            let block_notice = detect_block_reason(
+                                "",
+                                value
+                                    .get("text_sample")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(""),
+                                value.get("url").and_then(Value::as_str),
+                            );
+                            if let Some(reason) = block_notice {
+                                record_market_quote_fetch("dom", "blocked");
+                                attempt_log.push(json!({
+                                    "mode": "dom",
+                                    "status": "blocked",
+                                    "source": attempt.source_id,
+                                    "reason": reason,
+                                }));
+                                dom_block_reason_current = Some(reason.clone());
+                                dom_block_reason_meta = Some(reason.clone());
+                                dom_blocked_url = value
+                                    .get("url")
+                                    .and_then(Value::as_str)
+                                    .map(|s| s.to_string());
+                                if let Some(source) = attempt.source_id.as_deref() {
+                                    mark_source_unhealthy(source, &reason);
+                                }
+                                emit_self_heal_event("manual_takeover_hint", Some(reason.clone()));
+                            } else {
+                                record_market_quote_fetch("dom", "success");
+                                attempt_log.push(json!({
+                                    "mode": "dom",
+                                    "status": "success",
+                                    "source": attempt.source_id,
+                                }));
+                                winning_source = attempt.source_id.clone();
+                                winning_market = attempt.market.clone();
+                                observation = Some(value);
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            record_market_quote_fetch("dom", "failed");
+                            attempt_log.push(json!({
+                                "mode": "dom",
+                                "status": "failed",
+                                "source": attempt.source_id,
+                            }));
+                            last_error = Some(err);
+                            dom_failed_for_attempt = true;
+                        }
+                    }
+                }
+            }
+
+            if observation.is_some() {
+                break;
+            }
+
+            if dom_block_reason_current.is_some()
+                && attempt.api.is_some()
+                && !attempt.prefer_api_first
+            {
+                record_market_quote_fallback("dom_soft_block");
+            }
+
+            if (!attempt.prefer_api_first && attempt.api.is_some())
+                && (dom_failed_for_attempt
+                    || dom_block_reason_current.is_some()
+                    || attempt.source_url.is_none())
+            {
+                if dom_failed_for_attempt && attempt.source_url.is_some() {
+                    record_market_quote_fallback("dom_to_api");
+                }
+                let api_key = attempt.api_attempt_key();
+                if mark_quote_attempt(&subject_id, &api_key) {
+                    attempt_log.push(json!({
+                        "mode": "api",
+                        "status": "skipped",
+                        "reason": "already_attempted",
+                        "source": attempt.source_id,
+                    }));
+                } else if let Some(api_cfg) = attempt.api.as_ref() {
+                    match self
+                        .fetch_quotes_via_api(api_cfg, attempt.source_url.clone(), attempt.max_rows)
+                        .await
+                    {
+                        Ok(value) => {
+                            record_market_quote_fetch("api", "success");
+                            attempt_log.push(json!({
+                                "mode": "api",
+                                "status": "success",
+                                "source": attempt.source_id,
+                            }));
+                            winning_source = attempt.source_id.clone();
+                            winning_market = attempt.market.clone();
+                            observation = Some(value);
+                            break;
+                        }
+                        Err(err) => {
+                            record_market_quote_fetch("api", "failed");
+                            attempt_log.push(json!({
+                                "mode": "api",
+                                "status": "failed",
+                                "source": attempt.source_id,
+                            }));
+                            last_error = Some(err);
+                        }
+                    }
+                }
+            }
+
+            if observation.is_some() {
+                break;
+            }
+
+            if has_more {
+                record_market_quote_fallback("rotate_source");
+            }
+        }
+
+        let data = match observation {
+            Some(value) => value,
+            None => {
+                let err = last_error.unwrap_or_else(|| {
+                    SoulBrowserError::validation_error(
+                        "报价采集失败：所有数据源均不可用",
+                        "quote fetch failed: no mode succeeded",
+                    )
+                });
+                self.record_error(context, start, span);
+                return Err(err);
+            }
+        };
+
+        let block_notice = detect_block_reason(
+            "",
+            data.get("text_sample")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            data.get("url").and_then(Value::as_str),
+        );
+        if let Some(reason) = &block_notice {
+            emit_self_heal_event("manual_takeover_hint", Some(reason.clone()));
+        }
+
+        OBSERVATION_CACHE.insert(
+            context.subject_id.clone(),
+            ObservationEntry {
+                data: data.clone(),
+                parsed: HashMap::new(),
+            },
+        );
+        reset_quote_attempts(&subject_id);
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("subject_id".to_string(), json!(context.subject_id.clone()));
+        if !attempt_log.is_empty() {
+            metadata.insert("attempts".to_string(), Value::Array(attempt_log));
+        }
+        if let Some(source_id) = winning_source {
+            metadata.insert("source_id".to_string(), json!(source_id));
+        }
+        if let Some(market) = winning_market {
+            metadata.insert("source_market".to_string(), json!(market));
+        }
+        if let Some(reason) = dom_block_reason_meta {
+            metadata.insert("dom_block_reason".to_string(), json!(reason));
+        }
+        if let Some(url) = dom_blocked_url {
+            metadata.insert("dom_blocked_url".to_string(), json!(url));
+        }
+        if let Some(reason) = block_notice {
+            metadata.insert("block_reason".to_string(), json!(reason));
+        }
+        let output = ToolExecutionResult {
+            success: true,
+            output: Some(json!({
+                "status": "captured",
+                "observation": data,
+            })),
+            error: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+            metadata,
+        };
+        Ok(self.finish_tool(context, start, span, output))
+    }
+
+    async fn fetch_quotes_via_dom(
+        &self,
+        attempt: &QuoteAttemptPlan,
+        exec_ctx: ExecCtx,
+    ) -> Result<Value, SoulBrowserError> {
+        self.ensure_adapter_started().await?;
+        let page_id = self.resolve_page_for_route(&exec_ctx.route).await?;
+        let dom_config = DomQuoteConfig {
+            table_selectors: if attempt.table_selectors.is_empty() {
+                vec!["table".to_string()]
+            } else {
+                attempt.table_selectors.clone()
+            },
+            key_value_selectors: attempt.key_value_selectors.clone(),
+            max_rows: attempt.max_rows,
+        };
+        let config_json = serde_json::to_string(&dom_config).map_err(|err| {
+            SoulBrowserError::internal(&format!("Quote config serialization failed: {err}"))
+        })?;
+        let expression = QUOTE_FETCH_SCRIPT.replace("__CONFIG__", &config_json);
+        let raw = self
+            .adapter
+            .evaluate_script(page_id, &expression)
+            .await
+            .map_err(|err| {
+                SoulBrowserError::internal(&format!("Quote fetch script failed: {err}"))
+            })?;
+        let ok = raw.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ok {
+            return Err(SoulBrowserError::internal(
+                raw.get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Quote fetch script reported failure"),
+            ));
+        }
+        Ok(raw.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn fetch_quotes_via_api(
+        &self,
+        api: &ApiQuoteConfig,
+        source_url: Option<String>,
+        max_rows: Option<usize>,
+    ) -> Result<Value, SoulBrowserError> {
+        let client = Client::new();
+        let method = api.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+        let mut request = match method.as_str() {
+            "POST" => client.post(&api.url),
+            _ => client.get(&api.url),
+        };
+        if let Some(headers) = &api.headers {
+            for (key, value) in headers.iter() {
+                request = request.header(key, value);
+            }
+        }
+        if let Some(params) = &api.params {
+            if method == "POST" {
+                request = request.json(params);
+            } else {
+                let query: Vec<(String, String)> = params
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Self::format_api_value(v)))
+                    .collect();
+                request = request.query(&query);
+            }
+        }
+        let response = request.send().await.map_err(|err| {
+            SoulBrowserError::internal(&format!("Quote API request failed: {err}"))
+        })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|err| {
+            SoulBrowserError::internal(&format!("Quote API body read failed: {err}"))
+        })?;
+        if !status.is_success() {
+            return Err(SoulBrowserError::internal(&format!(
+                "Quote API returned {}",
+                status
+            )));
+        }
+        let json_value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let (tables, key_values) = Self::convert_api_response(&json_value, api, max_rows);
+        let text_sample = body.chars().take(2000).collect::<String>();
+        Ok(json!({
+            "kind": "quote_observation",
+            "source": "market.quote.fetch.api",
+            "url": source_url.unwrap_or_else(|| api.url.clone()),
+            "fetched_at": Utc::now().to_rfc3339(),
+            "tables": tables,
+            "key_values": key_values,
+            "text_sample": text_sample,
+            "text_sample_length": text_sample.len(),
+            "raw_api": json_value,
+        }))
+    }
+
+    fn convert_params(params: &Map<String, Value>) -> Vec<(String, String)> {
+        params
+            .iter()
+            .map(|(k, v)| (k.clone(), Self::format_api_value(v)))
+            .collect()
+    }
+
+    fn convert_api_response(
+        value: &Value,
+        cfg: &ApiQuoteConfig,
+        max_rows: Option<usize>,
+    ) -> (Vec<Value>, Vec<Value>) {
+        const DEFAULT_RECORD_PATH: &[&str] = &["data", "diff"];
+        let limit = max_rows.unwrap_or(50);
+        let records_value = if let Some(path) = cfg.record_path.as_ref() {
+            Self::traverse_path(value, path)
+        } else {
+            Self::traverse_default_path(value, DEFAULT_RECORD_PATH)
+        };
+        let records = records_value
+            .and_then(|entry: &Value| entry.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if records.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let field_mappings = Self::resolve_field_mappings(cfg);
+        let mut rows = Vec::new();
+        for entry in records.iter().take(limit) {
+            let mut row = Vec::new();
+            for mapping in &field_mappings {
+                let cell = Self::get_value_at_path(entry, &mapping.path)
+                    .map(Self::format_api_value)
+                    .unwrap_or_default();
+                row.push(Value::String(cell));
+            }
+            rows.push(Value::Array(row));
+        }
+
+        let headers: Vec<Value> = field_mappings
+            .iter()
+            .map(|mapping| Value::String(mapping.column.clone()))
+            .collect();
+        let tables = if rows.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({
+                "headers": headers,
+                "rows": rows,
+                "source": "api",
+            })]
+        };
+
+        let label_path = Self::resolve_label_path(cfg);
+        let price_path = Self::resolve_price_path(cfg);
+        let mut key_values = Vec::new();
+        if let Some(first) = records.first() {
+            if let Some(label_value) = Self::get_value_at_path(first, &label_path) {
+                if let Some(price_value) = Self::get_value_at_path(first, &price_path) {
+                    key_values.push(json!({
+                        "label": Self::format_api_value(label_value),
+                        "value": Self::format_api_value(price_value),
+                    }));
+                }
+            }
+        }
+
+        (tables, key_values)
+    }
+
+    fn resolve_field_mappings(cfg: &ApiQuoteConfig) -> Vec<ApiFieldMapping> {
+        if let Some(custom) = &cfg.field_mappings {
+            return custom.clone();
+        }
+        vec![
+            ApiFieldMapping {
+                column: "名称".to_string(),
+                path: vec![cfg.label_field.clone().unwrap_or_else(|| "f14".to_string())],
+            },
+            ApiFieldMapping {
+                column: "最新价".to_string(),
+                path: vec![cfg.price_field.clone().unwrap_or_else(|| "f2".to_string())],
+            },
+            ApiFieldMapping {
+                column: "涨跌".to_string(),
+                path: vec![cfg.change_field.clone().unwrap_or_else(|| "f4".to_string())],
+            },
+            ApiFieldMapping {
+                column: "涨跌幅".to_string(),
+                path: vec![cfg
+                    .change_pct_field
+                    .clone()
+                    .unwrap_or_else(|| "f3".to_string())],
+            },
+        ]
+    }
+
+    fn resolve_label_path(cfg: &ApiQuoteConfig) -> Vec<String> {
+        vec![cfg.label_field.clone().unwrap_or_else(|| "f14".to_string())]
+    }
+
+    fn resolve_price_path(cfg: &ApiQuoteConfig) -> Vec<String> {
+        vec![cfg.price_field.clone().unwrap_or_else(|| "f2".to_string())]
+    }
+
+    fn traverse_path<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+        let mut current = value;
+        for segment in path {
+            current = current.get(segment)?;
+        }
+        Some(current)
+    }
+
+    fn traverse_default_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+        let mut current = value;
+        for segment in path {
+            current = current.get(segment)?;
+        }
+        Some(current)
+    }
+
+    fn get_value_at_path<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+        let mut current = value;
+        for segment in path {
+            current = current.get(segment)?;
+        }
+        Some(current)
+    }
+
+    fn format_api_value(value: &Value) -> String {
+        match value {
+            Value::String(s) => s.clone(),
+            Value::Number(num) => num.to_string(),
+            Value::Bool(flag) => flag.to_string(),
+            other => other.to_string(),
+        }
+    }
+
     async fn execute_parse_tool(
         &self,
         context: &ToolExecutionContext,
@@ -1446,6 +2141,238 @@ impl BrowserToolExecutor {
                 "status": "parsed",
                 "schema": schema,
                 "result": parsed,
+            })),
+            error: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+            metadata,
+        };
+        Ok(self.finish_tool(context, start, span, result))
+    }
+
+    async fn execute_metal_price_validation(
+        &self,
+        context: &ToolExecutionContext,
+        start: Instant,
+        span: &tracing::Span,
+    ) -> Result<ToolExecutionResult, SoulBrowserError> {
+        let payload = context
+            .input
+            .get("payload")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        let payload: MetalPriceValidationPayload =
+            serde_json::from_value(payload).map_err(|err| {
+                self.record_error(context, start, span);
+                SoulBrowserError::validation_error("invalid_payload", &err.to_string())
+            })?;
+
+        let entry = OBSERVATION_CACHE.get(&context.subject_id).ok_or_else(|| {
+            SoulBrowserError::internal(
+                "No observation available for validation; run data.parse.metal_price first",
+            )
+        })?;
+        let parsed = entry.parsed.get("metal_price_v1").cloned().ok_or_else(|| {
+            SoulBrowserError::validation_error(
+                "missing_schema",
+                "metal_price_v1 数据不存在，请先执行 data.parse.metal_price",
+            )
+        })?;
+        drop(entry);
+
+        let ctx = MetalPriceValidationContext {
+            metal_keyword: payload
+                .metal_keyword
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("铜"),
+            allowed_markets: &payload.allowed_markets,
+            max_age_hours: payload.max_age_hours,
+        };
+
+        let report = match validate_metal_price_with_context(&parsed, &ctx) {
+            Ok(report) => report,
+            Err(err) => {
+                if let Some(failure) = err.downcast_ref::<MetalPriceValidationFailure>() {
+                    match failure {
+                        MetalPriceValidationFailure::MissingMarket(_)
+                        | MetalPriceValidationFailure::MissingMetal(_) => {
+                            emit_self_heal_event("switch_contract", Some(failure.to_string()));
+                        }
+                        MetalPriceValidationFailure::StaleQuotes { .. } => {
+                            emit_self_heal_event("retry_alt_source", Some(failure.to_string()));
+                        }
+                    }
+                }
+                self.record_error(context, start, span);
+                let message = err.to_string();
+                return Err(SoulBrowserError::validation_error(
+                    "metal_price_validation_failed",
+                    &message,
+                ));
+            }
+        };
+
+        let mut metadata = serde_json::Map::new();
+        if let Some(step_id) = payload.source_step_id {
+            metadata.insert("source_step_id".into(), json!(step_id));
+        }
+        metadata.insert("schema".into(), json!("metal_price_v1"));
+        metadata.insert("metal_keyword".into(), json!(ctx.metal_keyword));
+        metadata.insert("fresh_entries".into(), json!(report.fresh_entries));
+
+        let output = ToolExecutionResult {
+            success: true,
+            output: Some(json!({
+                "status": "validated",
+                "total_items": report.total_items,
+                "matching_metal": report.matched_metal,
+                "matching_market": report.matched_market,
+                "fresh_entries": report.fresh_entries,
+                "newest_as_of": report.newest_as_of,
+            })),
+            error: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+            metadata,
+        };
+        Ok(self.finish_tool(context, start, span, output))
+    }
+
+    async fn execute_target_validation(
+        &self,
+        context: &ToolExecutionContext,
+        start: Instant,
+        span: &tracing::Span,
+    ) -> Result<ToolExecutionResult, SoulBrowserError> {
+        let payload_value = context
+            .input
+            .get("payload")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        let payload: TargetValidationPayload =
+            serde_json::from_value(payload_value).map_err(|err| {
+                self.record_error(context, start, span);
+                SoulBrowserError::validation_error("invalid_payload", &err.to_string())
+            })?;
+
+        let TargetValidationPayload {
+            source_step_id,
+            keywords,
+            allowed_domains,
+            expected_status,
+        } = payload;
+
+        let entry = OBSERVATION_CACHE.get(&context.subject_id).ok_or_else(|| {
+            SoulBrowserError::internal(
+                "No observation available for validation; run data.extract-site first",
+            )
+        })?;
+        let snapshot = entry.data.clone();
+        drop(entry);
+
+        let node = canonical_observation(&snapshot);
+        let page_url = node
+            .get("url")
+            .and_then(Value::as_str)
+            .map(|value| value.to_string());
+        let title = node
+            .get("title")
+            .or_else(|| node.get("identity"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let text_sample = node
+            .get("text_sample")
+            .or_else(|| node.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if let Some(reason) = detect_block_reason(title, text_sample, page_url.as_deref()) {
+            self.record_error(context, start, span);
+            let detail = format!("页面疑似被拦截：{}", reason);
+            return Err(target_validation_error(
+                "target_validation_blocked",
+                &detail,
+            ));
+        }
+
+        let normalized_keywords = normalize_keywords(&keywords);
+        let haystack = observation_text_blob(node);
+        let matched_keywords: Vec<String> = normalized_keywords
+            .iter()
+            .filter(|keyword| keyword_matches(&haystack, keyword))
+            .cloned()
+            .collect();
+        if !normalized_keywords.is_empty() && matched_keywords.is_empty() {
+            self.record_error(context, start, span);
+            let detail = format!("页面内容缺少目标关键词：{}", normalized_keywords.join(", "));
+            return Err(target_validation_error(
+                "target_validation_keywords_missing",
+                &detail,
+            ));
+        }
+
+        let normalized_domains = normalize_domains(&allowed_domains);
+        let page_domain = page_url
+            .as_deref()
+            .and_then(|url| normalize_domain_input(url));
+        if !normalized_domains.is_empty() {
+            let domain_ok = page_domain.as_deref().map(|domain| {
+                normalized_domains
+                    .iter()
+                    .any(|allowed| domain_matches_allowed(domain, allowed))
+            });
+            if !matches!(domain_ok, Some(true)) {
+                self.record_error(context, start, span);
+                let detail = format!(
+                    "页面域名 {} 不在允许列表 {:?}",
+                    page_domain.clone().unwrap_or_else(|| "unknown".to_string()),
+                    normalized_domains
+                );
+                return Err(target_validation_error(
+                    "target_validation_domain_mismatch",
+                    &detail,
+                ));
+            }
+        }
+
+        let status_code = extract_status_code(node);
+        if let (Some(expected), Some(actual)) = (expected_status, status_code) {
+            if expected != actual {
+                self.record_error(context, start, span);
+                let detail = format!("HTTP 状态 {} 与期望 {} 不符", actual, expected);
+                return Err(target_validation_error(
+                    "target_validation_status_mismatch",
+                    &detail,
+                ));
+            }
+        }
+
+        let mut metadata = serde_json::Map::new();
+        if let Some(step_id) = source_step_id.as_deref() {
+            metadata.insert("source_step_id".into(), json!(step_id));
+        }
+        if !normalized_keywords.is_empty() {
+            metadata.insert("keywords".into(), json!(normalized_keywords));
+        }
+        metadata.insert("matched_keywords".into(), json!(matched_keywords.clone()));
+        if !normalized_domains.is_empty() {
+            metadata.insert("allowed_domains".into(), json!(normalized_domains));
+        }
+        if let Some(domain) = page_domain.as_deref() {
+            metadata.insert("domain".into(), json!(domain));
+        }
+        if let Some(status) = status_code {
+            metadata.insert("status_code".into(), json!(status));
+        }
+        if let Some(expected) = expected_status {
+            metadata.insert("expected_status".into(), json!(expected));
+        }
+
+        let result = ToolExecutionResult {
+            success: true,
+            output: Some(json!({
+                "status": "validated",
+                "matched_keywords": matched_keywords,
+                "domain": page_domain,
+                "status_code": status_code,
             })),
             error: None,
             duration_ms: start.elapsed().as_millis() as u64,
@@ -1579,6 +2506,11 @@ impl BrowserToolExecutor {
                 .map(|value| ("market_info_v1".to_string(), value))
                 .map_err(|err| {
                     SoulBrowserError::internal(&format!("Parse market info failed: {}", err))
+                }),
+            "data.parse.metal_price" => parse_metal_price(observation)
+                .map(|value| ("metal_price_v1".to_string(), value))
+                .map_err(|err| {
+                    SoulBrowserError::internal(&format!("Parse metal price failed: {}", err))
                 }),
             "data.parse.news_brief" => parse_news_brief(observation)
                 .map(|value| ("news_brief_v1".to_string(), value))
@@ -1848,6 +2780,75 @@ impl BrowserToolExecutor {
             "wait-for-condition currently supports net.quiet_ms, duration_ms, url_pattern, url_equals, or title_pattern",
         ))
     }
+
+    async fn pointer_click(
+        &self,
+        route: &ExecRoute,
+        x: f64,
+        y: f64,
+        button: &str,
+    ) -> Result<(), SoulBrowserError> {
+        let page_id = self.resolve_page_for_route(route).await?;
+        let normalized_button = match button.to_ascii_lowercase().as_str() {
+            "right" => "right",
+            "middle" => "middle",
+            _ => "left",
+        };
+        let payload = |event_type: &str| {
+            json!({
+                "type": event_type,
+                "x": x,
+                "y": y,
+                "button": normalized_button,
+                "buttons": 1,
+                "clickCount": 1,
+                "pointerType": "mouse",
+            })
+        };
+        self.adapter
+            .dispatch_mouse_event(page_id, payload("mousePressed"))
+            .await
+            .map_err(|err| Self::pointer_error("click", err))?;
+        self.adapter
+            .dispatch_mouse_event(page_id, payload("mouseReleased"))
+            .await
+            .map_err(|err| Self::pointer_error("click", err))
+    }
+
+    async fn pointer_scroll(
+        &self,
+        route: &ExecRoute,
+        x: f64,
+        y: f64,
+        delta_x: f64,
+        delta_y: f64,
+    ) -> Result<(), SoulBrowserError> {
+        let page_id = self.resolve_page_for_route(route).await?;
+        let payload = json!({
+            "type": "mouseWheel",
+            "x": x,
+            "y": y,
+            "deltaX": delta_x,
+            "deltaY": delta_y,
+            "pointerType": "mouse",
+        });
+        self.adapter
+            .dispatch_mouse_event(page_id, payload)
+            .await
+            .map_err(|err| Self::pointer_error("scroll", err))
+    }
+
+    async fn pointer_type(&self, route: &ExecRoute, text: &str) -> Result<(), SoulBrowserError> {
+        let page_id = self.resolve_page_for_route(route).await?;
+        self.adapter
+            .insert_text_event(page_id, text)
+            .await
+            .map_err(|err| Self::pointer_error("type", err))
+    }
+
+    fn pointer_error(action: &str, err: AdapterError) -> SoulBrowserError {
+        SoulBrowserError::internal(&format!("manual pointer {action} failed: {}", err))
+    }
 }
 
 fn required_deliver_field(
@@ -1890,6 +2891,426 @@ fn build_weather_search_url(query: &str, override_url: Option<&str>) -> String {
         .collect::<String>()
         .replace('+', "%20");
     format!("https://www.baidu.com/s?wd={}", encoded)
+}
+
+fn normalized_search_engine(engine: &str) -> &'static str {
+    match engine.to_ascii_lowercase().as_str() {
+        "bing" => "bing",
+        "google" => "google",
+        "duckduckgo" | "ddg" => "duckduckgo",
+        "baidu" => "baidu",
+        // Default to DuckDuckGo as it has fewer captchas
+        _ => "duckduckgo",
+    }
+}
+
+fn search_engine_attempts(engine_hint: &str) -> Vec<&'static str> {
+    let preferred = normalized_search_engine(engine_hint);
+    let mut order = vec![preferred];
+    // DuckDuckGo first as fallback (fewer captchas), then others
+    for fallback in ["duckduckgo", "google", "bing", "baidu"].iter() {
+        if order.contains(fallback) {
+            continue;
+        }
+        order.push(fallback);
+    }
+    order
+}
+
+fn build_browser_search_url(
+    engine_hint: &str,
+    query: &str,
+    site: Option<&str>,
+    override_url: Option<&str>,
+) -> (String, String) {
+    if let Some(custom) = override_url {
+        if !custom.trim().is_empty() {
+            return (
+                normalized_search_engine(engine_hint).to_string(),
+                custom.to_string(),
+            );
+        }
+    }
+    let normalized = normalized_search_engine(engine_hint);
+    let mut final_query = query.trim().to_string();
+    if let Some(site_value) = site.and_then(|s| normalize_site_hint(s)) {
+        if !final_query.is_empty() {
+            final_query.push(' ');
+        }
+        final_query.push_str(&format!("site:{}", site_value));
+    }
+    let encoded: String = form_urlencoded::byte_serialize(final_query.as_bytes()).collect();
+    let url = match normalized {
+        "bing" => format!("https://www.bing.com/search?q={encoded}"),
+        "google" => format!("https://www.google.com/search?q={encoded}"),
+        "duckduckgo" => format!("https://duckduckgo.com/?q={encoded}"),
+        "baidu" => format!("https://www.baidu.com/s?wd={encoded}"),
+        _ => format!("https://duckduckgo.com/?q={encoded}"),
+    };
+    (normalized.to_string(), url)
+}
+
+fn default_search_results_selector(engine: &str) -> &'static str {
+    search_selectors(engine)
+        .first()
+        .copied()
+        .unwrap_or("div#content_left")
+}
+
+fn search_selectors(engine: &str) -> &'static [&'static str] {
+    match engine {
+        "bing" => BING_SEARCH_SELECTORS,
+        "google" => GOOGLE_SEARCH_SELECTORS,
+        "duckduckgo" => DUCKDUCKGO_SEARCH_SELECTORS,
+        "baidu" => BAIDU_SEARCH_SELECTORS,
+        _ => DUCKDUCKGO_SEARCH_SELECTORS,
+    }
+}
+
+fn collect_results_selectors(input: &Value, engine: &str) -> Vec<String> {
+    let mut selectors: Vec<String> = Vec::new();
+    if let Some(value) = input.get("results_selectors") {
+        append_selector_value(value, &mut selectors);
+    }
+    if let Some(selector) = input
+        .get("results_selector")
+        .and_then(Value::as_str)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        push_selector(selector, &mut selectors);
+    }
+    for selector in search_selectors(engine) {
+        push_selector(selector, &mut selectors);
+    }
+    selectors
+}
+
+fn append_selector_value(value: &Value, selectors: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    push_selector(text, selectors);
+                }
+            }
+        }
+        Value::String(text) => push_selector(text, selectors),
+        _ => {}
+    }
+}
+
+fn push_selector(text: &str, selectors: &mut Vec<String>) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if selectors.iter().any(|existing| existing == trimmed) {
+        return;
+    }
+    selectors.push(trimmed.to_string());
+}
+
+fn auto_act_result_picker_script(config: &Value) -> Result<String, SoulBrowserError> {
+    serde_json::to_string(config)
+        .map(|serialized| AUTO_ACT_RESULT_PICKER_SCRIPT.replace("__CONFIG__", &serialized))
+        .map_err(|err| {
+            SoulBrowserError::internal(&format!(
+                "Failed to serialize AutoAct result picker config: {}",
+                err
+            ))
+        })
+}
+
+fn auto_act_candidate_selectors(input: &Value, engine: &str) -> Vec<String> {
+    let mut selectors = Vec::new();
+    if let Some(value) = input.get("selectors") {
+        append_selector_value(value, &mut selectors);
+    }
+    if selectors.is_empty() {
+        if let Some(value) = input.get("results_selectors") {
+            append_selector_value(value, &mut selectors);
+        }
+    }
+    if selectors.is_empty() {
+        if let Some(value) = input.get("results_selector").and_then(Value::as_str) {
+            push_selector(value, &mut selectors);
+        }
+    }
+    if selectors.is_empty() {
+        for selector in search_selectors(engine) {
+            selectors.push(selector.to_string());
+        }
+    }
+    selectors
+        .into_iter()
+        .map(|selector| selector.trim().to_string())
+        .filter(|selector| !selector.is_empty())
+        .collect()
+}
+
+fn auto_act_domain_hints(input: &Value) -> Vec<String> {
+    let mut domains = Vec::new();
+    if let Some(value) = input.get("domains") {
+        append_selector_value(value, &mut domains);
+    }
+    domains
+        .into_iter()
+        .filter_map(|raw| canonical_domain_hint(&raw))
+        .collect()
+}
+
+fn canonical_domain_hint(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = Url::parse(trimmed) {
+        if let Some(domain) = parsed.domain() {
+            return Some(domain.to_ascii_lowercase());
+        }
+    }
+    let without_scheme = trimmed
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("//");
+    let without_glob = without_scheme
+        .trim_start_matches('*')
+        .trim_start_matches('.');
+    let cleaned = without_glob.trim_matches('/');
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_ascii_lowercase())
+    }
+}
+
+fn domain_pattern(domain: &str) -> Option<String> {
+    let trimmed = domain.trim().trim_start_matches('*').trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("https?://[^/]*{}.*", escape(trimmed)))
+}
+
+fn url_prefix_pattern(url: &str) -> Option<String> {
+    if url.trim().is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = Url::parse(url) {
+        let mut base = format!("{}://{}", parsed.scheme(), parsed.host_str()?);
+        if let Some(port) = parsed.port() {
+            base.push(':');
+            base.push_str(&port.to_string());
+        }
+        base.push_str(parsed.path());
+        let escaped = escape(&base);
+        return Some(format!("^{}.*", escaped));
+    }
+    Some(format!("^{}.*", escape(url)))
+}
+
+fn post_click_patterns(
+    selected_url: Option<&str>,
+    matched_domain: Option<&str>,
+    domain_hints: &[String],
+    engine: &str,
+) -> Vec<String> {
+    if let Some(url) = selected_url {
+        let prefer_guardrail =
+            should_prioritize_guardrail(Some(url), matched_domain, domain_hints, engine);
+        if prefer_guardrail {
+            let mut patterns: Vec<String> = domain_hints
+                .iter()
+                .filter_map(|domain| domain_pattern(domain))
+                .collect();
+            if let Some(pattern) = url_prefix_pattern(url) {
+                patterns.push(pattern);
+            }
+            for fallback in fallback_wait_patterns(engine) {
+                if !patterns.iter().any(|existing| existing == &fallback) {
+                    patterns.push(fallback);
+                }
+            }
+            if !patterns.is_empty() {
+                patterns.dedup();
+                return patterns;
+            }
+        } else if let Some(pattern) = url_prefix_pattern(url) {
+            return vec![pattern];
+        }
+    }
+    if let Some(domain) = matched_domain {
+        if let Some(pattern) = domain_pattern(domain) {
+            return vec![pattern];
+        }
+    }
+    let mut patterns = Vec::new();
+    for domain in domain_hints {
+        if let Some(pattern) = domain_pattern(domain) {
+            patterns.push(pattern);
+        }
+    }
+    if !patterns.is_empty() {
+        patterns.dedup();
+        return patterns;
+    }
+    fallback_wait_patterns(engine)
+}
+
+fn is_baidu_redirect(url: &str) -> bool {
+    if let Ok(parsed) = Url::parse(url) {
+        if let Some(host) = parsed.host_str().map(|host| host.to_ascii_lowercase()) {
+            if host.ends_with("baidu.com") && parsed.path().starts_with("/link") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn fallback_wait_patterns(engine: &str) -> Vec<String> {
+    if engine.eq_ignore_ascii_case("baidu") {
+        vec![BAIDU_RESULT_REDIRECT_PATTERN.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn should_prioritize_guardrail(
+    selected_url: Option<&str>,
+    matched_domain: Option<&str>,
+    domain_hints: &[String],
+    engine: &str,
+) -> bool {
+    let Some(url) = selected_url else {
+        return false;
+    };
+    matched_domain.is_none()
+        && !domain_hints.is_empty()
+        && engine.eq_ignore_ascii_case("baidu")
+        && is_baidu_redirect(url)
+}
+
+fn pattern_targets_guardrail(pattern: &str, domain_hints: &[String]) -> bool {
+    domain_hints
+        .iter()
+        .any(|domain| pattern.contains(&escape(domain)))
+}
+
+fn dynamic_wait_timeout(
+    pattern: &str,
+    domain_hints: &[String],
+    engine: &str,
+    default_ms: u64,
+) -> u64 {
+    if engine.eq_ignore_ascii_case("baidu") && pattern_targets_guardrail(pattern, domain_hints) {
+        default_ms.min(5_000).max(1_000)
+    } else {
+        default_ms
+    }
+}
+
+fn search_url_wait_condition(engine: &str, url: &str) -> WaitCondition {
+    if let Ok(parsed) = Url::parse(url) {
+        let mut base = format!(
+            "{}://{}",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or_default()
+        );
+        if let Some(port) = parsed.port() {
+            base.push(':');
+            base.push_str(&port.to_string());
+        }
+        base.push_str(parsed.path());
+        let mut pattern = format!("^{}", escape(&base));
+        let param = match engine {
+            "bing" | "google" => "q",
+            _ => "wd",
+        };
+        if let Some((_, value)) = parsed.query_pairs().find(|(key, _)| key == param) {
+            let encoded: String = form_urlencoded::byte_serialize(value.as_bytes()).collect();
+            pattern.push_str(".*");
+            pattern.push_str(&escape(param));
+            pattern.push('=');
+            pattern.push_str(&escape(&encoded));
+        }
+        pattern.push_str(".*$");
+        return WaitCondition::UrlMatches(pattern);
+    }
+    WaitCondition::UrlMatches(format!(".*{}.*", escape(engine)))
+}
+
+fn normalize_site_hint(site: &str) -> Option<String> {
+    let trimmed = site.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cleaned = trimmed.trim_start_matches("site:").trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = Url::parse(cleaned) {
+        if let Some(host) = parsed.host_str().map(|h| h.to_string()) {
+            return Some(host);
+        }
+    }
+    let without_scheme = cleaned
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host_part = without_scheme
+        .split(|c| matches!(c, '/' | '?'))
+        .next()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())?;
+    Some(host_part.to_string())
+}
+
+fn modal_selectors_from_input(input: &Value) -> Vec<String> {
+    if let Some(selector) = input
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return vec![selector.to_string()];
+    }
+    if let Some(list) = input.get("selectors").and_then(|v| v.as_array()) {
+        let collected: Vec<String> = list
+            .iter()
+            .filter_map(|value| value.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if !collected.is_empty() {
+            return collected;
+        }
+    }
+    DEFAULT_MODAL_CLOSE_SELECTORS
+        .iter()
+        .map(|selector| selector.to_string())
+        .collect()
+}
+
+fn keyboard_event_script(
+    key: &str,
+    code: &str,
+    key_code: u32,
+    focus_selector: Option<&str>,
+) -> String {
+    let key_literal = serde_json::to_string(key).unwrap_or_else(|_| "\"Escape\"".to_string());
+    let code_literal = serde_json::to_string(code).unwrap_or_else(|_| "\"Escape\"".to_string());
+    let focus_literal = focus_selector
+        .map(|selector| serde_json::to_string(selector).unwrap_or_else(|_| "null".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "(() => {{\n            const focusSelector = {focus};\n            const options = {{ key: {key}, code: {code}, keyCode: {key_code}, which: {key_code}, bubbles: true }};\n            const targets = [];\n            if (focusSelector) {{\n                const candidate = document.querySelector(focusSelector);\n                if (candidate) {{\n                    try {{ candidate.focus(); }} catch (err) {{}}\n                    targets.push(candidate);\n                }}\n            }}\n            const active = document.activeElement;\n            if (active && !targets.includes(active)) {{\n                targets.push(active);\n            }}\n            if (document.body && !targets.includes(document.body)) {{\n                targets.push(document.body);\n            }}\n            if (document.documentElement && !targets.includes(document.documentElement)) {{\n                targets.push(document.documentElement);\n            }}\n            targets.push(window);\n            let dispatched = false;\n            for (const target of targets) {{\n                if (!target) continue;\n                const down = new KeyboardEvent('keydown', options);\n                const up = new KeyboardEvent('keyup', options);\n                target.dispatchEvent(down);\n                target.dispatchEvent(up);\n                dispatched = true;\n            }}\n            return dispatched;\n        }})()",
+        key = key_literal,
+        code = code_literal,
+        key_code = key_code,
+        focus = focus_literal,
+    )
 }
 
 fn weather_wait_condition(url: &str) -> WaitCondition {
@@ -2513,6 +3934,556 @@ impl ToolExecutor for BrowserToolExecutor {
                 let result = self.finish_tool(&context, start, &span, result);
                 Ok(result)
             }
+            "browser.search" => {
+                let query = required_field(
+                    &context.input,
+                    "query",
+                    "Missing field",
+                    "'query' is required for browser.search",
+                )?;
+                let site_filter = context
+                    .input
+                    .get("site")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let engine_hint = context
+                    .input
+                    .get("engine")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("baidu");
+                let override_url = context
+                    .input
+                    .get("search_url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty());
+                let engines = search_engine_attempts(engine_hint);
+                let mut last_error: Option<SoulBrowserError> = None;
+                for engine in engines {
+                    let (engine_label, search_url) = build_browser_search_url(
+                        engine,
+                        &query,
+                        site_filter.as_deref(),
+                        override_url,
+                    );
+                    let selectors = collect_results_selectors(&context.input, &engine_label);
+                    let selector_summary = selectors.join(", ");
+                    let url_condition = search_url_wait_condition(&engine_label, &search_url);
+
+                    let navigate_result = self
+                        .primitives
+                        .navigate(&exec_ctx, &search_url, WaitTier::DomReady)
+                        .await;
+                    if let Err(err) = navigate_result {
+                        last_error = Some(Self::map_action_error("Browser search", err));
+                        continue;
+                    }
+
+                    let mut wait_success = None;
+                    let mut selector_error: Option<SoulBrowserError> = None;
+                    // Use shorter timeout per selector to allow trying multiple selectors
+                    let per_selector_timeout = (context.timeout_ms / selectors.len() as u64)
+                        .max(3000)
+                        .min(8000);
+                    for selector in selectors.iter() {
+                        let wait = self
+                            .primitives
+                            .wait_for(
+                                &exec_ctx,
+                                &WaitCondition::ElementVisible(AnchorDescriptor::Css(
+                                    selector.clone(),
+                                )),
+                                per_selector_timeout,
+                            )
+                            .await;
+                        match wait {
+                            Ok(_) => {
+                                wait_success = Some(selector.clone());
+                                break;
+                            }
+                            Err(ActionError::WaitTimeout(_)) => {
+                                selector_error = Some(SoulBrowserError::operation_failed(
+                                    "browser.search",
+                                    &format!(
+                                        "Search results not detected on {engine} using selector {selector}",
+                                        engine = engine_label,
+                                        selector = selector,
+                                    ),
+                                ));
+                                continue;
+                            }
+                            Err(err) => {
+                                selector_error =
+                                    Some(Self::map_action_error("Browser search wait", err));
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Some(matched_selector) = wait_success {
+                        metadata.insert("search_url".to_string(), json!(search_url.clone()));
+                        metadata.insert("search_engine".to_string(), json!(engine_label.clone()));
+                        metadata.insert(
+                            "results_selector".to_string(),
+                            json!(matched_selector.clone()),
+                        );
+                        let duration = start.elapsed().as_millis() as u64;
+                        let result = ToolExecutionResult {
+                            success: true,
+                            output: Some(serde_json::json!({
+                                "status": "search_ready",
+                                "query": query,
+                                "engine": engine_label,
+                                "url": search_url,
+                                "results_selector": matched_selector,
+                            })),
+                            error: None,
+                            duration_ms: duration,
+                            metadata,
+                        };
+                        let result = self.finish_tool(&context, start, &span, result);
+                        return Ok(result);
+                    } else {
+                        match self
+                            .primitives
+                            .wait_for(&exec_ctx, &url_condition, context.timeout_ms)
+                            .await
+                        {
+                            Ok(_) => {
+                                last_error = selector_error.or_else(|| {
+                                    Some(SoulBrowserError::operation_failed(
+                                        "browser.search",
+                                        &format!(
+                                            "Search results not detected on {engine} (selectors: {selectors})",
+                                            engine = engine_label,
+                                            selectors = selector_summary,
+                                        ),
+                                    ))
+                                });
+                            }
+                            Err(err) => {
+                                last_error =
+                                    Some(Self::map_action_error("Browser search wait", err));
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                let err = last_error.unwrap_or_else(|| {
+                    SoulBrowserError::operation_failed(
+                        "browser.search",
+                        "Search results not detected",
+                    )
+                });
+                self.record_error(&context, start, &span);
+                Err(err)
+            }
+            "browser.search.click-result" => {
+                let engine_hint = context
+                    .input
+                    .get("engine")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("baidu");
+                let engine_label = normalized_search_engine(engine_hint);
+                let selectors = auto_act_candidate_selectors(&context.input, engine_label);
+                if selectors.is_empty() {
+                    self.record_error(&context, start, &span);
+                    return Err(SoulBrowserError::validation_error(
+                        "Missing selectors",
+                        "'selectors' or known search selectors are required for browser.search.click-result",
+                    ));
+                }
+                let domains = auto_act_domain_hints(&context.input);
+                let max_candidates = context
+                    .input
+                    .get("max_candidates")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(40);
+                let max_attempts = context
+                    .input
+                    .get("max_attempts")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(4) as usize;
+                let wait = context
+                    .input
+                    .get("wait_tier")
+                    .map(|v| Self::parse_wait_tier(Some(v)))
+                    .unwrap_or(WaitTier::DomReady);
+                let wait_per_candidate_ms = context
+                    .input
+                    .get("wait_per_candidate_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(15_000)
+                    .max(1);
+                let per_attempt_wait_ms = wait_per_candidate_ms.max(1_000);
+                let mut excluded_urls: Vec<String> = Vec::new();
+                if let Some(value) = context.input.get("exclude_urls") {
+                    append_selector_value(value, &mut excluded_urls);
+                }
+                excluded_urls = excluded_urls
+                    .into_iter()
+                    .map(|url| url.trim().to_string())
+                    .filter(|url| !url.is_empty())
+                    .collect();
+                let mut last_error: Option<SoulBrowserError> = None;
+                let mut attempt_logs: Vec<Value> = Vec::new();
+                let mut last_auto_act_failure: Option<(String, Vec<String>)> = None;
+                let dom_context = match self.primitives.resolve_context(&exec_ctx).await {
+                    Ok(ctx_handle) => ctx_handle,
+                    Err(err) => {
+                        self.record_error(&context, start, &span);
+                        return Err(SoulBrowserError::internal(&format!(
+                            "Failed to resolve execution context: {}",
+                            err
+                        )));
+                    }
+                };
+
+                for attempt_index in 0..max_attempts {
+                    let attempt_number = (attempt_index + 1) as u64;
+                    let marker_value = format!("autoact-{}", Uuid::new_v4().simple());
+                    let script_config = json!({
+                        "engine": engine_label,
+                        "selectors": selectors,
+                        "domains": domains,
+                        "marker_attr": SEARCH_RESULT_ATTR,
+                        "marker_value": marker_value,
+                        "max_candidates": max_candidates,
+                        "exclude_urls": excluded_urls,
+                    });
+                    let script = auto_act_result_picker_script(&script_config)?;
+                    let script_output = match self
+                        .primitives
+                        .adapter()
+                        .evaluate_script_in_context(&dom_context, &script)
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            self.record_error(&context, start, &span);
+                            return Err(SoulBrowserError::internal(&format!(
+                                "Failed to inspect search results: {}",
+                                err
+                            )));
+                        }
+                    };
+                    let status = script_output
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if status != "target_marked" {
+                        let reason = script_output
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("未能定位可点击的搜索结果");
+                        last_error = Some(SoulBrowserError::operation_failed(
+                            "browser.search.click-result",
+                            reason,
+                        ));
+                        break;
+                    }
+                    let anchor_selector =
+                        match script_output.get("anchor_selector").and_then(Value::as_str) {
+                            Some(selector) => selector.to_string(),
+                            None => {
+                                self.record_error(&context, start, &span);
+                                return Err(SoulBrowserError::internal(
+                                    "AutoAct result picker did not return anchor_selector",
+                                ));
+                            }
+                        };
+                    let anchor = AnchorDescriptor::Css(anchor_selector.clone());
+                    let report = self
+                        .primitives
+                        .click(&exec_ctx, &anchor, wait)
+                        .await
+                        .map_err(|err| {
+                            self.record_error(&context, start, &span);
+                            Self::map_action_error("Search result click", err)
+                        })?;
+                    let selected_url = script_output
+                        .get("selected_url")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string());
+                    let matched_domain = script_output
+                        .get("matched_domain")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string());
+                    let mut waited_pattern: Option<String> = None;
+                    let patterns = post_click_patterns(
+                        selected_url.as_deref(),
+                        matched_domain.as_deref(),
+                        &domains,
+                        engine_label,
+                    );
+                    let mut wait_failed = false;
+                    if !patterns.is_empty() {
+                        for pattern in patterns.iter() {
+                            let condition = WaitCondition::UrlMatches(pattern.clone());
+                            match self
+                                .primitives
+                                .wait_for(
+                                    &exec_ctx,
+                                    &condition,
+                                    dynamic_wait_timeout(
+                                        pattern,
+                                        &domains,
+                                        engine_label,
+                                        per_attempt_wait_ms,
+                                    ),
+                                )
+                                .await
+                            {
+                                Ok(wait_report) if wait_report.ok => {
+                                    waited_pattern = Some(pattern.clone());
+                                    break;
+                                }
+                                Ok(_) => {
+                                    wait_failed = true;
+                                    continue;
+                                }
+                                Err(ActionError::WaitTimeout(_)) => {
+                                    wait_failed = true;
+                                    continue;
+                                }
+                                Err(err) => {
+                                    self.record_error(&context, start, &span);
+                                    return Err(Self::map_action_error(
+                                        "Search result stabilization",
+                                        err,
+                                    ));
+                                }
+                            }
+                        }
+                        if waited_pattern.is_none() {
+                            wait_failed = true;
+                        }
+                    }
+                    let pattern_values: Vec<Value> = patterns
+                        .iter()
+                        .map(|pattern| Value::String(pattern.clone()))
+                        .collect();
+                    attempt_logs.push(json!({
+                        "attempt_index": attempt_number,
+                        "selected_url": selected_url.clone(),
+                        "matched_domain": matched_domain.clone(),
+                        "wait_patterns": pattern_values,
+                        "wait_pattern": waited_pattern.clone(),
+                        "wait_success": !wait_failed,
+                    }));
+
+                    if !wait_failed {
+                        metadata.insert(
+                            "auto_act_engine".to_string(),
+                            Value::String(engine_label.to_string()),
+                        );
+                        metadata.insert(
+                            "auto_act_attempt_index".to_string(),
+                            Value::Number(attempt_number.into()),
+                        );
+                        let attempts_value = Value::Array(attempt_logs.clone());
+                        metadata.insert("auto_act_attempts".to_string(), attempts_value.clone());
+                        let duration = report.latency_ms.max(start.elapsed().as_millis() as u64);
+                        let result = ToolExecutionResult {
+                            success: report.ok,
+                            output: Some(serde_json::json!({
+                                "status": "result_clicked",
+                                "engine": engine_label,
+                                "anchor": anchor_selector,
+                                "target_url": script_output
+                                    .get("selected_url")
+                                    .and_then(Value::as_str),
+                                "matched_domain": script_output
+                                    .get("matched_domain")
+                                    .and_then(Value::as_str),
+                                "fallback_used": script_output
+                                    .get("fallback_used")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
+                                "candidate_count": script_output
+                                    .get("candidate_count")
+                                    .and_then(Value::as_u64),
+                                "wait_pattern": waited_pattern,
+                                "attempts": attempts_value,
+                            })),
+                            error: None,
+                            duration_ms: duration,
+                            metadata,
+                        };
+                        let result = self.finish_tool(&context, start, &span, result);
+                        return Ok(result);
+                    }
+
+                    let failure_reason = match selected_url.as_deref() {
+                        Some(url) => format!("未能加载预期站点：{}", url),
+                        None => "未能加载预期站点".to_string(),
+                    };
+                    let coded_reason = format!("[auto_act_candidates_exhausted] {failure_reason}");
+                    last_error = Some(SoulBrowserError::operation_failed(
+                        "browser.search.click-result",
+                        &coded_reason,
+                    ));
+                    if let Some(url) = selected_url {
+                        if !excluded_urls.iter().any(|existing| existing == &url) {
+                            excluded_urls.push(url);
+                        }
+                    }
+                    last_auto_act_failure = Some((coded_reason.clone(), excluded_urls.clone()));
+                }
+
+                if let Some((coded_reason, excluded_snapshot)) = last_auto_act_failure {
+                    metadata.insert(
+                        "auto_act_engine".to_string(),
+                        Value::String(engine_label.to_string()),
+                    );
+                    metadata.insert(
+                        "auto_act_attempt_index".to_string(),
+                        Value::Number((attempt_logs.len() as u64).into()),
+                    );
+                    let attempts_value = Value::Array(attempt_logs.clone());
+                    metadata.insert("auto_act_attempts".to_string(), attempts_value.clone());
+                    let excluded_value = Value::Array(
+                        excluded_snapshot
+                            .iter()
+                            .map(|url| Value::String(url.clone()))
+                            .collect(),
+                    );
+                    metadata.insert("auto_act_excluded_urls".to_string(), excluded_value.clone());
+                    let duration = start.elapsed().as_millis() as u64;
+                    let result = ToolExecutionResult {
+                        success: false,
+                        output: Some(serde_json::json!({
+                            "status": "auto_act_candidates_exhausted",
+                            "engine": engine_label,
+                            "attempts": attempts_value,
+                            "excluded_urls": excluded_value,
+                        })),
+                        error: Some(coded_reason),
+                        duration_ms: duration,
+                        metadata,
+                    };
+                    let result = self.finish_tool(&context, start, &span, result);
+                    return Ok(result);
+                }
+                self.record_error(&context, start, &span);
+                Err(last_error.unwrap_or_else(|| {
+                    SoulBrowserError::operation_failed(
+                        "browser.search.click-result",
+                        "SERP 候选项全部尝试后仍未进入权威站点",
+                    )
+                }))
+            }
+            "browser.close-modal" => {
+                let selectors = modal_selectors_from_input(&context.input);
+                let wait_tier = context
+                    .input
+                    .get("wait_tier")
+                    .map(|v| Self::parse_wait_tier(Some(v)))
+                    .unwrap_or(WaitTier::DomReady);
+                let mut clicked_selector: Option<String> = None;
+                let mut last_error: Option<String> = None;
+
+                for selector in selectors.iter() {
+                    let anchor = AnchorDescriptor::Css(selector.clone());
+                    match self.primitives.click(&exec_ctx, &anchor, wait_tier).await {
+                        Ok(report) => {
+                            if report.ok {
+                                clicked_selector = Some(selector.clone());
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            last_error = Some(err.to_string());
+                            continue;
+                        }
+                    }
+                }
+
+                let fallback_escape = context
+                    .input
+                    .get("fallback_escape")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let focus_selector = context.input.get("focus_selector").and_then(|v| v.as_str());
+                let mut escape_used = false;
+                if clicked_selector.is_none() && fallback_escape {
+                    escape_used = match self
+                        .dispatch_keyboard_event(&exec_ctx, "Escape", "Escape", 27, focus_selector)
+                        .await
+                    {
+                        Ok(dispatched) => dispatched,
+                        Err(err) => {
+                            self.record_error(&context, start, &span);
+                            return Err(err);
+                        }
+                    };
+                }
+
+                if clicked_selector.is_none() && !escape_used {
+                    self.record_error(&context, start, &span);
+                    let detail =
+                        last_error.unwrap_or_else(|| "No close controls matched".to_string());
+                    return Err(SoulBrowserError::validation_error(
+                        "未找到可关闭的弹窗",
+                        &detail,
+                    ));
+                }
+
+                let duration = start.elapsed().as_millis() as u64;
+                let result = ToolExecutionResult {
+                    success: true,
+                    output: Some(serde_json::json!({
+                        "status": "modal_closed",
+                        "clicked_selector": clicked_selector,
+                        "escape_used": escape_used,
+                    })),
+                    error: None,
+                    duration_ms: duration,
+                    metadata,
+                };
+                let result = self.finish_tool(&context, start, &span, result);
+                Ok(result)
+            }
+            "browser.send-esc" => {
+                let focus_selector = context.input.get("focus_selector").and_then(|v| v.as_str());
+                let count = context
+                    .input
+                    .get("count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1)
+                    .clamp(1, 5) as usize;
+                let mut dispatched = false;
+                for _ in 0..count {
+                    let emitted = match self
+                        .dispatch_keyboard_event(&exec_ctx, "Escape", "Escape", 27, focus_selector)
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            self.record_error(&context, start, &span);
+                            return Err(err);
+                        }
+                    };
+                    dispatched |= emitted;
+                }
+                let duration = start.elapsed().as_millis() as u64;
+                let result = ToolExecutionResult {
+                    success: true,
+                    output: Some(serde_json::json!({
+                        "status": "escape_dispatched",
+                        "count": count,
+                        "dispatched": dispatched,
+                    })),
+                    error: None,
+                    duration_ms: duration,
+                    metadata,
+                };
+                let result = self.finish_tool(&context, start, &span, result);
+                Ok(result)
+            }
             "weather.search" => {
                 let query = required_field(
                     &context.input,
@@ -2833,6 +4804,104 @@ impl ToolExecutor for BrowserToolExecutor {
                     }
                 }
             }
+            "manual.pointer" => {
+                let route = match context.route.as_ref() {
+                    Some(route) => route,
+                    None => {
+                        let duration = start.elapsed().as_millis() as u64;
+                        let result = ToolExecutionResult {
+                            success: false,
+                            output: None,
+                            error: Some("manual.pointer requires an execution route".to_string()),
+                            duration_ms: duration,
+                            metadata,
+                        };
+                        let result = self.finish_tool(&context, start, &span, result);
+                        return Ok(result);
+                    }
+                };
+
+                let action = context
+                    .input
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("click")
+                    .to_ascii_lowercase();
+                let x = context
+                    .input
+                    .get("x")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let y = context
+                    .input
+                    .get("y")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let outcome = match action.as_str() {
+                    "click" => {
+                        let button = context
+                            .input
+                            .get("button")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("left");
+                        self.pointer_click(route, x, y, button).await
+                    }
+                    "scroll" => {
+                        let delta_x = context
+                            .input
+                            .get("delta_x")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let delta_y = context
+                            .input
+                            .get("delta_y")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        self.pointer_scroll(route, x, y, delta_x, delta_y).await
+                    }
+                    "type" => {
+                        let Some(text) = context.input.get("text").and_then(|v| v.as_str()) else {
+                            return Ok(self.finish_tool(
+                                &context,
+                                start,
+                                &span,
+                                ToolExecutionResult {
+                                    success: false,
+                                    output: None,
+                                    error: Some("typing requires 'text'".to_string()),
+                                    duration_ms: start.elapsed().as_millis() as u64,
+                                    metadata,
+                                },
+                            ));
+                        };
+                        self.pointer_type(route, text).await
+                    }
+                    other => Err(SoulBrowserError::validation_error(
+                        "Unsupported pointer action",
+                        &format!("action '{}' is not supported", other),
+                    )),
+                };
+
+                let (success, error_msg) = match outcome {
+                    Ok(_) => (true, None),
+                    Err(err) => (false, Some(err.to_string())),
+                };
+
+                let result = ToolExecutionResult {
+                    success,
+                    output: Some(serde_json::json!({
+                        "status": if success { "dispatched" } else { "failed" },
+                        "action": action,
+                        "x": x,
+                        "y": y,
+                    })),
+                    error: error_msg,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    metadata,
+                };
+                let result = self.finish_tool(&context, start, &span, result);
+                Ok(result)
+            }
             "complete-task" => {
                 let task_id = context
                     .input
@@ -2894,8 +4963,21 @@ impl ToolExecutor for BrowserToolExecutor {
                     .execute_observation_tool(&context, start, &span, exec_ctx)
                     .await;
             }
+            "market.quote.fetch" => {
+                return self
+                    .execute_quote_fetch_tool(&context, start, &span, exec_ctx)
+                    .await;
+            }
             tool if tool.starts_with("data.parse.") => {
                 return self.execute_parse_tool(&context, start, &span, tool).await;
+            }
+            "data.validate.metal_price" => {
+                return self
+                    .execute_metal_price_validation(&context, start, &span)
+                    .await;
+            }
+            "data.validate-target" => {
+                return self.execute_target_validation(&context, start, &span).await;
             }
             "data.deliver.structured" => {
                 return self.execute_deliver_tool(&context, start, &span).await;
@@ -2939,18 +5021,201 @@ fn parse_generic_observation(observation: &Value, schema: &str) -> Value {
     })
 }
 
+fn canonical_observation<'a>(value: &'a Value) -> &'a Value {
+    value.get("data").unwrap_or(value)
+}
+
+fn normalize_keywords(values: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|existing: &String| existing.as_str().eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
+fn normalize_domains(values: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        if let Some(domain) = normalize_domain_input(value) {
+            if !out.iter().any(|existing| existing == &domain) {
+                out.push(domain);
+            }
+        }
+    }
+    out
+}
+
+fn normalize_domain_input(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains("://") {
+        Url::parse(trimmed)
+            .ok()
+            .and_then(|parsed| parsed.domain().map(|domain| domain.to_ascii_lowercase()))
+    } else {
+        Some(trimmed.trim_start_matches("www.").to_ascii_lowercase())
+    }
+}
+
+fn domain_matches_allowed(actual: &str, allowed: &str) -> bool {
+    if actual == allowed {
+        return true;
+    }
+    actual
+        .strip_suffix(allowed)
+        .map(|prefix| prefix.ends_with('.'))
+        .unwrap_or(false)
+}
+
+fn observation_text_blob(value: &Value) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "title",
+        "identity",
+        "hero_text",
+        "description",
+        "text_sample",
+    ] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            if !text.trim().is_empty() {
+                parts.push(text.trim().to_string());
+            }
+        }
+    }
+    if let Some(meta) = value.get("meta").and_then(Value::as_object) {
+        for entry in meta.values() {
+            if let Some(text) = entry.as_str() {
+                if !text.trim().is_empty() {
+                    parts.push(text.trim().to_string());
+                }
+            }
+        }
+    }
+    if let Some(headings) = value.get("headings").and_then(Value::as_array) {
+        for heading in headings {
+            if let Some(text) = heading.get("text").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    parts.push(text.trim().to_string());
+                }
+            }
+        }
+    }
+    parts.join(" ").to_ascii_lowercase()
+}
+
+fn keyword_matches(haystack: &str, keyword: &str) -> bool {
+    if keyword.trim().is_empty() {
+        return false;
+    }
+    let lower = keyword.to_ascii_lowercase();
+    haystack.contains(&lower)
+}
+
+fn extract_status_code(value: &Value) -> Option<u16> {
+    for key in ["status_code", "status", "http_status"] {
+        if let Some(code) = value.get(key).and_then(Value::as_i64) {
+            return Some(code as u16);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use axum::{response::Html, routing::get, Router};
     use cdp_adapter::{
         event_bus, AdapterError, AdapterErrorKind, CdpAdapter, CdpConfig, CdpTransport,
         CommandTarget, PageId as AdapterPageId, SessionId as AdapterSessionId, TransportEvent,
     };
     use serde_json::json;
-    use std::sync::Arc;
+    use soulbrowser_core_types::{ExecRoute, FrameId, PageId, SessionId as RouteSessionId};
+    use std::{env, sync::Arc};
+    use tokio::net::TcpListener;
     use tokio::sync::{Mutex, OnceCell};
     use uuid::Uuid;
+
+    static FIXTURE_SERVER: OnceCell<String> = OnceCell::const_new();
+    const TOOL_FIXTURE_HTML: &str = r#"<!DOCTYPE html>
+<html lang='zh-CN'>
+  <head>
+    <meta charset='utf-8'>
+    <title>Tool Fixture</title>
+  </head>
+  <body>
+    <div id='app'>Fixture ready</div>
+    <form>
+      <label for='country'>Country</label>
+      <select id='country' name='country'>
+        <option value='cn'>China</option>
+        <option value='us'>United States</option>
+        <option value='jp'>Japan</option>
+      </select>
+    </form>
+  </body>
+</html>"#;
+
+    async fn ensure_fixture_url() -> String {
+        if let Ok(url) = env::var("SOULBROWSER_TOOL_FIXTURE_URL") {
+            return url;
+        }
+        FIXTURE_SERVER
+            .get_or_init(|| async {
+                let router = Router::new()
+                    .route("/", get(serve_fixture))
+                    .route("/tool_fixture.html", get(serve_fixture));
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind fixture listener");
+                let addr = listener.local_addr().expect("fixture addr");
+                tokio::spawn(async move {
+                    if let Err(err) = axum::serve(listener, router).await {
+                        tracing::warn!(target = "tests", ?err, "fixture server stopped");
+                    }
+                });
+                format!("http://{addr}/tool_fixture.html")
+            })
+            .await
+            .clone()
+    }
+
+    async fn serve_fixture() -> Html<&'static str> {
+        Html(TOOL_FIXTURE_HTML)
+    }
+
+    fn test_route() -> ExecRoute {
+        ExecRoute::new(
+            RouteSessionId(Uuid::new_v4().to_string()),
+            PageId(Uuid::new_v4().to_string()),
+            FrameId(Uuid::new_v4().to_string()),
+        )
+    }
+
+    async fn navigate_to_fixture(executor: &BrowserToolExecutor, route: &ExecRoute, url: &str) {
+        let context = ToolExecutionContext {
+            tool_id: "navigate-to-url".to_string(),
+            tenant_id: "test".to_string(),
+            subject_id: "user-1".to_string(),
+            input: serde_json::json!({"url": url}),
+            timeout_ms: 5_000,
+            trace_id: uuid::Uuid::new_v4().to_string(),
+            route: Some(route.clone()),
+        };
+        executor.execute(context).await.unwrap();
+    }
 
     #[tokio::test]
     async fn test_tool_manager() {
@@ -2996,18 +5261,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn post_click_patterns_prefer_guardrail_domains_on_baidu_redirects() {
+        let patterns = super::post_click_patterns(
+            Some("https://www.baidu.com/link?url=https%3A%2F%2Fexample.com%2Finfo"),
+            None,
+            &vec!["example.com".to_string()],
+            "baidu",
+        );
+        assert!(patterns
+            .first()
+            .expect("patterns present")
+            .contains(r"example\.com"));
+        assert!(patterns
+            .iter()
+            .any(|pattern| pattern.contains(r"baidu\.com")));
+    }
+
     #[tokio::test]
     async fn test_tool_executor() {
         let executor = BrowserToolExecutor::new();
+        let fixture_url = ensure_fixture_url().await;
+        let route = test_route();
+        navigate_to_fixture(&executor, &route, &fixture_url).await;
 
         let context = ToolExecutionContext {
             tool_id: "navigate-to-url".to_string(),
             tenant_id: "test".to_string(),
             subject_id: "user-1".to_string(),
-            input: serde_json::json!({"url": "https://example.com"}),
+            input: serde_json::json!({"url": fixture_url}),
             timeout_ms: 5000,
             trace_id: uuid::Uuid::new_v4().to_string(),
-            route: None,
+            route: Some(route.clone()),
         };
 
         let result = executor.execute(context).await.unwrap();
@@ -3025,7 +5310,7 @@ mod tests {
             }),
             timeout_ms: 5000,
             trace_id: uuid::Uuid::new_v4().to_string(),
-            route: None,
+            route: Some(route.clone()),
         };
 
         let select_result = executor.execute(select_ctx).await.unwrap();
@@ -3200,6 +5485,9 @@ mod tests {
     #[tokio::test]
     async fn test_wait_tools_produce_reports() {
         let executor = BrowserToolExecutor::new();
+        let fixture_url = ensure_fixture_url().await;
+        let route = test_route();
+        navigate_to_fixture(&executor, &route, &fixture_url).await;
 
         let element_wait = ToolExecutionContext {
             tool_id: "wait-for-element".to_string(),
@@ -3212,7 +5500,7 @@ mod tests {
             }),
             timeout_ms: 2_000,
             trace_id: uuid::Uuid::new_v4().to_string(),
-            route: None,
+            route: Some(route.clone()),
         };
 
         let element_result = executor.execute(element_wait).await.unwrap();
@@ -3232,7 +5520,7 @@ mod tests {
             }),
             timeout_ms: 1_000,
             trace_id: uuid::Uuid::new_v4().to_string(),
-            route: None,
+            route: Some(route.clone()),
         };
 
         let condition_result = executor.execute(condition_wait).await.unwrap();
@@ -3262,5 +5550,25 @@ mod tests {
         let output = result.output.expect("missing retrieve-history output");
         assert_eq!(output["status"].as_str(), Some("history"));
         assert_eq!(output["limit"].as_u64(), Some(3));
+    }
+    #[test]
+    fn convert_eastmoney_api_response() {
+        let payload = json!({
+            "data": {
+                "diff": [
+                    {"f14": "沪铜主连", "f2": 60590, "f4": -120, "f3": -0.2},
+                    {"f14": "伦铜", "f2": 8450, "f4": 15, "f3": 0.18}
+                ]
+            }
+        });
+        let cfg = ApiQuoteConfig {
+            url: "https://example.com".to_string(),
+            ..Default::default()
+        };
+        let (tables, key_values) =
+            BrowserToolExecutor::convert_api_response(&payload, &cfg, Some(10));
+        assert_eq!(tables.len(), 1);
+        assert_eq!(key_values.len(), 1);
+        assert_eq!(key_values[0]["label"], "沪铜主连");
     }
 }

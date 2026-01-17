@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+use serde_json::Value;
+
 use super::types::{LiveFramePayload, LiveOverlayEntry, SessionSnapshot, SessionStatus};
 
 #[derive(Clone, Debug, Serialize)]
@@ -17,5 +19,9 @@ pub enum SessionLiveEvent {
     },
     Overlay {
         overlay: LiveOverlayEntry,
+    },
+    MessageState {
+        session_id: String,
+        state: Value,
     },
 }

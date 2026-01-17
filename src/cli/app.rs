@@ -8,7 +8,7 @@ use super::env::CliArgs;
 use super::runtime::{
     apply_runtime_overrides, init_logging, load_config, load_local_env_overrides, LoadedConfig,
 };
-use soulbrowser_kernel::metrics;
+use soulbrowser_kernel::{metrics, telemetry};
 
 pub async fn run() -> Result<()> {
     load_local_env_overrides();
@@ -21,8 +21,10 @@ pub async fn run() -> Result<()> {
 
     let loaded_config = load_config(cli.config.as_ref()).await?;
     apply_runtime_overrides(&loaded_config.config);
+    telemetry::configure_from_env();
     let LoadedConfig { config, path } = loaded_config;
     let cli_context = CliContext::new(config, path, cli.metrics_port);
+    cli_context.init_telemetry().await?;
 
     match dispatch(&cli, &cli_context).await {
         Ok(()) => {

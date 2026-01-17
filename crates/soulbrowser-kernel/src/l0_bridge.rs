@@ -18,6 +18,7 @@ use permissions_broker::{
 use url::Url;
 
 use soulbrowser_registry::{metrics as registry_metrics, Registry, RegistryImpl};
+use soulbrowser_scheduler::{RouteEvent, RouteEventSender};
 use soulbrowser_state_center::{RegistryAction, RegistryEvent, StateCenter, StateEvent};
 
 use crate::errors::SoulBrowserError;
@@ -60,6 +61,7 @@ pub struct L0Bridge {
     page_sessions: Arc<DashMap<PageId, SessionId>>,
     #[allow(dead_code)]
     state_center: Arc<dyn StateCenter + Send + Sync>,
+    route_events: Option<Arc<RouteEventSender>>,
 }
 
 const PERMISSIONS_POLICY_PATH: &str = "config/permissions/policy.json";
@@ -70,6 +72,7 @@ impl L0Bridge {
         registry: Arc<RegistryImpl>,
         state_center: Arc<dyn StateCenter + Send + Sync>,
         default_session: SessionId,
+        route_events: Option<Arc<RouteEventSender>>,
     ) -> (Self, L0Handles) {
         let mapping: Arc<DashMap<cdp_adapter::ids::PageId, PageId>> = Arc::new(DashMap::new());
         let tap_mapping: Arc<DashMap<network_tap_light::PageId, PageId>> = Arc::new(DashMap::new());
@@ -97,6 +100,7 @@ impl L0Bridge {
         let origins_for_task = Arc::clone(&page_origins);
         let page_sessions_for_task = Arc::clone(&page_sessions);
         let state_center_for_task = Arc::clone(&state_center);
+        let route_events_for_task = route_events.clone();
 
         let cdp_task = tokio::spawn(async move {
             while let Ok(event) = cdp_rx.recv().await {
@@ -112,6 +116,7 @@ impl L0Bridge {
                     &origins_for_task,
                     &page_sessions_for_task,
                     &state_center_for_task,
+                    &route_events_for_task,
                     event,
                 )
                 .await
@@ -173,6 +178,7 @@ impl L0Bridge {
                 page_origins: Arc::clone(&page_origins),
                 page_sessions: Arc::clone(&page_sessions),
                 state_center: Arc::clone(&state_center),
+                route_events,
             },
             L0Handles {
                 cdp_sender,
@@ -243,6 +249,32 @@ fn extract_origin(url: &str) -> Option<String> {
     }
 }
 
+fn page_session_or_default(
+    page_sessions: &DashMap<PageId, SessionId>,
+    page: &PageId,
+    fallback: &SessionId,
+) -> SessionId {
+    page_sessions
+        .get(page)
+        .map(|entry| entry.clone())
+        .unwrap_or_else(|| fallback.clone())
+}
+
+fn emit_route_event(
+    route_events: &Option<Arc<RouteEventSender>>,
+    session: SessionId,
+    page: PageId,
+    frame: Option<FrameId>,
+) {
+    if let Some(sender) = route_events {
+        let _ = sender.send(RouteEvent {
+            session,
+            page,
+            frame,
+        });
+    }
+}
+
 fn should_apply_permissions(
     page_origins: &DashMap<PageId, String>,
     page: &PageId,
@@ -266,6 +298,7 @@ async fn handle_cdp_event(
     page_origins: &Arc<DashMap<PageId, String>>,
     page_sessions: &Arc<DashMap<PageId, SessionId>>,
     state_center: &Arc<dyn StateCenter + Send + Sync>,
+    route_events: &Option<Arc<RouteEventSender>>,
     event: RawEvent,
 ) -> Result<(), SoulBrowserError> {
     match event {
@@ -273,18 +306,30 @@ async fn handle_cdp_event(
             page,
             frame,
             parent,
+            opener,
             phase,
             ..
         } => {
             let phase_lower = phase.to_ascii_lowercase();
             match phase_lower.as_str() {
                 "opened" | "open" => {
+                    let mut opened_page: Option<(SessionId, PageId)> = None;
                     let pid_value = if let Some(entry) = mapping.get(&page) {
                         entry.clone()
                     } else {
+                        let session_to_use = opener
+                            .and_then(|opener_page| {
+                                mapping.get(&opener_page).map(|entry| entry.clone())
+                            })
+                            .and_then(|parent_pid| {
+                                page_sessions
+                                    .get(&parent_pid)
+                                    .map(|entry| entry.value().clone())
+                            })
+                            .unwrap_or_else(|| default_session.clone());
                         let pid =
                             registry
-                                .page_open(default_session.clone())
+                                .page_open(session_to_use.clone())
                                 .await
                                 .map_err(|err| {
                                     SoulBrowserError::internal(&format!(
@@ -298,12 +343,16 @@ async fn handle_cdp_event(
                         }
                         tap_mapping.insert(tap_page, pid.clone());
                         cdp_to_tap.insert(page, tap_page);
-                        page_sessions.insert(pid.clone(), default_session.clone());
+                        page_sessions.insert(pid.clone(), session_to_use.clone());
+                        opened_page = Some((session_to_use, pid.clone()));
                         pid
                     };
                     registry.page_focus(pid_value).await.map_err(|err| {
                         SoulBrowserError::internal(&format!("page focus failed: {err}"))
                     })?;
+                    if let Some((session, page)) = opened_page {
+                        emit_route_event(route_events, session, page, None);
+                    }
                 }
                 "closed" | "close" => {
                     if let Some((cdp_page, pid)) = mapping.remove(&page) {
@@ -318,37 +367,58 @@ async fn handle_cdp_event(
                     }
                 }
                 "focus" | "focused" => {
-                    if let Some(pid) = mapping.get(&page) {
+                    if let Some(pid_entry) = mapping.get(&page) {
+                        let pid_value = pid_entry.clone();
                         if let Some(frame_id) =
                             frame.and_then(|fid| frames.get(&fid).map(|entry| entry.clone()))
                         {
                             registry
-                                .frame_focus(pid.clone(), frame_id)
+                                .frame_focus(pid_value.clone(), frame_id.clone())
                                 .await
                                 .map_err(|err| {
                                     SoulBrowserError::internal(&format!(
                                         "frame focus failed: {err}"
                                     ))
                                 })?;
+                            let session =
+                                page_session_or_default(page_sessions, &pid_value, default_session);
+                            emit_route_event(route_events, session, pid_value, Some(frame_id));
                         } else {
-                            registry.page_focus(pid.clone()).await.map_err(|err| {
-                                SoulBrowserError::internal(&format!("page focus failed: {err}"))
-                            })?;
+                            registry
+                                .page_focus(pid_value.clone())
+                                .await
+                                .map_err(|err| {
+                                    SoulBrowserError::internal(&format!("page focus failed: {err}"))
+                                })?;
+                            let session =
+                                page_session_or_default(page_sessions, &pid_value, default_session);
+                            emit_route_event(route_events, session, pid_value, None);
                         }
                     }
                 }
                 "frame_attached" => {
-                    if let (Some(pid), Some(fid)) = (mapping.get(&page), frame) {
+                    if let (Some(pid_entry), Some(fid)) = (mapping.get(&page), frame) {
+                        let pid_value = pid_entry.clone();
                         let parent_frame = parent.and_then(|parent_fid| {
                             frames.get(&parent_fid).map(|entry| entry.clone())
                         });
                         let is_main = parent_frame.is_none();
                         let new_frame = registry
-                            .frame_attached(&pid, parent_frame.clone(), is_main)
+                            .frame_attached(&pid_value, parent_frame.clone(), is_main)
                             .map_err(|err| {
                                 SoulBrowserError::internal(&format!("frame attach failed: {err}"))
                             })?;
-                        frames.insert(fid, new_frame);
+                        frames.insert(fid, new_frame.clone());
+                        if is_main {
+                            let session =
+                                page_session_or_default(page_sessions, &pid_value, default_session);
+                            emit_route_event(
+                                route_events,
+                                session,
+                                pid_value.clone(),
+                                Some(new_frame),
+                            );
+                        }
                     }
                 }
                 "frame_detached" => {

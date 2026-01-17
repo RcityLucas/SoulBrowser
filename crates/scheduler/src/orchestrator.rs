@@ -1,6 +1,9 @@
 use std::{sync::Arc, time::Instant};
 
-use soulbrowser_core_types::{ActionId, ExecRoute, SoulError};
+use dashmap::DashMap;
+use soulbrowser_core_types::{
+    ActionId, ExecRoute, FrameId, PageId, RoutingHint, SessionId, SoulError,
+};
 use soulbrowser_registry::Registry;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -10,6 +13,7 @@ use tracing::{info, warn};
 use crate::executor::ToolExecutor;
 use crate::metrics;
 use crate::model::{DispatchOutput, DispatchRequest, DispatchTimeline, SubmitHandle};
+use crate::route_events::{RouteEventReceiver, RouteEventSender};
 use crate::runtime::{ReadyJob, SchedulerRuntime};
 use serde_json::Value;
 use soulbrowser_state_center::{DispatchEvent, StateCenter, StateEvent};
@@ -24,6 +28,14 @@ where
     executor: Arc<E>,
     state_center: Arc<dyn StateCenter>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    route_overrides: Arc<DashMap<SessionId, RouteOverride>>,
+    route_receiver: Option<Arc<Mutex<RouteEventReceiver>>>,
+}
+
+#[derive(Clone, Debug)]
+struct RouteOverride {
+    page: PageId,
+    frame: Option<FrameId>,
 }
 
 impl<R, E> Orchestrator<R, E>
@@ -31,18 +43,63 @@ where
     R: Registry + Send + Sync + 'static,
     E: ToolExecutor + Send + Sync + 'static,
 {
+    async fn drain_route_events(&self) {
+        let Some(receiver) = &self.route_receiver else {
+            return;
+        };
+        let mut rx = receiver.lock().await;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => {
+                    self.route_overrides.insert(
+                        event.session.clone(),
+                        RouteOverride {
+                            page: event.page.clone(),
+                            frame: event.frame.clone(),
+                        },
+                    );
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Closed
+                    | tokio::sync::broadcast::error::TryRecvError::Empty,
+                ) => break,
+            }
+        }
+    }
+
+    fn apply_route_override(&self, hint: &mut Option<RoutingHint>) {
+        let Some(route_hint) = hint.as_mut() else {
+            return;
+        };
+        let Some(session) = route_hint.session.clone() else {
+            return;
+        };
+        if let Some((_, override_entry)) = self.route_overrides.remove(&session) {
+            route_hint.page = Some(override_entry.page);
+            route_hint.frame = override_entry.frame;
+        }
+    }
+
     pub fn new(
         registry: Arc<R>,
         runtime: Arc<SchedulerRuntime>,
         executor: Arc<E>,
         state_center: Arc<dyn StateCenter>,
+        route_events: Option<Arc<RouteEventSender>>,
     ) -> Self {
+        let route_overrides = Arc::new(DashMap::new());
+        let route_receiver = route_events.map(|sender| Arc::new(Mutex::new(sender.subscribe())));
         Self {
             registry,
             runtime,
             executor,
             state_center,
             worker: Mutex::new(None),
+            route_overrides,
+            route_receiver,
         }
     }
 
@@ -74,7 +131,9 @@ where
 
     pub async fn submit(&self, request: DispatchRequest) -> Result<SubmitHandle, SoulError> {
         self.spawn().await;
-        let hint = request.routing_hint.clone();
+        let mut hint = request.routing_hint.clone();
+        self.drain_route_events().await;
+        self.apply_route_override(&mut hint);
         let route = self.registry.route_resolve(hint).await?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let tool_name = request.tool_call.tool.clone();
@@ -399,6 +458,7 @@ mod tests {
     use super::*;
     use crate::executor::{ToolDispatchResult, ToolExecutor};
     use crate::model::{CallOptions, DispatchRequest, Priority, SchedulerConfig};
+    use crate::route_events::{route_event_channel, RouteEvent};
     use soulbrowser_core_types::{ExecRoute, FrameId, PageId, RoutingHint, SessionId, ToolCall};
     use soulbrowser_registry::SessionCtx;
     use soulbrowser_state_center::{InMemoryStateCenter, NoopStateCenter, StateCenter, StateEvent};
@@ -507,6 +567,7 @@ mod tests {
             runtime.clone(),
             executor.clone(),
             state_center_dyn,
+            None,
         );
 
         let handle = orchestrator.submit(mock_request()).await.unwrap();
@@ -543,6 +604,7 @@ mod tests {
             runtime.clone(),
             executor,
             state_center_dyn,
+            None,
         );
 
         let handle = orchestrator.submit(mock_request()).await.unwrap();
@@ -587,6 +649,7 @@ mod tests {
             runtime.clone(),
             executor,
             state_center_dyn,
+            None,
         );
 
         let handle = orchestrator.submit(mock_request()).await.unwrap();
@@ -614,6 +677,7 @@ mod tests {
             runtime.clone(),
             executor.clone(),
             state_center,
+            None,
         );
 
         let handle = orchestrator.submit(mock_request()).await.unwrap();
@@ -631,5 +695,54 @@ mod tests {
 
         let executions = executor.executions.lock().await;
         assert_eq!(*executions, 1);
+    }
+
+    #[tokio::test]
+    async fn routing_hint_overrides_when_route_event_received() {
+        let registry = Arc::new(MockRegistry {
+            route: mock_route(),
+            calls: Arc::new(AsyncMutex::new(Vec::new())),
+        });
+        let runtime = Arc::new(SchedulerRuntime::new(SchedulerConfig::default()));
+        let executor = Arc::new(MockExecutor {
+            executions: Arc::new(AsyncMutex::new(0)),
+        });
+        let state_center: Arc<dyn StateCenter> = NoopStateCenter::new();
+        let (route_tx, _route_rx) = route_event_channel(8);
+        let route_bus = Arc::new(route_tx);
+        let orchestrator = Orchestrator::new(
+            registry.clone(),
+            runtime.clone(),
+            executor,
+            state_center,
+            Some(route_bus.clone()),
+        );
+
+        let session = registry.route.session.clone();
+        let new_page = PageId::new();
+        let new_frame = FrameId::new();
+        route_bus
+            .send(RouteEvent {
+                session: session.clone(),
+                page: new_page.clone(),
+                frame: Some(new_frame.clone()),
+            })
+            .unwrap();
+
+        let mut request = mock_request();
+        if let Some(ref mut hint) = request.routing_hint {
+            hint.session = Some(session);
+            hint.page = Some(PageId::new());
+        }
+
+        let handle = orchestrator.submit(request).await.unwrap();
+        orchestrator.spawn().await;
+        handle.receiver.await.unwrap();
+
+        let calls = registry.calls.lock().await;
+        let recorded = calls.last().and_then(|hint| hint.clone());
+        let recorded_hint = recorded.unwrap();
+        assert_eq!(recorded_hint.page, Some(new_page));
+        assert_eq!(recorded_hint.frame, Some(new_frame));
     }
 }

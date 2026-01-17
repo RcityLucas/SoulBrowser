@@ -17,7 +17,9 @@ use super::run::cmd_run;
 use super::scheduler::cmd_scheduler;
 use super::serve::cmd_serve;
 use super::start::cmd_start;
+use super::telemetry::cmd_telemetry;
 use super::timeline::cmd_timeline;
+use super::tools::cmd_tools;
 use crate::cli::commands::Commands;
 use crate::cli::context::CliContext;
 use anyhow::Result;
@@ -43,5 +45,7 @@ pub async fn dispatch(cli: &CliArgs, ctx: &CliContext) -> Result<()> {
         Commands::Demo(args) => cmd_demo_real(args).await,
         Commands::Perceive(args) => cmd_perceive(args, ctx).await,
         Commands::Serve(args) => cmd_serve(args, ctx.metrics_port(), ctx.config().clone()).await,
+        Commands::Tools(args) => cmd_tools(args, ctx).await,
+        Commands::Telemetry(args) => cmd_telemetry(args, ctx).await,
     }
 }

@@ -1,7 +1,7 @@
 use agent_core::{AgentIntentKind, AgentPlan, AgentRequest};
 use serde_json::Value;
 
-const CAPABILITY_OVERVIEW: &str = "- Browser automation core: navigate, click, type_text (with submit), select, scroll, wait (visible/hidden/network idle).\n- Observation -> Parse -> Deliver pipeline is enforced automatically; structured outputs always flow through `data.extract-site` -> `data.parse.*` -> `data.deliver.structured`.\n- Deterministic parsers available: generic observation, market info, news brief, GitHub repositories, Twitter feed, Facebook feed, LinkedIn profile, Hacker News feed.\n- GitHub repo parsing can auto-fill the username based on recent navigation/current URL if planner forgets.\n- Planner may insert `agent.note` for inline reporting when needed.\n- The executor automatically normalizes tool aliases (e.g., browser.*) and enforces sensible waits/timeouts.\n";
+const CAPABILITY_OVERVIEW: &str = "- Browser automation core: navigate, click, type_text (with submit), select, scroll, wait (visible/hidden/network idle).\n- Observation -> Parse -> Deliver pipeline is enforced automatically; structured outputs always flow through `data.extract-site` -> `data.parse.*` -> `data.deliver.structured`.\n- Deterministic parsers available: generic observation, market info, news brief, GitHub repositories, Twitter feed, Facebook feed, LinkedIn profile, Hacker News feed.\n- GitHub repo parsing can auto-fill the username based on recent navigation/current URL if planner forgets.\n- Planner may insert `agent.note` for inline reporting when needed.\n- The executor automatically normalizes tool aliases (e.g., browser.*) and enforces sensible waits/timeouts.\n- BrowserUse telemetry expects every step to specify `thinking`, `evaluation`, `memory`, `next_goal`, and DOM actions must be followed by `agent.evaluate` so the UI can render Evaluate/Next Goal cards.\n";
 
 const STRUCTURED_SCHEMA_GUIDE: &str = "- data.parse.generic -> schema=generic_observation_v1 (default when summarizing DOM observations).\n- data.parse.market_info -> schema=market_info_v1.\n- data.parse.news_brief -> schema=news_brief_v1.\n- data.parse.weather -> schema=weather_report_v1.\n- data.parse.github-repo / github.extract-repo -> schema=github_repos_v1.\n- data.parse.twitter-feed -> schema=twitter_feed_v1.\n- data.parse.facebook-feed -> schema=facebook_feed_v1.\n- data.parse.linkedin-profile -> schema=linkedin_profile_v1.\n- data.parse.hackernews-feed -> schema=hackernews_feed_v1.\n";
 
@@ -15,6 +15,8 @@ const DELIVER_PAYLOAD_TEMPLATE: &str = r#"{
   }
 }"#;
 
+const BROWSERUSE_TIMELINE_GUIDE: &str = "- `thinking`: concise reasoning describing why this action is needed right now.\n- `evaluation`: natural-language summary of what success looks like and how to verify it (used by agent.evaluate).\n- `memory`: critical facts to carry forward (e.g., detected symbols, captcha states, URLs, popup outcomes).\n- `next_goal`: the immediate objective after this step finishes, enabling adaptive replanning.\n";
+
 pub struct PromptBuilder;
 
 impl PromptBuilder {
@@ -23,7 +25,7 @@ impl PromptBuilder {
     }
 
     pub fn system_prompt(&self) -> &'static str {
-        "You are SoulBrowser's planning strategist. Always read the structured channels (e.g., <initial_user_request>, <follow_up_user_request>, <agent_history>, <browser_state>, <browser_vision>, <read_state>, <file_system>, <todo_md>) before reasoning. Generate deterministic JSON plans for web automation that turn those requirements into concrete actions."
+        "You are SoulBrowser's BrowserUse-style planning strategist. Always read the structured channels (e.g., <initial_user_request>, <follow_up_user_request>, <agent_history>, <browser_state>, <browser_vision>, <read_state>, <file_system>, <todo_md>) before reasoning. Generate deterministic JSON plans for web automation using the BrowserUse thinking/evaluation/memory/next_goal timeline so executors can follow, critique, and replan each action."
     }
 
     pub fn build_user_prompt(
@@ -67,6 +69,12 @@ impl PromptBuilder {
                     .to_string(),
             );
         }
+        if request.intent.is_market_intent() {
+            sections.push(
+                "Market intents must enforce navigate -> data.validate-target (domain + keyword check) -> data.parse.metal_price -> data.deliver.structured (metal_price_v1)."
+                    .to_string(),
+            );
+        }
         if !request.intent.required_outputs.is_empty() {
             let outputs = request
                 .intent
@@ -89,6 +97,10 @@ impl PromptBuilder {
         sections.push(format!(
             "Structured schema map (choose exact IDs, do not invent new schemas):\n{}",
             STRUCTURED_SCHEMA_GUIDE
+        ));
+        sections.push(format!(
+            "BrowserUse timeline metadata requirements:\n{}",
+            BROWSERUSE_TIMELINE_GUIDE
         ));
         sections.push(format!(
             "data.deliver.structured payload template (missing schema/artifact_label/filename/source_step_id => plan rejected automatically):\n{}",
@@ -126,12 +138,27 @@ impl PromptBuilder {
         {
             sections.push(history_block.to_string());
         }
+        if let Some(task_prompt) = request
+            .metadata
+            .get("agent_task_prompt")
+            .and_then(Value::as_str)
+        {
+            sections.push(task_prompt.to_string());
+        }
         if let Some(helpers) = request
             .metadata
             .get("registry_helper_prompt")
             .and_then(Value::as_str)
         {
             sections.push(format!("Registry helper actions:\n{}", helpers));
+        }
+
+        if let Some(tools) = request
+            .metadata
+            .get("tool_registry_prompt")
+            .and_then(Value::as_str)
+        {
+            sections.push(format!("Available custom tools:\n{}", tools));
         }
 
         if let Some(browser_state) = browser_state_section(request) {
@@ -162,7 +189,7 @@ impl PromptBuilder {
         }
 
         format!(
-            "{header}\n\nProduce JSON following this schema: {schema}\nRules:\n1. Always emit valid JSON without markdown.\n2. Use css selectors prefixed with 'css=' when possible.\n3. Supported actions: navigate, click, type_text, select, scroll, wait.\n4. Use wait='idle' for network idle waits.\n5. Provide rationale and risks arrays even if empty.\n6. When structured outputs are requested, include explicit navigate -> observe -> act -> parse -> deliver steps covering data acquisition, parsing, and persistence.\n7. Parsing steps must cite deterministic parsers and final steps must mention the structured schema/screenshot that will be produced.\n8. Custom tool allowlist (anything else will be rejected): data.extract-site (observation), data.parse.market_info, data.parse.news_brief, data.parse.twitter-feed, data.parse.facebook-feed, data.parse.linkedin-profile, data.parse.hackernews-feed, data.parse.github-repo (or github.extract-repo alias), data.deliver.structured, and agent.note.\n9. `data.parse.github-repo` steps must include `payload.username` (GitHub handle without the leading `@`) derived from the navigation target or user request.\n10. To observe a page, rely on the automatically inserted data.extract-site step; do not schedule extra ad-hoc \"observe\" actions.\n11. When emitting `data.deliver.structured`, its payload must include `schema`, `artifact_label`, `filename`, and `source_step_id` pointing to the parse step that produced the data; missing any of these fields causes automatic plan rejection.\n12. Deliver `payload.schema` must come from the canonical map (generic_observation_v1, market_info_v1, news_brief_v1, github_repos_v1, twitter_feed_v1, facebook_feed_v1, linkedin_profile_v1, hackernews_feed_v1) aligned with the preceding parser.\n13. When submitting a Baidu search, target the actual submit button (`css=#su`, `text=百度一下`, or equivalent) rather than container selectors like `.s_search`.",
+            "{header}\n\nProduce JSON following this schema: {schema}\nRules:\n1. Always emit valid JSON without markdown.\n2. Populate `thinking`, `evaluation`, `memory`, and `next_goal` for every step; keep them specific and actionable.\n3. After each DOM interaction (navigate/click/type_text/select/scroll/wait) insert an `agent.evaluate` step that summarizes what was learned, whether a blocker occurred, and what the following goal should be.\n4. Use css selectors prefixed with 'css=' when possible.\n5. Supported actions include navigate, click, type_text, select, scroll, wait, agent.evaluate, agent.note, and the allowed data.* custom tools; represent `agent.evaluate` exactly as a custom tool call named `agent.evaluate`.\n6. Use wait='idle' for network idle waits.\n7. Provide rationale and risks arrays even if empty.\n8. When structured outputs are requested, include explicit navigate -> observe -> act -> parse -> deliver steps covering data acquisition, parsing, and persistence.\n9. Parsing steps must cite deterministic parsers and final steps must mention the structured schema/screenshot that will be produced.\n10. Custom tool allowlist (anything else will be rejected): data.extract-site (observation), data.parse.market_info, data.parse.news_brief, data.parse.twitter-feed, data.parse.facebook-feed, data.parse.linkedin-profile, data.parse.hackernews-feed, data.parse.github-repo (or github.extract-repo alias), data.deliver.structured, agent.evaluate, and agent.note.\n11. `data.parse.github-repo` steps must include `payload.username` (GitHub handle without the leading `@`) derived from the navigation target or user request.\n12. To observe a page, rely on the automatically inserted data.extract-site step; do not schedule extra ad-hoc \"observe\" actions.\n13. When emitting `data.deliver.structured`, its payload must include `schema`, `artifact_label`, `filename`, and `source_step_id` pointing to the parse step that produced the data; missing any of these fields causes automatic plan rejection.\n14. Deliver `payload.schema` must come from the canonical map (generic_observation_v1, market_info_v1, news_brief_v1, github_repos_v1, twitter_feed_v1, facebook_feed_v1, linkedin_profile_v1, hackernews_feed_v1) aligned with the preceding parser.\n15. When submitting a Baidu search, target the actual submit button (`css=#su`, `text=百度一下`, or equivalent) rather than container selectors like `.s_search`.",
             header = sections.join("\n"),
             schema = JSON_SCHEMA
         )
@@ -412,7 +439,11 @@ const JSON_SCHEMA: &str = r#"{
     {
       \"title\": \"Short name\",
       \"detail\": \"Specific instructions\",
-      \"action\": \"navigate|click|type_text|select|scroll|wait\",
+      \"thinking\": \"Why this action matters right now\",
+      \"evaluation\": \"Expected Evaluate summary / guardrail check\",
+      \"memory\": \"Important fact to remember\",
+      \"next_goal\": \"Immediate follow-up objective\",
+      \"action\": \"navigate|click|type_text|select|scroll|wait|agent.evaluate|agent.note\",
       \"url\": \"Required for navigate\",
       \"locator\": \"css=.selector or text=Submit\",
       \"text\": \"Input text when action=type_text\",

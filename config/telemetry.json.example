@@ -1,0 +1,14 @@
+{
+  "device_id": "example-device-id",
+  "webhooks": [
+    {
+      "url": "https://example.com/webhook",
+      "bearer": null
+    }
+  ],
+  "posthog": {
+    "host": "https://app.posthog.com",
+    "api_key": "PHC_EXAMPLE_KEY",
+    "distinct_id": "cli"
+  }
+}

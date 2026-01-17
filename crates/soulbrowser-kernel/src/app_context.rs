@@ -5,11 +5,13 @@
 
 use parking_lot::RwLock as SyncRwLock;
 use std::collections::hash_map::DefaultHasher;
+use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
@@ -21,11 +23,13 @@ use crate::{
     config::BrowserConfiguration,
     errors::SoulBrowserError,
     integration::{default_provider, IntegrationProvider},
+    manual_override::ManualSessionManager,
     plugin_registry::PluginRegistry,
     self_heal::SelfHealRegistry,
     sessions::SessionService,
     storage::StorageManager,
     task_status::TaskStatusRegistry,
+    tool_registry::{default_tool_registry, ToolRegistry},
     tools::BrowserToolManager,
 };
 use cdp_adapter::CdpAdapter;
@@ -53,6 +57,7 @@ use crate::l0_bridge::{L0Bridge, L0Handles};
 
 /// Global application context
 pub struct AppContext {
+    tenant_id: String,
     storage: Arc<StorageManager>,
     auth_manager: Arc<BrowserAuthManager>,
     session_manager: Arc<SessionManager>,
@@ -82,6 +87,8 @@ pub struct AppContext {
     session_service: Arc<SessionService>,
     memory_center: Arc<MemoryCenter>,
     self_heal_registry: Arc<SelfHealRegistry>,
+    manual_session_manager: Arc<ManualSessionManager>,
+    tool_registry: Arc<ToolRegistry>,
     background_tasks: Vec<JoinHandle<()>>,
 }
 
@@ -94,18 +101,88 @@ struct ContextCacheKey {
 
 impl ContextCacheKey {
     fn new(tenant: &str, storage: Option<&PathBuf>, policy_paths: &[PathBuf]) -> Self {
-        let mut canonical = policy_paths
+        let mut fingerprints = policy_paths
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|path| policy_fingerprint(path))
             .collect::<Vec<_>>();
-        canonical.sort();
+        fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
         let mut hasher = DefaultHasher::new();
-        canonical.hash(&mut hasher);
+        fingerprints.hash(&mut hasher);
         Self {
             tenant: tenant.to_string(),
             storage: storage.cloned(),
             policy_hash: hasher.finish(),
         }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct PolicyFingerprint {
+    path: String,
+    modified_secs: u64,
+    len: u64,
+}
+
+fn policy_fingerprint(path: &PathBuf) -> PolicyFingerprint {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let (modified_secs, len) = metadata_signature(&canonical)
+        .or_else(|_| metadata_signature(path))
+        .unwrap_or((0, 0));
+    PolicyFingerprint {
+        path: canonical.display().to_string(),
+        modified_secs,
+        len,
+    }
+}
+
+fn metadata_signature(path: &Path) -> io::Result<(u64, u64)> {
+    let metadata = fs::metadata(path)?;
+    let len = metadata.len();
+    let modified_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    Ok((modified_secs, len))
+}
+
+#[cfg(test)]
+mod context_cache_tests {
+    use super::*;
+    use std::io::Write;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn policy_hash_changes_after_file_update() {
+        let mut file = NamedTempFile::new().expect("temp policy file");
+        writeln!(file, "alpha").expect("write policy");
+        let path = file.path().to_path_buf();
+
+        let original = ContextCacheKey::new("tenant", None, &[path.clone()]);
+        thread::sleep(Duration::from_millis(1100));
+        std::fs::write(&path, b"beta policy contents").expect("rewrite policy");
+        let updated = ContextCacheKey::new("tenant", None, &[path.clone()]);
+
+        assert_ne!(
+            original.policy_hash, updated.policy_hash,
+            "policy hash should change when file contents/mtime change"
+        );
+    }
+
+    #[test]
+    fn policy_hash_order_insensitive() {
+        let file_a = NamedTempFile::new().expect("policy a");
+        let file_b = NamedTempFile::new().expect("policy b");
+        let path_a = file_a.path().to_path_buf();
+        let path_b = file_b.path().to_path_buf();
+
+        let key_ab = ContextCacheKey::new("tenant", None, &[path_a.clone(), path_b.clone()]);
+        let key_ba = ContextCacheKey::new("tenant", None, &[path_b, path_a]);
+
+        assert_eq!(key_ab.policy_hash, key_ba.policy_hash);
     }
 }
 
@@ -213,11 +290,14 @@ impl AppContext {
             per_task_limit: initial_view.scheduler.limits.per_task_limit,
         }));
         let executor_adapter = Arc::new(ToolManagerExecutorAdapter::new(tool_manager.clone()));
+        let (route_event_tx, _route_event_rx) = soulbrowser_scheduler::route_event_channel(128);
+        let route_event_bus = Arc::new(route_event_tx);
         let scheduler_service = Arc::new(SchedulerService::new(
             registry.clone(),
             scheduler_runtime.clone(),
             executor_adapter,
             Arc::clone(&state_center_dyn),
+            Some(route_event_bus.clone()),
         ));
         scheduler_service.start().await;
 
@@ -305,10 +385,15 @@ impl AppContext {
             registry.clone(),
             Arc::clone(&state_center_dyn_send),
             default_session.clone(),
+            Some(route_event_bus.clone()),
         )
         .await;
 
         let plugin_registry = Arc::new(PluginRegistry::load_default());
+        let tool_registry = default_tool_registry();
+        if let Err(err) = tool_registry.load_from_dir(PathBuf::from("config/tool_registry")) {
+            warn!(?err, "failed to load custom tool registry entries");
+        }
         let task_status_registry = Arc::new(TaskStatusRegistry::new(200));
         task_status_registry.add_stream_observer(session_service.clone());
         let memory_center = Arc::new(match &storage_path {
@@ -333,8 +418,10 @@ impl AppContext {
                         .expect("self-heal registry default initialization")
                 }),
         );
+        let manual_session_manager = Arc::new(ManualSessionManager::from_env());
 
         Ok(Self {
+            tenant_id: tenant_id.clone(),
             storage,
             auth_manager,
             session_manager,
@@ -358,6 +445,8 @@ impl AppContext {
             session_service,
             memory_center,
             self_heal_registry,
+            manual_session_manager,
+            tool_registry,
             background_tasks,
         })
     }
@@ -365,6 +454,10 @@ impl AppContext {
     /// Get the storage manager
     pub fn storage(&self) -> Arc<StorageManager> {
         self.storage.clone()
+    }
+
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
     }
 
     #[allow(dead_code)]
@@ -409,8 +502,16 @@ impl AppContext {
         self.session_service.clone()
     }
 
+    pub fn manual_session_manager(&self) -> Arc<ManualSessionManager> {
+        Arc::clone(&self.manual_session_manager)
+    }
+
     pub fn memory_center(&self) -> Arc<MemoryCenter> {
         self.memory_center.clone()
+    }
+
+    pub fn tool_registry(&self) -> Arc<ToolRegistry> {
+        self.tool_registry.clone()
     }
 
     pub fn self_heal_registry(&self) -> Arc<SelfHealRegistry> {
@@ -582,7 +683,28 @@ impl SchedulerToolExecutor for ToolManagerExecutorAdapter {
                 labels.insert("success".into(), "false".into());
                 obs_metrics::inc(METRIC_SCHED_DISPATCHES, labels.clone());
                 obs_metrics::observe(METRIC_SCHED_LATENCY, duration_ms, labels);
-                Err(SoulError::new(err.to_string()))
+
+                let mut user_msg = err.user_message().to_string();
+                if let Some(dev_msg) = err.dev_message() {
+                    warn!(
+                        target = "tools",
+                        tool = %request.tool_call.tool,
+                        %subject,
+                        %dev_msg,
+                        "Tool execution failed"
+                    );
+                    user_msg = format!("{user_msg} ({dev_msg})");
+                } else {
+                    warn!(
+                        target = "tools",
+                        tool = %request.tool_call.tool,
+                        %subject,
+                        error = %user_msg,
+                        "Tool execution failed"
+                    );
+                }
+
+                Err(SoulError::new(user_msg))
             }
         }
     }

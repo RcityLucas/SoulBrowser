@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tokio::sync::OnceCell;
 
+use crate::cli::telemetry::load_persistent_sinks;
 use soulbrowser_kernel::app_context::{create_context, get_or_create_context, AppContext};
+use soulbrowser_kernel::tool_registry::ToolRegistry;
 use soulbrowser_kernel::Config;
 
 const DEFAULT_TENANT_ID: &str = "cli";
@@ -14,6 +16,8 @@ pub struct CliContext {
     config_path: PathBuf,
     metrics_port: u16,
     app_context: OnceCell<Arc<AppContext>>,
+    tool_registry_loaded: OnceCell<()>,
+    telemetry_loaded: OnceCell<()>,
 }
 
 impl CliContext {
@@ -23,6 +27,8 @@ impl CliContext {
             config_path,
             metrics_port,
             app_context: OnceCell::new(),
+            tool_registry_loaded: OnceCell::new(),
+            telemetry_loaded: OnceCell::new(),
         }
     }
 
@@ -32,6 +38,13 @@ impl CliContext {
 
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    pub fn config_dir(&self) -> PathBuf {
+        self.config_path
+            .parent()
+            .map(|path| path.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     pub fn metrics_port(&self) -> u16 {
@@ -76,5 +89,39 @@ impl CliContext {
         )
         .await
         .map_err(|err| err.into())
+    }
+}
+
+impl CliContext {
+    pub async fn ensure_tool_registry_loaded(&self, registry: Arc<ToolRegistry>) -> Result<()> {
+        let config_dir = self
+            .config_path
+            .parent()
+            .map(|path| path.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let tools_dir = config_dir.join("tools");
+        let dir_clone = tools_dir.clone();
+        let registry_clone = registry.clone();
+        self.tool_registry_loaded
+            .get_or_try_init(|| {
+                let dir = dir_clone.clone();
+                let registry = registry_clone.clone();
+                async move {
+                    if dir.exists() {
+                        registry.load_from_dir(&dir).map_err(|err| anyhow!(err))?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn init_telemetry(&self) -> Result<()> {
+        let dir = self.config_dir();
+        self.telemetry_loaded
+            .get_or_try_init(|| async { load_persistent_sinks(&dir) })
+            .await?;
+        Ok(())
     }
 }

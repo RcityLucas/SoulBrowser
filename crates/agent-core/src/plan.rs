@@ -184,6 +184,14 @@ pub enum AgentToolKind {
         name: String,
         payload: serde_json::Value,
     },
+    /// Agent signals task completion (for agent loop mode).
+    /// The LLM uses this to indicate the task is finished.
+    Done {
+        /// Whether the task was completed successfully.
+        success: bool,
+        /// Completion message, result summary, or extracted content.
+        text: String,
+    },
 }
 
 /// Scroll targets exposed to the planner.

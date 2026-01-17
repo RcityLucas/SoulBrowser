@@ -248,16 +248,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_baidu_weather_widget() {
-        let observation = serde_json::json!({
-            "title": "济南天气_百度搜索",
-            "data": {
-                "text_sample": "百度首页设置登录 百度一下 济南天气 济南 14:45更新 5° -4~6°C 晴 70 良"
-            }
-        });
-        let value = crate::parsers::weather::parse_weather(&observation).expect("parse weather");
-        assert_eq!(value["city"], "济南");
-        assert_eq!(value["temperature_low_c"], -4.0);
-        assert_eq!(value["temperature_high_c"], 6.0);
+    fn extracts_subject_from_widget_text() {
+        let sample = "百度首页设置登录 百度一下 济南天气 济南 14:45更新 5° -4~6°C 晴 70 良";
+        let subject = extract_weather_subject(sample).expect("subject detected");
+        assert_eq!(subject, "济南");
     }
 }

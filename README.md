@@ -1,445 +1,239 @@
-# SoulBrowser 1.0 - Intelligent Browser Automation Framework
+# SoulBrowser
 
-> A living, breathing browser automation system that perceives, understands, and acts with intelligence.
+> Intelligent web automation with multi-modal perception, policy-guarded execution, and plug-in ready gateways.
 
-## 🌟 Philosophy
+SoulBrowser stitches together a command-line facade, a reusable kernel, and a large set of focused crates to plan, execute, and inspect browser automation flows. The workspace already ships with structural/visual/semantic perceivers, a policy-aware scheduler, memory and timeline services, and an HTTP surface that can expose the console UI or act as a gateway for external adapters.
 
-SoulBrowser isn't just another automation tool - it's a digital consciousness that navigates the web with awareness and purpose. Built with Rust for performance and safety, it treats web interactions as a journey through digital realms, where every element has multiple identities and every action creates ripples of change.
+Need more context? Use these companions:
+- `README_CN.md` &mdash; Chinese overview for the same repo.
+- `docs/README.md` &mdash; module cheat sheet.
+- `docs/module_deep_dive.md` &mdash; crate-by-crate architecture notes.
 
-## 🏗️ Architecture
+## Table of contents
+1. [Highlights](#highlights)
+2. [Architecture overview](#architecture-overview)
+3. [Repository layout](#repository-layout)
+4. [Module map](#module-map)
+5. [CLI surfaces](#cli-surfaces)
+6. [Quick start](#quick-start)
+7. [Configuration and environment](#configuration-and-environment)
+8. [Data and storage conventions](#data-and-storage-conventions)
+9. [Observability & diagnostics](#observability--diagnostics)
+10. [Development workflow](#development-workflow)
+11. [Troubleshooting tips](#troubleshooting-tips)
+12. [Status and roadmap notes](#status-and-roadmap-notes)
+13. [Licensing](#licensing)
 
+## Highlights
+- **Unified CLI** &mdash; `soulbrowser` wraps every subsystem: multi-modal perception, L8 agent chat, scheduler/policy inspection, artifact export, memory/timeline introspection, and serve/gateway surfaces.
+- **Kernel + AppContext** &mdash; `soulbrowser-kernel` wires Chrome/CDP access, perception services, the registry, scheduler, policy center, plugin registry, memory center, and storage providers (defaulting to the soulbase integration).
+- **Perception stack** &mdash; Structural, visual, and semantic perceivers (plus the `perceiver-hub`) form the basis for the `perceive` command and console overlays, producing `MultiModalPerception` documents and screenshots.
+- **Action pipeline** &mdash; `action-primitives` feed the locator/gate/flow crates, which the scheduler uses to dispatch tool calls via the registry and policy center.
+- **Observability** &mdash; The state center caches perceiver and dispatch events, the event store exposes hot/cold rings and timeline exports, and metrics are served over HTTP (default `localhost:9090`).
+- **Security & governance** &mdash; Policy and permission brokers, privacy filters, plugin guardrails, and network-tap scaffolding are ready for L7 adapters, plugins, and governance timelines.
+
+## Architecture overview
 ```
-L7: External Interfaces [Later]
-    └── HTTP/gRPC/MCP Adapters
-L6: Governance & Observability [MVP]
-    └── Metrics, Timeline, Privacy
-L5: Tools Layer [MVP]
-    └── 12 High-level Tools
-L4: Elastic Persistence [MVP/Scaffold]
-    └── Event Store, Snapshots
-L3: Intelligent Action [MVP]
-    └── Primitives, Locator, Validation
-L2: Layered Perception [MVP/Scaffold]
-    └── Structural, Visual, Semantic
-L1: Unified Kernel [Next]
-    └── Dispatcher, Scheduler, State (development kicking off)
-L0: Runtime & Adapters [In-flight]
-    └── CDP scaffolding, Permissions, Network, Stealth, Extensions
-
-## ✅ Current Status
-
-- **L0 Runtime & Adapters**: CDP adapter now exposes a pluggable transport/event loop; permissions broker, network tap (light), stealth runtime, and extensions bridge each ship with in-memory runtimes and crate-level smoke tests.
-- **Legacy layers (L1+)**: existing soul-base wiring remains in place for the CLI; fresh L1 work (dispatcher/scheduler/state) begins next.
-- **Scheduler telemetry**: the CLI embeds the unified kernel scheduler; `soulbrowser info` and `soulbrowser scheduler` surface recent dispatch attempts, timestamps, basic Registry lifecycle events, and support cancelling pending actions.
-- **Policy center**: `soulbrowser policy show`/`override` exposes current limits and allows runtime overrides (with TTL) that feed into the scheduler/registry.
-- **Legacy assets archived**: historical demos/tests now live under `docs/examples/legacy_examples.md`; the default build focuses on the Serve/API stack.
-
-See `docs/PRODUCT_COMPLETION_PLAN.md` for the consolidated roadmap, `docs/L0_ACTUAL_PROGRESS.md` for runtime status details, and `docs/AI_BROWSER_EXPERIENCE_PLAN.md` for the upcoming AI browser experience work. Plan contributors can consult `docs/plans/CUSTOM_TOOL_ALLOWLIST.md` for the supported custom tools and lint instructions before shipping structured runs.
+CLI (soulbrowser)
+   │
+   ├─ Runtime bootstrap (env/config, metrics, logging)
+   │
+   └─ Dispatch ─▶ Kernel / ServeOptions ─▶ AppContext cache
+                    │
+                    ├─ Registry + Scheduler + State Center
+                    ├─ PerceptionService → Perceiver Hub (structural/visual/semantic)
+                    ├─ Event Store / Timeline / Memory Center
+                    └─ Gateway (L7 adapters, HTTP surface, plugins, policies)
 ```
+Key supporting crates:
+- **Kernel runtime** (`soulbrowser-kernel`): Serve/gateway orchestration, app context builder, perception service, storage/tasks, metrics, server surfaces.
+- **Action layer** (`action-primitives`, `action-locator`, `action-gate`, `action-flow`, `soulbrowser-actions`): execution primitives, selector healing, gating evidence, flow orchestration.
+- **Perception layer** (`perceiver-structural`, `perceiver-visual`, `perceiver-semantic`, `perceiver-hub`, `network-tap-light`): multi-modal DOM/AX, screenshot/visual diff, semantic analysis, network summaries.
+- **Control plane** (`registry`, `scheduler`, `state-center`, `policy-center`, `event-bus`, `event-store`, `snapshot-store`, `memory-center`): sessions/pages, dispatch queues, policy snapshots/overrides, and historical data.
+- **Integration layer** (`cdp-adapter`, `permissions-broker`, `extensions-bridge`, `stealth`, `integration-soulbase`, `l6-*`, `l7-*`): CDP + permission scaffolds, plugin runtime, observability adapters, HTTP surfaces.
+- **Agent & LLM support** (`agent-core`, `soulbrowser-kernel::agent`, `chat_support`, `l6-observe`, `l6-privacy`): plan models, validators, planner selection, LLM caching, privacy filtering, and observation exporters.
 
-## 🚀 Quick Start
+The CLI and Serve/Gateway surfaces sit on top of this stack: each command parses env/config overrides, requests an `AppContext`, and interacts with the scheduler, registry, and perception layers through kernel APIs. Because the same runtime powers CLI sessions, HTTP adapters, and plugins, diagnostics collected by `state-center`, `event-store`, or `metrics` are instantly visible everywhere.
 
-> 📖 **New User?** Start with our [快速开始指南](docs/快速开始指南.md) for a 5-minute walkthrough!
+## Repository layout
+| Path | Purpose |
+| --- | --- |
+| `src/cli/` | CLI commands (`serve`, `perceive`, `chat`, `analyze`, `artifacts`, `console`, `scheduler`, `policy`, `timeline`, etc.). |
+| `crates/soulbrowser-kernel/` | Core kernel: serve/gateway, runtime, perception service, config, app context, metrics, auth, storage, tools. |
+| `crates/action-*` | Action primitives, locator, gate, flow & executor stacks used by the scheduler. |
+| `crates/perceiver-*` & `crates/perceiver-hub/` | Structural/visual/semantic perceivers plus the hub that fuses them into `MultiModalPerception`. |
+| `crates/agent-core/` | L8 agent plan models, LLM provider abstraction, rule/LLM planner plumbing, plan-to-flow conversion. |
+| `crates/registry/`, `crates/scheduler/`, `crates/state-center/`, `crates/policy-center/` | Orchestration backbone: tracks sessions, dispatch queues, policy snapshots/overrides, and execution/perception events. |
+| `crates/event-store/`, `crates/l6-timeline/`, `crates/memory-center/`, `crates/event-bus/` | Event persistence, cold/hot rings, timeline export, lightweight memory persistence, and pub/sub utilities. |
+| `crates/cdp-adapter/`, `crates/network-tap-light/`, `crates/permissions-broker/`, `crates/extensions-bridge/`, `crates/stealth/` | L0 interaction scaffolds (Chrome detection, network tapping, permission enforcement, extension channels, stealth helpers). |
+| `crates/l7-adapter/`, `crates/l7-plugin/`, `crates/integration-soulbase/`, `crates/soulbrowser-actions/` | Gateway/router wiring, plugin runtime, integration provider, and action re-exports. |
+| `config/` | Sample configuration, policy, planner, plugin, and permission bundles (`config/README.md` documents usage). |
+| `docs/` | Chinese overview plus module overview (`docs/README.md`) and deep dive (`docs/module_deep_dive.md`). |
+| `static/` | Static assets (console shell HTML). |
+| `soulbrowser-output/` | Default runtime output root (tenant storage, run bundles, state center snapshots, artifacts). |
 
-### Zero-Config Dev Console
+### Root level quick reference
+- `Cargo.toml` / `Cargo.lock` – workspace manifest + lockfile.
+- `build.rs` – embeds build metadata (timestamp, git hash/branch).
+- `src/` – binary/lib sources.
+- `crates/` – internal libraries powering the CLI.
+- `config/` – sample configs, policies, and env overrides.
+- `docs/` – onboarding/architecture documentation.
+- `static/console.html` – console shell served by `serve --surface console`.
+- `third_party/` – vendored assets or placeholder for external deps.
+- `soulbrowser-output/` – default runtime output tree (git-ignored).
+- `target/` – Cargo build artifacts (generated).
 
+### `crates/soulbrowser-kernel/src` key modules
+- `kernel.rs` – serve/gateway wiring, HTTP pipeline, tenant normalization.
+- `runtime.rs` – runtime bootstrap, tenant storage prep, rate limits.
+- `app_context.rs` – shared storage/auth/tool managers, scheduler/service wiring.
+- `perception_service.rs` – orchestration of structural/visual/semantic perceivers.
+- `metrics.rs` – Prometheus registry/recorders.
+- `gateway/`, `server/`, `integration/`, `automation/`, `policy/`, etc. – supporting modules for adapters, tools, auth, storage, analytics, chat, watchdogs.
+
+## Module map
+Summaries below are mirrored (with more detail) in `docs/README.md` and `docs/module_deep_dive.md`.
+
+| Layer | Crates / Paths | Highlights |
+| --- | --- | --- |
+| CLI shell | `src/cli/` | `app.rs` bootstrap, `runtime.rs` config/env, `commands.rs` + `dispatch.rs` for verbs, per-command files (`serve`, `chat`, `perceive`, etc.). |
+| Kernel/runtime | `crates/soulbrowser-kernel` | `Kernel::serve/gateway`, `AppContext`, `ServeState`, `PerceptionService`, metrics, HTTP surfaces. |
+| Action & scheduler | `action-*`, `soulbrowser-actions`, `registry`, `scheduler`, `state-center` | Navigation/click primitives, locator healers, validation gates, dispatcher/orchestrator, ExecRoute, dispatch/probe events. |
+| Perception | `perceiver-*`, `perceiver-hub`, `network-tap-light` | DOM/AX resolution, screenshot/OCR, semantic analysis, hub aggregation, network summaries. |
+| Control plane | `event-store`, `l6-timeline`, `policy-center`, `permissions-broker`, `memory-center`, `integration-soulbase` | Event persistence, timeline export, runtime policy overrides, permission enforcement, memory persistence, storage/auth/tool providers. |
+| Governance & adapters | `cdp-adapter`, `extensions-bridge`, `l7-adapter`, `l7-plugin`, `l6-privacy`, `l6-observe`, `stealth` | Chrome detection, extension scaffolds, HTTP adapters, plugin runtime, privacy filters, observation exporters. |
+| Agent/LLM | `agent-core`, `soulbrowser-kernel::agent`, `chat_support` | Agent plan models, planner selection (rule/LLM), plan-to-flow converters, execution reports. |
+
+## CLI surfaces
+| Command | Status | Description |
+| --- | --- | --- |
+| `serve` | Stable | Runs the testing server and console UI; supports authentication, tenant isolation, shared session pool toggles, and console/gateway presets. |
+| `gateway` | Stable | Starts the L7 adapter HTTP surface (future gRPC/WebDriver) with optional policy files and demo plan execution. |
+| `perceive` | Stable | Performs multi-modal perception against a URL, emitting summaries, logs, JSON, and optional screenshots. |
+| `chat` | Stable | Generates L8 agent plans (rule or LLM planners), optionally executes flows via the scheduler, and persists run bundles/artifacts. |
+| `analyze` | Stable | Runs analytics (performance, accessibility, security, usability, compatibility, or full) against recorded sessions. |
+| `artifacts` / `console` | Stable | Inspect run-bundle artifacts, extract payloads, render BrowserUse-style GIF timelines, and launch an ad-hoc console viewer bound to bundle data. |
+| `timeline` | Stable | Hydrates the event store from storage, exports governance timelines/replays/records, and writes logs to disk. |
+| `scheduler`, `perceiver`, `policy`, `info` | Stable | Debug/observability commands to inspect dispatch queues, perceiver events, policy revisions/overrides, and overall health. |
+| `tools` | Beta | Register/list/remove runtime tool descriptors (JSON) and persist them under `config/tools`. |
+| `telemetry` | Beta | `telemetry tail`, `telemetry webhook/posthog/list/remove` manage sinks defined in `config/telemetry.json`; set `SOULBROWSER_TELEMETRY_STDOUT=1` to emit events. |
+| `config` | Stable | View, set, reset, or validate the YAML config file; uses JSON dot-path assignments. |
+| `run`, `record`, `replay`, `export`, `start`, `demo` | Retired | Historical commands now bail with guidance to use the consolidated `serve`/`gateway` surfaces. |
+ 
+### Common flows
 ```bash
-# 从根目录直接启动后端 + Web 控制台（自动: host=0.0.0.0、禁用鉴权、注入默认 token）
-./scripts/start_web_console.sh
+# Build everything once
+cargo build --workspace
 
-# 可选：自定义端口或 token
-BACKEND_PORT=8804 FRONTEND_PORT=5173 SERVE_TOKEN=my-dev-token ./scripts/start_web_console.sh
+# Launch the console surface (http://127.0.0.1:8787)
+cargo run --bin soulbrowser -- serve --port 8787 --surface console --auth-token devtoken
 
-# 后端就绪后，另开终端启动前端
-cd web-console && npm install && npm run dev
+# Run perception with screenshot + JSON summary
+cargo run --bin soulbrowser -- perceive --url https://example.com --all \
+    --screenshot ./soulbrowser-output/perception/example.png \
+    --output ./soulbrowser-output/perception/example.json
+
+# Generate an agent plan and execute it immediately
+cargo run --bin soulbrowser -- chat --prompt "Book a round-trip ticket" --execute \
+    --save-run ./soulbrowser-output/runs/ticket.json --artifacts-path ./soulbrowser-output/runs/artifacts.json
+
+# Inspect recent scheduler/perceiver state
+cargo run --bin soulbrowser -- scheduler --status failure
+cargo run --bin soulbrowser -- perceiver --kind resolve --format table
 ```
 
-脚本会：
-
-- 自动编译（若无现成二进制）、关闭 Prometheus 端口，并以 `--host 0.0.0.0 --disable-auth` 方式启动 Serve，以便 WSL ⇄ Windows 直接访问。
-- 将 `SERVE_TOKEN` 注入后端的 `SOUL_SERVE_TOKEN`，并将 `VITE_SERVE_TOKEN/VITE_BACKEND_URL` 输出在当前 shell 环境，方便前端沿用。
-- 在 WSL 中提醒如何附加 Windows Chrome（或复用现有 DevTools WebSocket）。
-- 等待 `/health` 就绪后保持后端后台运行，显示“下一步”提示，前端由开发者在另一个终端执行 `npm run dev`。
-
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/soulbrowser
-cd soulbrowser
-
-# Build the project
-cargo build
-
-# Run tests
-cargo test
-
-# Run the real-browser demo (requires Chrome/Chromium)
-SOULBROWSER_USE_REAL_CHROME=1 \
-SOULBROWSER_DISABLE_SANDBOX=1 \
-cargo run -- demo \
-    --chrome-path /path/to/chrome \
-    --screenshot soulbrowser-output/demo.png
-```
-
-### 🎯 30-Second Demo
-```bash
-# Enable Chrome connection
-export SOULBROWSER_USE_REAL_CHROME=1
-export SOULBROWSER_DISABLE_SANDBOX=1
-
-# Run intelligent demo
-soulbrowser demo --headful --screenshot demo-result.png
-```
-
-### Real Browser Demo
-
-The `demo` CLI command drives a headless (or optional headful) Chromium session through the L0 CDP adapter and the L2 structural perceiver. To reproduce:
-
-1. Install Chrome/Chromium locally and note the executable path.
-2. Export `SOULBROWSER_USE_REAL_CHROME=1` (and typically `SOULBROWSER_DISABLE_SANDBOX=1` when running inside containers) so the adapter switches from the noop transport to the real Chromium transport. Optionally set `SOULBROWSER_CHROME=/absolute/path/to/chrome` if the binary is not discoverable via PATH.
-3. Execute `cargo run -- demo --chrome-path /absolute/path/to/chrome --screenshot soulbrowser-output/demo.png`.
-4. The command will
-   - Wait for a live page/session from Chrome,
-   - Navigate to `https://www.wikipedia.org/`,
-   - Use the structural perceiver to resolve the search input/button via DOM/AX snapshots,
-   - Type "SoulBrowser", click the submit button, and log CDP events,
-   - Capture a PNG screenshot in `soulbrowser-output/`.
-
-Use `--headful` to launch a visible Chrome window or tweak selectors/text with the `--input-selector`, `--submit-selector`, and `--input-text` flags.
-
-If you already have a Chrome instance running with DevTools remote debugging enabled (for example: `/usr/bin/google-chrome --remote-debugging-port=9222 ...`), you can attach instead of launching:
-
-```bash
-SOULBROWSER_USE_REAL_CHROME=1 \
-cargo run -- demo \
-  --ws-url ws://127.0.0.1:9222/devtools/browser/<id> \
-  --screenshot soulbrowser-output/demo.png
-```
-
-### L7 Gateway Surfaces
-
-The `gateway` command exposes the external adapter interfaces (HTTP, optional gRPC, optional WebDriver bridge) on top of the live scheduler and state center:
-
-```bash
-# Start HTTP adapter on 8710 and the WebDriver bridge on 9515
-soulbrowser gateway \
-  --http 127.0.0.1:8710 \
-  --webdriver 127.0.0.1:9515
-
-# Provide custom policy definitions if needed
-soulbrowser gateway \
-  --adapter-policy config/policies/adapter_policy.yaml \
-  --webdriver-policy config/policies/wd_bridge_policy.yaml
-```
-
-The HTTP adapter serves `/healthz` and `/v1/tools/run`, enforcing per-tenant limits from the adapter policy. The WebDriver bridge offers a Selenium-compatible façade that routes into SoulBrowser tools. All surfaces share the same scheduler runtime, metrics, and privacy guards, and shut down cleanly on `Ctrl+C`.
-
-### Multi-Modal Perception Analysis
-
-The `perceive` CLI command provides comprehensive page analysis using all three L2 perceivers:
-
-```bash
-# Full multi-modal analysis with cross-modal insights
-SOULBROWSER_USE_REAL_CHROME=1 \
-cargo run -- perceive \
-  --url https://www.wikipedia.org \
-  --all \
-  --insights \
-  --screenshot wiki.png \
-  --output results.json
-
-# Visual-only analysis
-SOULBROWSER_USE_REAL_CHROME=1 \
-cargo run -- perceive \
-  --url https://example.com \
-  --visual \
-  --screenshot example.png
-
-# Semantic-only analysis
-SOULBROWSER_USE_REAL_CHROME=1 \
-cargo run -- perceive \
-  --url https://news.ycombinator.com \
-  --semantic \
-  --output hn-analysis.json
-```
-
-The command provides rich output including:
-- 📊 **Structural Analysis**: DOM node count, interactive elements, forms, navigation
-- 👁️ **Visual Analysis**: Dominant colors, contrast ratios, viewport utilization, complexity scores
-- 🧠 **Semantic Analysis**: Language detection, content classification, keywords, readability
-- 💡 **Cross-Modal Insights**: Performance, accessibility, UX observations from combining multiple modalities
-
-## 📦 Project Structure
-
-```
-SoulBrowser/
-├── crates/
-│   ├── cdp-adapter/            # L0 transport & event wiring scaffold
-│   ├── permissions-broker/     # L0 policy runtime with TTL-aware decisions
-│   ├── network-tap-light/      # L0 network summary & snapshot helper
-│   ├── stealth/                # L0 fingerprint & captcha runtime scaffold
-│   ├── extensions-bridge/      # L0 MV3 bridge scaffold
-│   ├── perceiver-structural/   # L2 DOM/AX tree analysis with caching
-│   ├── perceiver-visual/       # L2 screenshot capture and visual metrics
-│   ├── perceiver-semantic/     # L2 content classification and NLP
-│   ├── perceiver-hub/          # L2 multi-modal coordination layer
-│   ├── core-types/             # Shared data structures
-│   ├── event-bus/              # Event broadcasting system
-│   ├── registry/               # Session/page registry
-│   ├── scheduler/              # Task scheduling and dispatch
-│   ├── state-center/           # State management with telemetry
-│   └── policy-center/          # Policy and quota management
-├── docs/                       # Architecture plans & progress notes (plus legacy example catalog)
-├── examples/                   # Active automation + SDK samples (legacy demos archived in docs/examples)
-├── src/                        # CLI entrypoint and orchestration
-├── tests/                      # Current integration tests (legacy full-stack suites were archived)
-└── target/                     # Cargo build artifacts
-```
-
-## 🔑 Key Features
-
-### Multi-Modal Element Targeting
-- **CSS Selectors** - Traditional web selectors
-- **ARIA Attributes** - Accessibility-based targeting
-- **Text Content** - Find by visible text
-- **Geometric Position** - Coordinate-based location
-- **Intelligent Fallback** - Automatic strategy switching
-
-### Unified Observation System
-Every action produces a rich observation containing:
-- Multi-dimensional signals (DOM, Network, Console)
-- Success/failure status with detailed context
-- Performance metrics and timing
-- Optional artifacts (screenshots, snapshots)
-
-### Intelligent Recovery
-- Automatic retry with exponential backoff
-- Context-aware recovery strategies
-- Graceful degradation under pressure
-- Self-healing element locators
-
-## 🛠️ Core Components
-
-### L0: Runtime & Adapters
-- **CDP Adapter**: Pluggable transport + cancellable event loop (real CDP wiring in progress)
-- **Permissions Broker**: In-memory policy store with TTL-aware decisions
-- **Network Tap (Light)**: Per-page snapshot & summary registry, awaiting CDP feed
-- **Stealth Runtime**: Profile catalog, applied-profile cache, captcha hooks
-- **Extensions Bridge**: MV3 channel runtime (enable/disable, open/invoke stubs)
-
-### L1: Unified Kernel
-- **Session Registry**: Multi-session lifecycle management
-- **Task Dispatcher**: Intelligent task routing
-- **Execution Scheduler**: Concurrency and priority control
-- **State Center**: In-memory state with event logging
-
-### L2: Layered Perception ✨ Production-Ready Multi-Modal System
-- **Structural Perceiver**: DOM and Accessibility tree analysis with intelligent caching
-  - TTL-based anchor and snapshot caches (60s default, configurable)
-  - Automatic cache invalidation on CDP lifecycle events (navigate, load, DOM updates)
-  - Real-time metrics: hit/miss tracking, average latency, cache efficiency
-  - CLI visibility: `soulbrowser perceiver` shows cache stats and hit rates
-- **Visual Perceiver**: Screenshot capture and visual analysis ✅ Production-Ready
-  - CDP-based screenshot capture with configurable quality and format
-  - Visual metrics: color palette, contrast ratio, viewport utilization
-  - Visual diff computation (pixel-based and SSIM)
-  - Screenshot caching with TTL-based invalidation
-- **Semantic Perceiver**: Content understanding and classification ✅ Production-Ready
-  - Language detection with confidence scoring (60+ languages)
-  - Content type classification (Article, Portal, Form, Product, etc.)
-  - Page intent recognition (Informational, Transactional, Navigation)
-  - Text summarization and keyword extraction
-  - Readability scoring (Flesch-Kincaid)
-- **Multi-Modal Perception Hub**: Unified coordination layer ✅ Production-Ready
-  - Orchestrates all three perceivers for comprehensive page understanding
-  - Cross-modal insight generation (6 insight types)
-  - Confidence scoring across modalities
-  - Parallel execution with configurable timeouts
-  - CLI command: `soulbrowser perceive --url <URL> --all --insights`
-
-### L3: Intelligent Action
-- **Action Primitives**: Low-level browser operations
-- **Smart Locator**: Multi-strategy element finding with self-heal
-- **Post-condition Gates**: Action validation and verification
-- **Flow Orchestration**: Complex action sequences [Scaffold]
-
-### L5: Tools Layer
-High-level tools that combine perception, action, and validation:
-- `navigate-to-url` - Smart navigation with verification
-- `click` - Intelligent clicking with fallback
-- `type-text` - Robust text input
-- `wait-for-element` - Smart waiting strategies
-- `take-screenshot` - Streams real PNG bytes via the CDP adapter (falls back to a stub when no browser session is available)
-- And 8 more specialized tools...
-
-The `take-screenshot` tool now emits a richer payload including `byte_len`, `content_type`, the resolved execution `route`, and raw `bytes`. When the CLI is connected to a real Chromium instance (set `SOULBROWSER_USE_REAL_CHROME=1`), the tool will create or reuse a CDP page for the current `ExecRoute` before returning actual viewport pixels. When running against the noop adapter, the tool gracefully returns a small placeholder buffer so existing scenarios keep working.
-
-```jsonc
-{
-  "success": true,
-  "output": {
-    "status": "captured",
-    "byte_len": 495832,
-    "content_type": "image/png",
-    "route": {
-      "session": "3f4a...",
-      "page": "8b12...",
-      "frame": "8b12..."
-    },
-    "filename": "capture.png",
-    "bytes": [137, 80, 78, 71, ...]
-  }
-}
-```
-
-If the adapter cannot attach to a browser session, the tool reports a `status: failed` payload with diagnostic metadata while the page pipeline continues executing.
-
-## 🔄 Data Flow
-
-1. **Agent Request** → L5 Tool receives high-level command
-2. **Perception** → L2 analyzes page and generates anchors
-3. **Action** → L3 executes primitive with L0 capabilities
-4. **Validation** → Post-condition gates verify success
-5. **Observation** → Unified envelope returned to agent
-6. **Persistence** → L4 stores events and snapshots
-7. **Monitoring** → L6 tracks metrics and timeline（默认启动 `--metrics-port 9090` 暴露 `/metrics` Prometheus 指标，`--metrics-port 0` 可关闭）
-
-## 🧾 Automation Script DSL
-
-The CLI `run` command understands a lightweight DSL for scripting browser flows. Core actions mirror CLI options (`navigate`, `click`, `type`, `wait`, `screenshot`), while control keywords unlock structured flows:
-
-```
-# substitute parameters defined via --param key=value or config
-set greeting Hello World
-
-loop 3
-  navigate https://example.com
-  type #search {{greeting}}
-  click #submit
-endloop
-
-if environment == staging
-  screenshot stage.png
-else
-  screenshot prod.png
-endif
-
- parallel 2
-   branch
-     navigate https://example.com/profile
-     wait 500
-   endbranch
-   branch
-     navigate https://example.com/settings
-     wait 500
-   endbranch
- endparallel
-```
-
- Loops accept numeric counts (or templated values), `if` supports `==` / `!=` comparisons against parameters or `set` locals, and `parallel` runs branches concurrently up to the configured `parallel_instances` limit (override per block with `parallel N`).
-
-## 🧪 Development
-
-> 👨‍💻 **Developer?** Check out our [开发环境搭建指南](docs/开发环境搭建指南.md) for complete setup instructions!
-
-```bash
-# Run core test suites
-cargo test
-cargo test -p cdp-adapter
-cargo test -p permissions-broker
-cargo test -p network-tap-light
-cargo test -p stealth
-cargo test -p extensions-bridge
-
-# Run L2 perceiver tests
-cargo test -p perceiver-structural
-cargo test -p perceiver-visual
-cargo test -p perceiver-semantic
-cargo test -p perceiver-hub
-
-# Run L2 integration tests with real Chrome
-SOULBROWSER_USE_REAL_CHROME=1 cargo test --test l2_perception_integration
-
-# Run with logging
-RUST_LOG=debug cargo run
-
-# Build documentation
-cargo doc --open
-
-# Format & lint
-cargo fmt
-cargo clippy
-```
-
-## 📊 Roadmap
-
-### Phase 1: Foundation (Current)
-- ✅ Core architecture setup
-- ✅ Unified data contracts
-- 🔄 L0-L1 implementation
-- ✅ L2 Multi-Modal Perception (Structural, Visual, Semantic)
-- ⏳ L3 Intelligent Action enhancements
-
-### Phase 2: Intelligence
-- ✅ Visual perception (screenshot, metrics, diff)
-- ✅ Semantic understanding (NLP, classification, summarization)
-- ✅ Multi-modal insight generation
-- ⏳ Advanced recovery strategies
-- ⏳ Flow orchestration and planning
-
-### Phase 3: Scale
-- ⏳ Distributed execution
-- ⏳ Cloud deployment
-- ⏳ External APIs
-- ⏳ Plugin system
-
-## ⚙️ Configuration
-
-> ⚙️ **Need Help with Config?** See our [配置参考手册](docs/配置参考手册.md) for complete configuration options!
-
-- **Policy files**: Edit `config/policies/browser_policy.json` or point `SOUL_POLICY_PATH` to a custom JSON file.
-- **Strict authorization**: `SOUL_STRICT_AUTHZ=true` forces authorization decisions to respect the facade result without route-policy fallback.
-- **Quota persistence**: Adjust `SOUL_QUOTA_PERSIST_MS` / `SOUL_QUOTA_REFRESH_MS` for disk sync and reload cadence.
-- See `config/config.yaml.example` for a complete configuration template.
-- For a deeper overview of the soul-base integration, see `docs/soul_base_components.md`.
-
-## 📚 Documentation
-
-### 🚀 Getting Started
-- [快速开始指南](docs/快速开始指南.md) - 5分钟快速上手
-- [CLI参考手册](docs/CLI参考手册.md) - 完整的命令行指南
-- [配置参考手册](docs/配置参考手册.md) - 详细的配置选项
-
-### 🛠️ Development
-- [开发环境搭建指南](docs/开发环境搭建指南.md) - 完整的开发环境设置
-- [核心组件API参考](docs/核心组件API参考.md) - 核心 Crates API 文档
-- [故障排除手册](docs/故障排除手册.md) - 问题诊断和解决方案
-
-### 📖 Architecture & Design
-- [项目结构概览](docs/project_structure.md) - 项目组织和结构说明
-- [Soul-Base组件集成](docs/soul_base_components.md) - 集成架构说明
-- [文档缺失分析与补充计划](docs/文档缺失分析与补充计划.md) - 文档状态和计划
-
-## 🤝 Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## 📄 License
-
-MIT OR Apache-2.0
-
-## 🌈 Philosophy Quote
-
-> "Like a gardener tending to a digital garden, SoulBrowser nurtures each interaction, 
-> understanding that every click creates ripples, every navigation opens new realms, 
-> and every observation teaches us about the living web."
-
-## 🆘 Need Help?
-
-- 🐛 **Found a Bug?** [Report it](https://github.com/your-org/SoulBrowser/issues)
-- 💡 **Have an idea?** [Share it](https://github.com/your-org/SoulBrowser/discussions)
-- ❓ **Need Support?** Check our [故障排除手册](docs/故障排除手册.md)
-- 📖 **Want to Learn?** Start with [快速开始指南](docs/快速开始指南.md)
-
----
-
-Built with ❤️ and Rust by the SoulBrowser Team
+## Quick start
+1. **Install prerequisites** – Rust 1.70+, Chrome/Chromium (or set `SOULBROWSER_CHROME`), and any LLM credentials you plan to use.
+2. **Clone & build** – `git clone … && cd soulbrowser && cargo build --workspace` to download dependencies and compile every crate.
+3. **Copy config** – `cp config/config.yaml.example config/config.yaml`, then adjust browser defaults, output directory, and policy paths.
+4. **Set secrets/env** – duplicate `config/local.env.example` to `config/local.env`; populate `SOUL_CONSOLE_TOKEN`, `OPENAI_API_KEY`, etc. (CLI auto-loads the file before parsing args)。如需备用 OpenAI key，可一起填写 `SOULBROWSER_OPENAI_BACKUP_KEY`，planner 会在主 key 被限流时自动切换。
+5. **Start Serve** – `cargo run --bin soulbrowser -- serve --surface console --port 8787 --auth-token devtoken` and open the printed URL.
+6. **Iterate** – use `perceive`, `chat`, `scheduler`, and `perceiver` to capture perception data, agent flows, and debugging information under `soulbrowser-output/`.
+
+## Configuration and environment
+1. Copy `config/config.yaml.example` to `config/config.yaml` and adjust:
+   - `default_browser`, `default_headless` – CLI defaults for Chromium/Chrome.
+   - `output_dir` – root for artifacts/run bundles (`./soulbrowser-output` by default).
+   - `soul` block – enable agent assistance, model id, API key, prompt directory.
+   - `recording` / `performance` – toggle screenshot/video/network/perf capture.
+   - `policy_paths` – list of policy files loaded into the policy center (`SOUL_POLICY_PATH` mirrors the first entry).
+   - `strict_authorization` / `serve_surface` – default auth + surface for `serve`.
+2. Populate `config/local.env` (ignored by git) to set secrets (OpenAI keys, console tokens, etc.). `src/cli/runtime.rs` automatically loads it before parsing CLI args.
+3. Optional directories under `config/`: `permissions/` (per-tenant gateway policies), `plugins/` (registry + manifests), `planner/` (prompt templates), `policies/` (org-specific policy bundles).
+   - Telemetry sinks persist under `config/telemetry.json` (managed via `soulbrowser telemetry ...` commands); the CLI auto-loads this file to register webhook/PostHog sinks on startup.
+
+### Key environment variables
+| Variable | Purpose |
+| --- | --- |
+| `SOULBROWSER_CHROME` / `SOULBROWSER_USE_REAL_CHROME` | Override or force the Chrome/Chromium binary the CDP adapter launches. |
+| `SOULBROWSER_CHROME_PROFILE` | Provide a Chrome profile directory (else `.soulbrowser-profile*` temp dirs are used). |
+| `SOULBROWSER_WS_URL` | Attach to an existing DevTools websocket instead of launching Chrome (mirrors CLI `--ws-url`). |
+| `SOULBROWSER_DISABLE_PERCEPTION_POOL` | Disable shared perception sessions (also settable via `serve --shared-session=false`). |
+| `SOULBROWSER_LLM_CACHE_DIR` | Custom cache folder for planner outputs (CLI `--llm-cache-dir` overrides). |
+| `SOUL_STRICT_AUTHZ` | Forces strict authorization (auto-enabled when config demands or when serve auth tokens are supplied). |
+| `SOUL_SERVE_SURFACE` | Default serve surface (`console` or `gateway`). |
+| `SOUL_CONSOLE_TOKEN` / `SOUL_SERVE_TOKEN` | Auth tokens accepted by the serve surface without passing `--auth-token`. |
+| `SOUL_POLICY_PATH` | Explicit policy snapshot path if not relying on config search paths. |
+| `SOUL_CHAT_CONTEXT_LIMIT` / `SOUL_CHAT_CONTEXT_WAIT_MS` | Tune concurrency and wait time for chat context captures. |
+
+## Data and storage conventions
+- `soulbrowser-output/` (configurable) hosts tenant-specific directories, artifacts, screenshots, logs, run bundles, state-center snapshots, and timeline exports.
+- Run bundles captured via `chat --save-run` include `plans`, `execution`, `state_events`, and `artifacts`, which the `console` and `artifacts` commands ingest.
+- `memory_center` records live in-memory unless pointed at a persistence file. Use `CliContext::app_context()` → `memory_center()` to store/retrieve small facts.
+- Event streams are stored via `event-store` hot rings and optional cold writer (see `config/defaults` when tuning retention).
+- Perceiver logs/overlays, scheduler snapshots, and CLI exports land under `soulbrowser-output/<tenant>/` to keep per-tenant state isolated.
+- Runtime tool descriptors live in `config/tools/*.json` (managed via `soulbrowser tools register/remove`); each CLI run auto-loads these definitions into the planner/tool registry.
+
+## Observability & diagnostics
+- **Metrics** – the CLI spawns a Prometheus endpoint on `http://localhost:<metrics_port>/metrics` (default `9090`). Scheduler, registry, CDP adapter, LLM cache, and plan statistics are exposed.
+- **State center** – stores recent dispatch/perceiver events for CLI inspection and console overlays. Snapshots persist under `soulbrowser-output/state-center/` when enabled.
+- **Timeline exports** – `soulbrowser timeline` hydrates an in-memory event store and writes records/timelines/replays based on action/flow/task identifiers or time ranges.
+- **Artifacts & console** – run bundles can be inspected offline (`soulbrowser console --serve --input bundle.json`) and artifacts filtered/extracted or turned into GIF timelines (`soulbrowser artifacts --gif timeline.gif ...`).
+- **Logs** – tracing logs stream to stdout and respect `--log-level`/`--debug`. `config/local.env` can set `RUST_LOG` (e.g., `soulbrowser_kernel=debug`) for fine-grained filters.
+- **Telemetry stream** – set `SOULBROWSER_TELEMETRY_STDOUT=1` to emit JSON step/task events during execution; sinks are pluggable (`soulbrowser_kernel::telemetry::register_sink`) for webhooks/PostHog adapters.
+- `soulbrowser telemetry tail` 可以实时查看事件，使用 `soulbrowser telemetry webhook --url …` 发送到任意 HTTP endpoint，或用 `soulbrowser telemetry posthog --api-key ...` 注册 PostHog sink；每个事件包含基础运行指标（`runtime_ms`、LLM token 统计若模型返回 usage 即自动填充）。
+
+## Development workflow
+1. **Format & lint**
+   ```bash
+   cargo fmt --all
+   cargo clippy --workspace --all-targets -- -D warnings
+   ```
+2. **Test**
+   ```bash
+   cargo test --workspace
+   ```
+3. **Targeted runs**
+   - `cargo run --bin soulbrowser -- serve ...` for end-to-end smoke tests.
+   - `cargo run -p perceiver-hub --example ...` when iterating on perceiver logic.
+   - `cargo test -p <crate>` for crate-specific changes (action stack, scheduler, policy center, etc.).
+4. **Artifacts**
+   - Use `soulbrowser chat ... --save-run` to capture reproducible bundles.
+   - `soulbrowser console --serve --input bundle.json` to visualize plan/execution timelines without a live browser.
+
+### Testing & QA tips
+- Keep `cargo fmt`/`cargo clippy -D warnings` clean to mirror CI.
+- Use `assert_cmd` (already a dev-dependency) for CLI regression tests.
+- For scheduler/perceiver debugging, record `soulbrowser-output/state-center/snapshot.json` (if persistence is enabled) and share run bundles.
+- Run `gateway` with `--disable-auth` only for local experiments; production instances should rely on tokens/IP allowlists.
+
+## Troubleshooting tips
+| Symptom | Suggested checks |
+| --- | --- |
+| Serve fails to bind port | Ensure no other process uses the port; pass `--port <freeport>` or set `--metrics-port 0` if Prometheus conflicts. |
+| Chrome cannot be found | Set `SOULBROWSER_CHROME=/path/to/chrome` or install Chromium/Chrome; `cdp-adapter` logs detection attempts. |
+| Perception hangs | Lower `--timeout`, disable pooling via `--shared-session=false` (Serve) or set `SOULBROWSER_DISABLE_PERCEPTION_POOL=1`, and confirm DevTools websocket (`--ws-url`). |
+| Planner errors due to LLM auth | Supply `--llm-api-key`, set `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` in `local.env`, or fall back to `--llm-provider mock`. |
+| Empty scheduler output | Ensure commands generate events (e.g., run `chat --execute` first) and check `soulbrowser-output/state-center/` snapshots. |
+
+## Status and roadmap notes
+- The CDP adapter, network tap, permissions broker, and extensions bridge are scaffolds; real Chromium wiring, audit hooks, and extension channels land in later milestones.
+- Legacy commands (`start`, `run`, `record`, `replay`, `export`, `demo`) intentionally bail with guidance to the serve/gateway surfaces after the CLI refactor.
+- The gateway currently exposes only the HTTP surface; gRPC and WebDriver listeners are stubbed behind CLI flags for future releases.
+- LLM planner selection supports rule-based, OpenAI, Anthropic, or mock providers. Provide API keys via env vars or `chat` CLI overrides.
+- Plugin registries, policy overrides, and privacy filters live under `crates/l7-plugin`, `crates/policy-center`, and `crates/l6-privacy`; populate `config/plugins` and `config/policies` as your org rolls out governance requirements.
+- Documentation roadmap – `README_CN.md` and the `docs/` tree mirror this README; update them whenever new modules or workflows land to keep onboarding friction low.
+
+## Licensing
+Dual-licensed under MIT or Apache-2.0 (see `Cargo.toml` metadata). Choose the license that best fits your deployment.

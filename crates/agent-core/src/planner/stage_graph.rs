@@ -149,6 +149,8 @@ impl IntentStageConfig {
             stage_entry("navigate", vec!["context_url", "preferred_site", "search"]),
             stage_entry("act", vec!["auto"]),
             stage_entry("observe", vec!["extract_site"]),
+            stage_entry("validate", vec!["target_guardrail"]),
+            stage_entry("evaluate", vec!["auto_evaluate"]),
             stage_entry("parse", vec!["generic_parser"]),
             stage_entry("deliver", vec!["structured", "agent_note"]),
         ]

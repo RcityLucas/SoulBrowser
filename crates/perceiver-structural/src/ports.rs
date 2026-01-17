@@ -75,7 +75,9 @@ where
             .dom_snapshot(page, DomSnapshotConfig::default())
             .await
             .map_err(|err| {
-                PerceiverError::internal(format!("dom snapshot failed: {:?}", err.kind))
+                // Include both kind and hint for better debugging
+                let hint_info = err.hint.as_deref().unwrap_or("no details");
+                PerceiverError::internal(format!("dom snapshot failed: {:?} ({})", err.kind, hint_info))
             })?;
         let strings: Vec<Value> = dom.strings.into_iter().map(|s| Value::String(s)).collect();
         describe_backend(&dom.raw, &strings, backend_node_id).ok_or_else(|| {
@@ -114,7 +116,9 @@ where
             .dom_snapshot(page, dom_config)
             .await
             .map_err(|err| {
-                PerceiverError::internal(format!("dom snapshot failed: {:?}", err.kind))
+                // Include both kind and hint for better debugging
+                let hint_info = err.hint.as_deref().unwrap_or("no details");
+                PerceiverError::internal(format!("dom snapshot failed: {:?} ({})", err.kind, hint_info))
             })?;
 
         let ax_raw = if matches!(level, SnapLevel::Light) {
@@ -128,7 +132,9 @@ where
                 .ax_snapshot(page, ax_config)
                 .await
                 .map_err(|err| {
-                    PerceiverError::internal(format!("ax snapshot failed: {:?}", err.kind))
+                    // Include both kind and hint for better debugging
+                    let hint_info = err.hint.as_deref().unwrap_or("no details");
+                    PerceiverError::internal(format!("ax snapshot failed: {:?} ({})", err.kind, hint_info))
                 })?
                 .raw
         };

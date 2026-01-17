@@ -72,6 +72,15 @@ impl SoulBrowserError {
         Self { inner: error }
     }
 
+    /// Create operation failure error
+    pub fn operation_failed(operation: &str, detail: &str) -> Self {
+        let error = ErrorBuilder::new(codes::UNKNOWN_INTERNAL)
+            .user_msg(format!("{} failed", operation))
+            .dev_msg(format!("{}", detail))
+            .build();
+        Self { inner: error }
+    }
+
     /// Create internal error
     pub fn internal(message: &str) -> Self {
         let error = ErrorBuilder::new(codes::UNKNOWN_INTERNAL)
@@ -136,7 +145,11 @@ impl SoulBrowserError {
 
 impl fmt::Display for SoulBrowserError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.inner.message_user)
+        if let Some(dev_msg) = &self.inner.message_dev {
+            write!(f, "{} ({})", dev_msg, self.inner.message_user)
+        } else {
+            write!(f, "{}", self.inner.message_user)
+        }
     }
 }
 

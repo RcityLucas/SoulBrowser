@@ -1,6 +1,7 @@
 use crate::executor::ToolExecutor;
 use crate::model::{DispatchRequest, SubmitHandle};
 use crate::orchestrator::Orchestrator;
+use crate::route_events::RouteEventSender;
 use crate::runtime::SchedulerRuntime;
 use async_trait::async_trait;
 use soulbrowser_core_types::{ActionId, SoulError};
@@ -34,8 +35,10 @@ where
         runtime: Arc<SchedulerRuntime>,
         executor: Arc<E>,
         state_center: Arc<dyn StateCenter>,
+        route_events: Option<Arc<RouteEventSender>>,
     ) -> Self {
-        let orchestrator = Orchestrator::new(registry, runtime, executor, state_center);
+        let orchestrator =
+            Orchestrator::new(registry, runtime, executor, state_center, route_events);
         Self { orchestrator }
     }
 
@@ -54,7 +57,7 @@ where
         state_center: Arc<dyn StateCenter>,
     ) -> Self {
         let executor = Arc::new(crate::executor::NoopExecutor::default());
-        Self::new(registry, runtime, executor, state_center)
+        Self::new(registry, runtime, executor, state_center, None)
     }
 }
 

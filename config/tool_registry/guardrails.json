@@ -1,0 +1,32 @@
+[
+  {
+    "id": "data.validate-target",
+    "label": "Validate Target Page",
+    "description": "Ensure the observed page matches the requested keywords, domain, and HTTP status before parsing.",
+    "usage": "Call right after navigation/data.extract-site to block 404/redirect/captcha pages before parsing or delivery steps.",
+    "required_fields": [
+      "payload.keywords",
+      "payload.allowed_domains"
+    ],
+    "optional_fields": [
+      "payload.expected_status",
+      "payload.source_step_id"
+    ],
+    "output": "Reports matched keywords, normalized domain, and HTTP status when validation succeeds.",
+    "example": {
+      "payload": {
+        "source_step_id": "observe-1",
+        "keywords": [
+          "白银",
+          "现货"
+        ],
+        "allowed_domains": [
+          "quote.eastmoney.com",
+          "data.eastmoney.com"
+        ],
+        "expected_status": 200
+      }
+    },
+    "priority": 15
+  }
+]

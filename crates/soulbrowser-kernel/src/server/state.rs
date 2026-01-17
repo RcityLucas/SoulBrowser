@@ -89,6 +89,12 @@ impl ServeState {
         self.app_context().await.session_service()
     }
 
+    pub async fn manual_session_manager(
+        &self,
+    ) -> Arc<crate::manual_override::ManualSessionManager> {
+        self.app_context().await.manual_session_manager()
+    }
+
     pub async fn refresh_app_context(&self) -> Result<()> {
         let context = self.build_context().await?;
         {

@@ -1,0 +1,39 @@
+[package]
+name = "action-primitives"
+version = "0.1.0"
+edition = "2021"
+authors = ["SoulBrowser Team"]
+license = "MIT OR Apache-2.0"
+description = "L3 Action Primitives - Core browser automation operations"
+
+[dependencies]
+# Core types
+soulbrowser-core-types = { path = "../core-types" }
+cdp-adapter = { path = "../cdp-adapter" }
+perceiver-structural = { path = "../perceiver-structural" }
+soulbrowser-state-center = { path = "../state-center" }
+soulbrowser-policy-center = { path = "../policy-center" }
+
+# Async runtime
+tokio = { version = "1.39", features = ["full"] }
+tokio-util = { version = "0.7" }
+async-trait = "0.1"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+
+# Logging
+tracing = "0.1"
+dashmap = "5"
+
+[dev-dependencies]
+tokio-test = "0.4"

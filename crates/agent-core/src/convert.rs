@@ -182,6 +182,17 @@ fn convert_tool(tool: &AgentTool, opts: &PlanToFlowOptions) -> Result<ActionType
             action_type: name.clone(),
             parameters: payload_to_map(payload),
         }),
+        AgentToolKind::Done { success, text } => {
+            // Convert Done action to a custom action that signals completion.
+            // This is used in agent loop mode to indicate task completion.
+            let mut params = std::collections::HashMap::new();
+            params.insert("success".to_string(), serde_json::Value::Bool(*success));
+            params.insert("text".to_string(), serde_json::Value::String(text.clone()));
+            Ok(ActionType::Custom {
+                action_type: "agent.done".to_string(),
+                parameters: params,
+            })
+        }
     }
 }
 

@@ -3,7 +3,7 @@ use agent_core::{
     requires_weather_pipeline, WaitMode,
 };
 use serde_json::{json, Value};
-use url::form_urlencoded;
+use std::collections::HashMap;
 
 use super::{stage_overlay, StageStrategy, StrategyApplication, StrategyInput, StrategyStep};
 
@@ -56,6 +56,7 @@ impl StageStrategy for ContextUrlNavigateStrategy {
                 }
                 Some(overlay)
             },
+            vendor_context: HashMap::new(),
         })
     }
 }
@@ -109,6 +110,7 @@ impl StageStrategy for PreferredSiteNavigateStrategy {
                 }
                 Some(overlay)
             },
+            vendor_context: HashMap::new(),
         })
     }
 }
@@ -132,12 +134,25 @@ impl StageStrategy for SearchNavigateStrategy {
     }
 
     fn apply(&self, input: &StrategyInput<'_>) -> Option<StrategyApplication> {
-        let query = input.context.search_seed();
-        let encoded: String = form_urlencoded::byte_serialize(query.as_bytes()).collect();
-        let url = format!("https://www.baidu.com/s?wd={}", encoded);
+        let query = input
+            .context
+            .guardrail_queries()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| input.context.search_seed());
+        let payload = json!({ "query": query });
+        let tool = AgentTool {
+            kind: AgentToolKind::Custom {
+                name: "browser.search".to_string(),
+                payload,
+            },
+            wait: WaitMode::DomReady,
+            timeout_ms: Some(30_000),
+        };
+        let step = StrategyStep::new("搜索相关网页", tool).with_detail("自动触发浏览器搜索");
         Some(StrategyApplication {
-            steps: vec![navigate_step("搜索相关网页", &url)],
-            note: Some(format!("使用搜索策略查询 {query}")),
+            steps: vec![step],
+            note: Some("插入 browser.search 搜索入口".to_string()),
             overlay: {
                 let mut overlay = stage_overlay(
                     agent_core::planner::PlanStageKind::Navigate,
@@ -150,6 +165,7 @@ impl StageStrategy for SearchNavigateStrategy {
                 }
                 Some(overlay)
             },
+            vendor_context: HashMap::new(),
         })
     }
 }
@@ -210,6 +226,7 @@ impl StageStrategy for WeatherSearchStrategy {
                 }
                 Some(overlay)
             },
+            vendor_context: HashMap::new(),
         })
     }
 }
@@ -223,6 +240,32 @@ mod tests {
 
     fn weather_request() -> AgentRequest {
         AgentRequest::new(TaskId::new(), "查询济南天气")
+    }
+
+    #[test]
+    fn search_strategy_uses_guardrail_domains() {
+        let mut request = AgentRequest::new(TaskId::new(), "通过同花顺帮我查镍价");
+        request.intent.allowed_domains = vec!["https://www.10jqka.com.cn".to_string()];
+        request.intent.validation_keywords = vec!["同花顺 镍价".to_string()];
+        let context = ContextResolver::new(&request).build();
+        let plan = AgentPlan::new(TaskId::new(), "demo");
+        let input = StrategyInput {
+            plan: &plan,
+            request: &request,
+            context: &context,
+        };
+        let strategy = SearchNavigateStrategy::new();
+        let application = strategy.apply(&input).expect("applied");
+        let payload = match &application.steps[0].tool.kind {
+            AgentToolKind::Custom { payload, .. } => payload.clone(),
+            other => panic!("unexpected tool: {other:?}"),
+        };
+        let query = payload
+            .get("query")
+            .and_then(Value::as_str)
+            .expect("query present");
+        assert!(query.contains("site:10jqka.com.cn"));
+        assert!(query.contains("同花顺"));
     }
 
     #[test]

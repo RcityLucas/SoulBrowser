@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 pub enum PlanStageKind {
     Navigate,
     Observe,
+    Validate,
     Act,
+    Evaluate,
     Parse,
     Deliver,
 }
@@ -17,7 +19,9 @@ impl PlanStageKind {
         match self {
             PlanStageKind::Navigate => "navigate",
             PlanStageKind::Observe => "observe",
+            PlanStageKind::Validate => "validate",
             PlanStageKind::Act => "act",
+            PlanStageKind::Evaluate => "evaluate",
             PlanStageKind::Parse => "parse",
             PlanStageKind::Deliver => "deliver",
         }
@@ -27,7 +31,9 @@ impl PlanStageKind {
         match value.to_ascii_lowercase().as_str() {
             "navigate" => Some(PlanStageKind::Navigate),
             "observe" => Some(PlanStageKind::Observe),
+            "validate" => Some(PlanStageKind::Validate),
             "act" => Some(PlanStageKind::Act),
+            "evaluate" => Some(PlanStageKind::Evaluate),
             "parse" => Some(PlanStageKind::Parse),
             "deliver" => Some(PlanStageKind::Deliver),
             _ => None,
@@ -45,15 +51,25 @@ pub fn classify_step(step: &AgentPlanStep) -> Vec<PlanStageKind> {
         | AgentToolKind::Scroll { .. }
         | AgentToolKind::Wait { .. } => vec![PlanStageKind::Act],
         AgentToolKind::Custom { name, .. } => classify_custom_tool(name),
+        AgentToolKind::Done { .. } => vec![PlanStageKind::Deliver],
     }
 }
 
 fn classify_custom_tool(name: &str) -> Vec<PlanStageKind> {
     let lowered = name.trim().to_ascii_lowercase();
-    if matches!(lowered.as_str(), "data.extract-site" | "page.observe") {
+    if matches!(
+        lowered.as_str(),
+        "data.extract-site" | "page.observe" | "market.quote.fetch"
+    ) {
         vec![PlanStageKind::Observe]
-    } else if lowered == "weather.search" {
+    } else if lowered == "data.validate-target" || lowered == "data.validate.metal_price" {
+        vec![PlanStageKind::Validate]
+    } else if lowered == "weather.search" || lowered == "browser.search" {
         vec![PlanStageKind::Navigate]
+    } else if lowered == "browser.close-modal" || lowered == "browser.send-esc" {
+        vec![PlanStageKind::Act]
+    } else if lowered == "agent.evaluate" {
+        vec![PlanStageKind::Evaluate]
     } else if is_parse_tool(&lowered) {
         if lowered == "data.parse.github-repo" {
             vec![PlanStageKind::Observe, PlanStageKind::Parse]

@@ -51,6 +51,8 @@ pub struct SessionSnapshot {
     pub overlays: Vec<LiveOverlayEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_frame: Option<LiveFramePayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_state: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,7 +90,7 @@ pub struct LiveFramePayload {
     pub overlays: Vec<LiveOverlayEntry>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteSummary {
     pub session: String,
     pub page: Option<String>,

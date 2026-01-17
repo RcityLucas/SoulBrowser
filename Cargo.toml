@@ -101,6 +101,8 @@ l7-adapter = { path = "crates/l7-adapter" }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 memory-center = { path = "crates/memory-center" }
+image = { version = "0.24", default-features = false, features = ["gif", "jpeg", "png"] }
+font8x8 = "0.3"
 
 # CLI and argument parsing
 clap = { version = "4.4", features = ["derive", "color", "suggestions"] }

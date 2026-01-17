@@ -13,3 +13,27 @@ strategies:
     telemetry_label: human_confirm
     action: !HumanApproval
       severity: warn
+  - id: retry_alt_source
+    description: 切换到备用行情抓取模式（API 失败后改用 DOM 或其它来源）。
+    enabled: true
+    tags: [quotes]
+    telemetry_label: retry_alt_source
+    action: !Annotate
+      severity: warn
+      note: 自动改用备用行情数据源
+  - id: switch_contract
+    description: 当前合约或市场无数据，建议切换其它合约。
+    enabled: true
+    tags: [quotes]
+    telemetry_label: switch_contract
+    action: !Annotate
+      severity: warn
+      note: 建议切换合约或市场重新抓取
+  - id: manual_takeover_hint
+    description: 检测到登录/验证码阻塞，引导人工接管。
+    enabled: true
+    tags: [manual, quotes]
+    telemetry_label: manual_takeover_hint
+    action: !Annotate
+      severity: error
+      note: 需要人工接管浏览器并完成登录/验证

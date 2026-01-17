@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -29,6 +29,7 @@ pub struct SessionService {
     backend: Arc<dyn crate::storage::BrowserStorage>,
     live_origin: Option<String>,
     handles: DashMap<String, Arc<SessionHandle>>,
+    task_sessions: DashMap<String, String>,
 }
 
 impl SessionService {
@@ -42,6 +43,7 @@ impl SessionService {
             backend: storage.backend(),
             live_origin,
             handles: DashMap::new(),
+            task_sessions: DashMap::new(),
         }
     }
 
@@ -157,6 +159,12 @@ impl SessionService {
         if let Some(handle) = self.handles.get(session_id) {
             handle.bind_task(task_id);
         }
+        self.task_sessions
+            .insert(task_id.to_string(), session_id.to_string());
+    }
+
+    pub fn unbind_task(&self, task_id: &str) {
+        self.task_sessions.remove(task_id);
     }
 
     pub async fn issue_share_link(&self, session_id: &str) -> Result<SessionShareContext> {
@@ -359,6 +367,28 @@ impl SessionService {
         };
         handle.push_overlay(entry);
     }
+
+    fn handle_message_state(&self, task_id: &str, state: &Value) {
+        let Some(session_id) = self
+            .task_sessions
+            .get(task_id)
+            .map(|entry| entry.value().clone())
+            .or_else(|| self.find_session_by_task(task_id))
+        else {
+            return;
+        };
+        let handle = self.ensure_handle(&session_id);
+        handle.update_message_state(state.clone());
+    }
+
+    fn find_session_by_task(&self, task_id: &str) -> Option<String> {
+        for entry in self.handles.iter() {
+            if entry.value().record().last_task_id.as_deref() == Some(task_id) {
+                return Some(entry.key().clone());
+            }
+        }
+        None
+    }
 }
 
 impl TaskStreamObserver for SessionService {
@@ -369,6 +399,9 @@ impl TaskStreamObserver for SessionService {
             }
             TaskStreamEvent::Overlay { overlay } => {
                 self.handle_overlay(overlay);
+            }
+            TaskStreamEvent::MessageState { state } => {
+                self.handle_message_state(task_id, state);
             }
             _ => {}
         }
@@ -398,6 +431,7 @@ struct SessionHandleInner {
     record: RwLock<SessionRecord>,
     overlays: Mutex<VecDeque<LiveOverlayEntry>>,
     last_frame: Mutex<Option<LiveFramePayload>>,
+    message_state: Mutex<Option<serde_json::Value>>,
 }
 
 impl SessionHandle {
@@ -408,6 +442,7 @@ impl SessionHandle {
                 record: RwLock::new(record),
                 overlays: Mutex::new(VecDeque::new()),
                 last_frame: Mutex::new(None),
+                message_state: Mutex::new(None),
             },
             sender,
         }
@@ -422,6 +457,7 @@ impl SessionHandle {
             session: self.inner.record.read().clone(),
             overlays: self.overlay_snapshot(),
             last_frame: self.inner.last_frame.lock().clone(),
+            message_state: self.inner.message_state.lock().clone(),
         }
     }
 
@@ -446,6 +482,17 @@ impl SessionHandle {
             *guard = Some(frame.clone());
         }
         let _ = self.sender.send(SessionLiveEvent::Frame { frame });
+    }
+
+    fn update_message_state(&self, state: serde_json::Value) {
+        {
+            let mut guard = self.inner.message_state.lock();
+            *guard = Some(state.clone());
+        }
+        let session_id = self.inner.record.read().id.clone();
+        let _ = self
+            .sender
+            .send(SessionLiveEvent::MessageState { session_id, state });
     }
 
     fn touch_event(&self, task_id: &str, at: DateTime<Utc>) {

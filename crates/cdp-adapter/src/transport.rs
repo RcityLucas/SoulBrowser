@@ -20,11 +20,12 @@ use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 use crate::config::CdpConfig;
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::util::extract_ws_url;
-use crate::AdapterMode;
+use crate::{AdapterMode, DebuggerEndpoint};
 
 #[derive(Clone, Debug)]
 pub struct TransportEvent {
@@ -37,6 +38,56 @@ pub struct TransportEvent {
 pub enum CommandTarget {
     Browser,
     Session(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct DebuggerEndpointBase {
+    ws_origin: String,
+    http_origin: String,
+    host_port: String,
+}
+
+impl DebuggerEndpointBase {
+    fn from_ws_url(raw: &str) -> Option<Self> {
+        let url = Url::parse(raw).ok()?;
+        let host = url.host_str()?.to_string();
+        let port = url.port_or_known_default()?;
+        let has_ipv6 = host.contains(':');
+        let bracketed_host = if has_ipv6 {
+            format!("[{host}]", host = host)
+        } else {
+            host.clone()
+        };
+        let host_port = format!("{host}:{port}", host = bracketed_host, port = port);
+        let ws_scheme = match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            other => other,
+        };
+        let http_scheme = match url.scheme() {
+            "wss" | "https" => "https",
+            _ => "http",
+        };
+        let ws_origin = format!("{scheme}://{host}", scheme = ws_scheme, host = host_port);
+        let http_origin = format!("{scheme}://{host}", scheme = http_scheme, host = host_port);
+        Some(Self {
+            ws_origin,
+            http_origin,
+            host_port,
+        })
+    }
+
+    pub fn endpoint_for_target(&self, target_id: &str) -> DebuggerEndpoint {
+        let ws_url = format!("{}/devtools/page/{}", self.ws_origin, target_id);
+        let inspect_url = format!(
+            "{}/devtools/inspector.html?ws={}/devtools/page/{}",
+            self.http_origin, self.host_port, target_id
+        );
+        DebuggerEndpoint {
+            ws_url,
+            inspect_url: Some(inspect_url),
+        }
+    }
 }
 
 #[async_trait]
@@ -52,6 +103,10 @@ pub trait CdpTransport: Send + Sync {
 
     fn adapter_mode(&self) -> AdapterMode {
         AdapterMode::Real
+    }
+
+    async fn debugger_base(&self) -> Option<DebuggerEndpointBase> {
+        None
     }
 }
 
@@ -197,6 +252,13 @@ impl CdpTransport for ChromiumTransport {
             Err(err) => Err(err),
         }
     }
+
+    async fn debugger_base(&self) -> Option<DebuggerEndpointBase> {
+        match self.runtime().await {
+            Ok(runtime) => runtime.debugger_base(),
+            Err(_) => None,
+        }
+    }
 }
 
 struct ControlMessage {
@@ -213,6 +275,7 @@ struct RuntimeState {
     heartbeat_task: Option<JoinHandle<()>>,
     child: Mutex<Option<Child>>,
     alive: Arc<AtomicBool>,
+    debugger_base: Option<DebuggerEndpointBase>,
 }
 
 impl RuntimeState {
@@ -223,6 +286,11 @@ impl RuntimeState {
             let browser_cfg = Self::browser_config(&cfg)?;
             Self::launch_browser(browser_cfg).await?
         };
+
+        let debugger_base = DebuggerEndpointBase::from_ws_url(&ws_url);
+        if debugger_base.is_none() {
+            warn!(target: "cdp-transport", url = %ws_url, "failed to parse debugger base url");
+        }
 
         let conn = Connection::<CdpEventMessage>::connect(&ws_url)
             .await
@@ -260,6 +328,7 @@ impl RuntimeState {
             heartbeat_task,
             child: Mutex::new(child),
             alive,
+            debugger_base,
         })
     }
 
@@ -282,6 +351,7 @@ impl RuntimeState {
                 heartbeat_task: None,
                 child: Mutex::new(None),
                 alive: alive.clone(),
+                debugger_base: None,
             }),
             alive,
         )
@@ -289,6 +359,10 @@ impl RuntimeState {
 
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    fn debugger_base(&self) -> Option<DebuggerEndpointBase> {
+        self.debugger_base.clone()
     }
 
     async fn send_internal(
@@ -437,6 +511,15 @@ impl RuntimeState {
                 .with_hint(format!("failed to ensure user-data-dir: {err}"))
         })?;
 
+        // Clean up stale SingletonLock file to prevent "profile in use" errors
+        // when restarting after a crash or unclean shutdown
+        let lock_file = profile_dir.join("SingletonLock");
+        if lock_file.exists() {
+            if let Err(err) = fs::remove_file(&lock_file) {
+                warn!(target: "cdp-transport", ?err, "failed to remove stale SingletonLock");
+            }
+        }
+
         let mut builder = BrowserConfig::builder()
             .request_timeout(Duration::from_millis(cfg.default_deadline_ms))
             .launch_timeout(Duration::from_secs(20));
@@ -483,6 +566,16 @@ impl RuntimeState {
             args.push("--mute-audio");
         }
         builder = builder.args(args);
+
+        if let Some(addr) = cfg
+            .remote_debugging_addr
+            .as_deref()
+            .map(|value| value.trim())
+        {
+            if !addr.is_empty() {
+                builder = builder.arg(format!("--remote-debugging-address={addr}"));
+            }
+        }
 
         if !cfg.executable.as_os_str().is_empty() {
             builder = builder.chrome_executable(cfg.executable.clone());
@@ -650,7 +743,9 @@ impl RuntimeState {
             | CdpError::DecodeError(_)
             | CdpError::ScrollingFailed(_)
             | CdpError::NotFound
-            | CdpError::Url(_) => AdapterError::new(AdapterErrorKind::CdpIo)
+            | CdpError::Url(_)
+            | CdpError::UnexpectedWsMessage(_)
+            | CdpError::InvalidMessage(_, _) => AdapterError::new(AdapterErrorKind::CdpIo)
                 .with_hint(hint)
                 .retriable(true),
         }

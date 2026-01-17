@@ -69,10 +69,16 @@ pub async fn load_config(config_path: Option<&PathBuf>) -> Result<LoadedConfig> 
     let config_path = match config_path {
         Some(path) => path.clone(),
         None => {
-            let mut path = dirs::config_dir().context("Failed to get config directory")?;
-            path.push("soulbrowser");
-            path.push("config.yaml");
-            path
+            // Priority: ./config/config.yaml > ~/.config/soulbrowser/config.yaml
+            let local_config = PathBuf::from("config/config.yaml");
+            if local_config.exists() {
+                local_config
+            } else {
+                let mut path = dirs::config_dir().context("Failed to get config directory")?;
+                path.push("soulbrowser");
+                path.push("config.yaml");
+                path
+            }
         }
     };
 
